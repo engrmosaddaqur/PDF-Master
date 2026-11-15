@@ -20,6 +20,7 @@ import {
   renderPageThumbnail,
   splitPdfByRanges,
 } from '../services/pdfEngine';
+import { PdfSourcePicker } from './PdfSourcePicker';
 
 interface PageOrganizerViewProps {
   doc: DocumentRecord;
@@ -28,6 +29,7 @@ interface PageOrganizerViewProps {
   onClose: () => void;
   onSaveDocument: (updated: DocumentRecord) => Promise<void>;
   onCreateExtractedDoc: (newDoc: DocumentRecord) => Promise<void>;
+  onImportDoc?: (doc: DocumentRecord) => Promise<void>;
 }
 
 interface PageTile {
@@ -42,9 +44,11 @@ interface PageTile {
 export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
   doc,
   allDocs,
+  language,
   onClose,
   onSaveDocument,
   onCreateExtractedDoc,
+  onImportDoc,
 }) => {
   const [tiles, setTiles] = useState<PageTile[]>([]);
   const [loading, setLoading] = useState(true);
@@ -410,34 +414,30 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
         </button>
       </div>
 
-      {/* Insert from Vault PDF Picker */}
+      {/* Insert from Device Storage or Recent PDFs Picker */}
       {showInsertPicker && (
         <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl max-h-[75vh] flex flex-col">
+          <div className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl max-h-[82vh] flex flex-col">
             <h3 className="font-display text-base font-bold mb-3">
-              Insert Pages from Another PDF
+              {language === 'bn'
+                ? 'অন্য পিডিএফ থেকে পৃষ্ঠা যোগ করুন'
+                : 'Insert Pages from Another PDF'}
             </h3>
-            <div className="flex-1 overflow-y-auto space-y-2">
-              {allDocs
-                .filter((d) => !d.isTrashed && d.id !== doc.id && !d.isVaultLocked)
-                .map((d) => (
-                  <button
-                    key={d.id}
-                    onClick={() => handleInsertFromOtherPdf(d)}
-                    className="w-full min-h-[52px] p-3 rounded-xl border border-slate-200 dark:border-slate-700 text-left flex items-center justify-between hover:bg-slate-50 dark:hover:bg-slate-800"
-                  >
-                    <span className="text-sm font-medium truncate">{d.name}</span>
-                    <span className="text-xs font-mono-nums text-slate-500 ml-2 shrink-0">
-                      {d.pageCount}p
-                    </span>
-                  </button>
-                ))}
+            <div className="flex-1 overflow-y-auto pr-0.5">
+              <PdfSourcePicker
+                language={language}
+                docs={allDocs}
+                excludeDocId={doc.id}
+                maxListHeightClass="max-h-60"
+                onImportDoc={onImportDoc}
+                onSelectDoc={(other) => void handleInsertFromOtherPdf(other)}
+              />
             </div>
             <button
               onClick={() => setShowInsertPicker(false)}
               className="mt-3 w-full min-h-[44px] rounded-xl bg-slate-100 dark:bg-slate-800 text-sm font-semibold"
             >
-              Cancel
+              {language === 'bn' ? 'বাতিল' : 'Cancel'}
             </button>
           </div>
         </div>

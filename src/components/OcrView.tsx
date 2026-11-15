@@ -4,7 +4,6 @@ import {
   Copy,
   Download,
   FileText,
-  FileUp,
   ImagePlus,
   Loader2,
   ScanText,
@@ -23,6 +22,7 @@ import {
 } from '../services/pdfEngine';
 import { runAiVisionOcr, runOnDeviceOcr, type OcrLanguage } from '../services/ocrService';
 import { downloadArrayBuffer } from '../services/storageService';
+import { PdfSourcePicker } from './PdfSourcePicker';
 
 interface OcrViewProps {
   language: AppLanguage;
@@ -30,6 +30,7 @@ interface OcrViewProps {
   initialDocId?: string;
   aiConsentGranted: boolean;
   localOnlyMode: boolean;
+  onImportDoc?: (doc: DocumentRecord) => Promise<void>;
   onGrantAiConsent: () => void;
   onClose: () => void;
   onSaveSearchablePdf: (doc: DocumentRecord) => Promise<void>;
@@ -42,6 +43,7 @@ export const OcrView: React.FC<OcrViewProps> = ({
   initialDocId,
   aiConsentGranted,
   localOnlyMode,
+  onImportDoc,
   onGrantAiConsent,
   onClose,
   onSaveSearchablePdf,
@@ -323,48 +325,22 @@ export const OcrView: React.FC<OcrViewProps> = ({
 
           {sourceType === 'pdf' ? (
             <div className="space-y-2.5">
-              <label className="flex items-center justify-center gap-2 min-h-[54px] px-3 rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 cursor-pointer hover:border-[#2563EB] text-sm font-semibold text-[#2563EB]">
-                <FileUp className="w-5 h-5 shrink-0" />
-                <span className="truncate">
-                  {uploadedPdf ? `Selected PDF: ${uploadedPdf.name}` : 'Upload PDF File from Device'}
-                </span>
-                <input
-                  type="file"
-                  accept="application/pdf,.pdf"
-                  onChange={(e) => {
-                    const file = e.target.files?.[0];
-                    e.target.value = '';
-                    if (file) handleUploadPdfFile(file);
-                  }}
-                  className="hidden"
-                />
-              </label>
-
-              {vaultDocs.length > 0 && (
-                <div>
-                  <label className="block text-[11px] font-semibold text-slate-500 mb-1">
-                    Or choose a PDF from Vault
-                  </label>
-                  <select
-                    value={uploadedPdf ? '' : selectedDocId}
-                    onChange={(e) => {
-                      setUploadedPdf(null);
-                      setPdfRenderLimit(10);
-                      setSelectedDocId(e.target.value);
-                      setExtractedPages([]);
-                      setCombinedText('');
-                    }}
-                    className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
-                  >
-                    {uploadedPdf && <option value="">-- Using uploaded file --</option>}
-                    {vaultDocs.map((d) => (
-                      <option key={d.id} value={d.id}>
-                        {d.name} ({d.pageCount} pages)
-                      </option>
-                    ))}
-                  </select>
-                </div>
-              )}
+              <PdfSourcePicker
+                language={language}
+                docs={docs}
+                selectedDocId={uploadedPdf ? '' : selectedDocId}
+                maxListHeightClass="max-h-44"
+                onImportDoc={async (rec) => {
+                  if (onImportDoc) await onImportDoc(rec);
+                }}
+                onSelectDoc={(d) => {
+                  setUploadedPdf(null);
+                  setPdfRenderLimit(10);
+                  setSelectedDocId(d.id);
+                  setExtractedPages([]);
+                  setCombinedText('');
+                }}
+              />
 
               {loadingPdfPages && (
                 <div className="flex items-center gap-2 text-xs text-[#2563EB]">
@@ -391,17 +367,55 @@ export const OcrView: React.FC<OcrViewProps> = ({
               )}
             </div>
           ) : (
-            <label className="flex items-center justify-center gap-2 min-h-[56px] rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 cursor-pointer hover:border-[#2563EB] text-sm font-semibold text-[#2563EB]">
-              <ImagePlus className="w-5 h-5" />
-              <span>Select Photo or Scanned Image (PNG / JPG)</span>
-              <input
-                type="file"
-                accept="image/*"
-                multiple
-                onChange={handleUploadImage}
-                className="hidden"
-              />
-            </label>
+            <div className="space-y-3">
+              <label className="flex items-center justify-center gap-2 min-h-[56px] rounded-xl border-2 border-dashed border-[#2563EB]/45 bg-[#2563EB]/5 cursor-pointer hover:bg-[#2563EB]/10 text-sm font-semibold text-[#2563EB]">
+                <ImagePlus className="w-5 h-5" />
+                <span>
+                  {language === 'bn'
+                    ? 'ডিভাইস থেকে ছবি বা স্ক্যান নির্বাচন করুন'
+                    : 'Import Photo / Image from Device Storage'}
+                </span>
+                <input
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  onChange={handleUploadImage}
+                  className="hidden"
+                />
+              </label>
+
+              {vaultDocs.length > 0 && (
+                <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-1.5">
+                  <span className="text-[11px] font-bold text-slate-600 dark:text-slate-300 block">
+                    {language === 'bn'
+                      ? 'অথবা রিসেন্ট ফাইল থেকে OCR করুন'
+                      : 'Or OCR from Recent Files'}
+                  </span>
+                  <div className="flex gap-1.5 overflow-x-auto no-scrollbar pb-0.5">
+                    {[...vaultDocs]
+                      .sort((a, b) => (b.lastOpenedAt || b.updatedAt) - (a.lastOpenedAt || a.updatedAt))
+                      .slice(0, 6)
+                      .map((d) => (
+                        <button
+                          key={d.id}
+                          type="button"
+                          onClick={() => {
+                            setSourceType('pdf');
+                            setUploadedPdf(null);
+                            setPdfRenderLimit(10);
+                            setSelectedDocId(d.id);
+                            setExtractedPages([]);
+                            setCombinedText('');
+                          }}
+                          className="px-3 py-1.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-medium whitespace-nowrap shrink-0 hover:border-[#2563EB]"
+                        >
+                          {d.name} ({d.pageCount}p)
+                        </button>
+                      ))}
+                  </div>
+                </div>
+              )}
+            </div>
           )}
 
           {pageImages.length > 0 && (

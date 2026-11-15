@@ -1,15 +1,18 @@
 import React, { useState } from 'react';
-import { ArrowLeft, GitCompare, Minus, Plus } from 'lucide-react';
+import { ArrowLeft, ChevronDown, ChevronUp, FileText, GitCompare, Minus, Plus } from 'lucide-react';
 import type { AppLanguage, DocumentRecord } from '../types';
 import { getT } from '../i18n/translations';
 import { extractDocumentPagesText, renderPageToDataUrl } from '../services/pdfEngine';
 import { comparePdfPagesText, type PageComparisonResult } from '../services/diffEngine';
+import { formatBytes } from '../services/storageService';
+import { PdfSourcePicker } from './PdfSourcePicker';
 
 interface CompareViewProps {
   language: AppLanguage;
   docs: DocumentRecord[];
   initialDocA?: string;
   initialDocB?: string;
+  onImportDoc?: (doc: DocumentRecord) => Promise<void>;
   onClose: () => void;
 }
 
@@ -18,12 +21,19 @@ export const CompareView: React.FC<CompareViewProps> = ({
   docs,
   initialDocA,
   initialDocB,
+  onImportDoc,
   onClose,
 }) => {
   const t = getT(language);
   const available = docs.filter((d) => !d.isTrashed && !d.isVaultLocked);
-  const [docAId, setDocAId] = useState(initialDocA || available[0]?.id || '');
-  const [docBId, setDocBId] = useState(initialDocB || available[1]?.id || available[0]?.id || '');
+  const recentSorted = [...available].sort(
+    (a, b) => (b.lastOpenedAt || b.updatedAt) - (a.lastOpenedAt || a.updatedAt)
+  );
+  const [docAId, setDocAId] = useState(initialDocA || recentSorted[0]?.id || '');
+  const [docBId, setDocBId] = useState(
+    initialDocB || recentSorted[1]?.id || recentSorted[0]?.id || ''
+  );
+  const [pickerSlot, setPickerSlot] = useState<'a' | 'b' | null>('a');
   const [running, setRunning] = useState(false);
   const [mode, setMode] = useState<'diff' | 'sideBySide'>('diff');
   const [summary, setSummary] = useState<{
@@ -34,10 +44,14 @@ export const CompareView: React.FC<CompareViewProps> = ({
   } | null>(null);
   const [sideImages, setSideImages] = useState<Array<{ a?: string; b?: string; page: number }>>([]);
 
+  const docAObj = available.find((d) => d.id === docAId);
+  const docBObj = available.find((d) => d.id === docBId);
+
   const runComparison = async () => {
     const docA = available.find((d) => d.id === docAId);
     const docB = available.find((d) => d.id === docBId);
     if (!docA || !docB) return;
+    setPickerSlot(null);
     setRunning(true);
     try {
       const [pagesA, pagesB] = await Promise.all([
@@ -79,43 +93,99 @@ export const CompareView: React.FC<CompareViewProps> = ({
       <div className="flex-1 overflow-y-auto p-4 max-w-4xl w-full mx-auto space-y-4">
         <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-3">
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label className="block text-xs font-semibold text-slate-500 mb-1">
-                {t.compare.selectFirst}
-              </label>
-              <select
-                value={docAId}
-                onChange={(e) => setDocAId(e.target.value)}
-                className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
-              >
-                {available.map((d) => (
-                  <option key={d.id} value={d.id}>
-                    {d.name} ({d.pageCount}p)
-                  </option>
-                ))}
-              </select>
-            </div>
-            <div>
-              <label className="block text-xs font-semibold text-slate-500 mb-1">
-                {t.compare.selectSecond}
-              </label>
-              <select
-                value={docBId}
-                onChange={(e) => setDocBId(e.target.value)}
-                className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
-              >
-                {available.map((d) => (
-                  <option key={d.id} value={d.id}>
-                    {d.name} ({d.pageCount}p)
-                  </option>
-                ))}
-              </select>
-            </div>
+            {/* Slot A Summary Toggle */}
+            <button
+              type="button"
+              onClick={() => setPickerSlot((cur) => (cur === 'a' ? null : 'a'))}
+              className={`p-3 rounded-xl border text-left flex items-center justify-between gap-2 transition-colors ${
+                pickerSlot === 'a'
+                  ? 'border-[#2563EB] bg-[#2563EB]/10'
+                  : 'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/70'
+              }`}
+            >
+              <div className="min-w-0">
+                <span className="block text-[10.5px] font-bold uppercase tracking-wider text-[#2563EB]">
+                  {t.compare.selectFirst}
+                </span>
+                <span className="flex items-center gap-1.5 text-xs font-bold text-[#142B4A] dark:text-white truncate mt-0.5">
+                  <FileText className="w-3.5 h-3.5 shrink-0 text-[#2563EB]" />
+                  <span className="truncate">{docAObj?.name || 'Choose PDF A'}</span>
+                </span>
+                {docAObj && (
+                  <span className="block text-[10.5px] font-mono-nums text-slate-500 mt-0.5">
+                    {docAObj.pageCount}p · {formatBytes(docAObj.sizeBytes)}
+                  </span>
+                )}
+              </div>
+              {pickerSlot === 'a' ? (
+                <ChevronUp className="w-4 h-4 text-[#2563EB] shrink-0" />
+              ) : (
+                <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
+              )}
+            </button>
+
+            {/* Slot B Summary Toggle */}
+            <button
+              type="button"
+              onClick={() => setPickerSlot((cur) => (cur === 'b' ? null : 'b'))}
+              className={`p-3 rounded-xl border text-left flex items-center justify-between gap-2 transition-colors ${
+                pickerSlot === 'b'
+                  ? 'border-[#06B6D4] bg-[#06B6D4]/10'
+                  : 'border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800/70'
+              }`}
+            >
+              <div className="min-w-0">
+                <span className="block text-[10.5px] font-bold uppercase tracking-wider text-[#06B6D4]">
+                  {t.compare.selectSecond}
+                </span>
+                <span className="flex items-center gap-1.5 text-xs font-bold text-[#142B4A] dark:text-white truncate mt-0.5">
+                  <FileText className="w-3.5 h-3.5 shrink-0 text-[#06B6D4]" />
+                  <span className="truncate">{docBObj?.name || 'Choose PDF B'}</span>
+                </span>
+                {docBObj && (
+                  <span className="block text-[10.5px] font-mono-nums text-slate-500 mt-0.5">
+                    {docBObj.pageCount}p · {formatBytes(docBObj.sizeBytes)}
+                  </span>
+                )}
+              </div>
+              {pickerSlot === 'b' ? (
+                <ChevronUp className="w-4 h-4 text-[#06B6D4] shrink-0" />
+              ) : (
+                <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
+              )}
+            </button>
           </div>
+
+          {pickerSlot && (
+            <div className="p-3 rounded-2xl bg-slate-50 dark:bg-slate-800/40 border border-slate-200 dark:border-slate-700">
+              <PdfSourcePicker
+                language={language}
+                docs={docs}
+                selectedDocId={pickerSlot === 'a' ? docAId : docBId}
+                compact
+                maxListHeightClass="max-h-40"
+                label={
+                  pickerSlot === 'a'
+                    ? `${t.compare.selectFirst} — Device Storage or Recent Files`
+                    : `${t.compare.selectSecond} — Device Storage or Recent Files`
+                }
+                onImportDoc={onImportDoc}
+                onSelectDoc={(d) => {
+                  if (pickerSlot === 'a') {
+                    setDocAId(d.id);
+                    setPickerSlot('b');
+                  } else {
+                    setDocBId(d.id);
+                    setPickerSlot(null);
+                  }
+                }}
+              />
+            </div>
+          )}
 
           <button
             onClick={runComparison}
-            disabled={running || available.length === 0}
+            disabled={running || !docAObj || !docBObj}
             className="w-full min-h-[46px] rounded-xl bg-[#2563EB] disabled:opacity-40 text-white text-sm font-semibold flex items-center justify-center gap-2"
           >
             <GitCompare className="w-4 h-4" />

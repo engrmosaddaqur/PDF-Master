@@ -1,12 +1,18 @@
 import React, { useEffect, useState } from 'react';
 import {
+  ArrowDown,
   ArrowLeft,
+  ArrowUp,
   Check,
+  Clock,
   Download,
-  FileUp,
+  FolderOpen,
   Lock,
+  Plus,
+  Search,
   ShieldCheck,
   Unlock,
+  X,
 } from 'lucide-react';
 import type { AppLanguage, DocumentRecord, PaperSizeKey } from '../types';
 import {
@@ -21,6 +27,7 @@ import {
   getPdfDocumentInfo,
   mergePdfs,
   renderPageThumbnail,
+  renderPageToDataUrl,
   repairPdfBytes,
   resizePdfPages,
   rotateAllPages,
@@ -30,6 +37,7 @@ import {
 } from '../services/pdfEngine';
 import {
   docxFileToPdf,
+  htmlDocumentToPdf,
   imagesToPdf,
   pdfToDocxBytes,
   pdfToImagesZip,
@@ -38,7 +46,8 @@ import {
   pptxFileToPdf,
   xlsxFileToPdf,
 } from '../services/conversionService';
-import { downloadArrayBuffer, formatBytes } from '../services/storageService';
+import { downloadArrayBuffer, formatBytes, formatRelativeTime } from '../services/storageService';
+import { PdfSourcePicker } from './PdfSourcePicker';
 
 interface ToolRunnerModalProps {
   toolId: string;
@@ -74,8 +83,18 @@ const TOOL_TITLES: Record<string, string> = {
   pptToPdf: 'PowerPoint (.PPTX) to PDF',
 };
 
+interface MergeSourceItem {
+  id: string;
+  name: string;
+  pageCount: number;
+  sizeBytes: number;
+  pdfBytes: ArrayBuffer;
+  source: 'recent' | 'device';
+}
+
 export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
   toolId,
+  language,
   docs,
   preselectedDocId,
   onClose,
@@ -83,9 +102,35 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
   onUpdateExistingDoc,
 }) => {
   const available = docs.filter((d) => !d.isTrashed && !d.isVaultLocked);
+  const recentSorted = [...available].sort(
+    (a, b) => (b.lastOpenedAt || b.updatedAt) - (a.lastOpenedAt || a.updatedAt)
+  );
   const [selectedIds, setSelectedIds] = useState<string[]>(
     preselectedDocId ? [preselectedDocId] : available[0] ? [available[0].id] : []
   );
+  const [mergeQueue, setMergeQueue] = useState<MergeSourceItem[]>(() => {
+    if (toolId === 'merge' && preselectedDocId) {
+      const found = available.find((d) => d.id === preselectedDocId);
+      if (found) {
+        return [
+          {
+            id: found.id,
+            name: found.name,
+            pageCount: found.pageCount,
+            sizeBytes: found.sizeBytes,
+            pdfBytes: found.pdfBytes,
+            source: 'recent',
+          },
+        ];
+      }
+    }
+    return [];
+  });
+  const [mergeSearch, setMergeSearch] = useState('');
+  const [lastMergedResult, setLastMergedResult] = useState<{
+    bytes: ArrayBuffer;
+    name: string;
+  } | null>(null);
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
   const [running, setRunning] = useState(false);
   const [resultMsg, setResultMsg] = useState<string | null>(null);
@@ -132,13 +177,65 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
     'wordToPdf',
     'excelToPdf',
     'pptToPdf',
-    'unlockPdf',
   ].includes(toolId);
 
-  const toggleMultiDoc = (id: string) => {
-    setSelectedIds((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
-    );
+  const [recentExternalDocId, setRecentExternalDocId] = useState<string>('');
+
+  const handleImportMergePdfs = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    setErrorMsg(null);
+    const added: MergeSourceItem[] = [];
+    for (const file of files) {
+      try {
+        const buf = await file.arrayBuffer();
+        const info = await getPdfDocumentInfo(buf).catch(() => ({ pageCount: 1 }));
+        added.push({
+          id: `dev_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          name: file.name,
+          pageCount: info.pageCount,
+          sizeBytes: buf.byteLength,
+          pdfBytes: cloneBuffer(buf),
+          source: 'device',
+        });
+      } catch {
+        setErrorMsg(`Could not read ${file.name} as a PDF.`);
+      }
+    }
+    if (added.length > 0) {
+      setMergeQueue((prev) => [...prev, ...added]);
+    }
+    e.target.value = '';
+  };
+
+  const toggleRecentInMerge = (d: DocumentRecord) => {
+    setMergeQueue((prev) => {
+      const exists = prev.some((item) => item.id === d.id);
+      if (exists) {
+        return prev.filter((item) => item.id !== d.id);
+      }
+      return [
+        ...prev,
+        {
+          id: d.id,
+          name: d.name,
+          pageCount: d.pageCount,
+          sizeBytes: d.sizeBytes,
+          pdfBytes: d.pdfBytes,
+          source: 'recent',
+        },
+      ];
+    });
+  };
+
+  const moveMergeItem = (idx: number, dir: -1 | 1) => {
+    const target = idx + dir;
+    if (target < 0 || target >= mergeQueue.length) return;
+    setMergeQueue((prev) => {
+      const next = [...prev];
+      [next[idx], next[target]] = [next[target], next[idx]];
+      return next;
+    });
   };
 
   const saveNewPdf = async (
@@ -181,17 +278,29 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
     setRunning(true);
     setErrorMsg(null);
     setResultMsg(null);
+    setLastMergedResult(null);
     setPreviewUrls([]);
 
     try {
       if (toolId === 'merge') {
-        if (selectedIds.length < 2) throw new Error('Select at least 2 PDFs to merge.');
-        const buffers = selectedIds
-          .map((id) => available.find((d) => d.id === id)?.pdfBytes)
-          .filter(Boolean) as ArrayBuffer[];
+        if (mergeQueue.length < 2) {
+          throw new Error(
+            language === 'bn'
+              ? 'মার্জ করতে কমপক্ষে ২টি পিডিএফ (ডিভাইস বা রিসেন্ট ফাইল থেকে) নির্বাচন করুন।'
+              : 'Add at least 2 PDFs from Device Storage or Recent Files to merge.'
+          );
+        }
+        const buffers = mergeQueue.map((item) => item.pdfBytes);
         const merged = await mergePdfs(buffers);
-        await saveNewPdf(merged, `Merged_${Date.now().toString().slice(-4)}.pdf`, 'edited', 'Merged PDFs');
-        setResultMsg(`Merged ${buffers.length} PDFs successfully (${formatBytes(merged.byteLength)}).`);
+        const outName = `Merged_${Date.now().toString().slice(-4)}.pdf`;
+        await saveNewPdf(merged, outName, 'edited', `Merged ${buffers.length} PDFs`);
+        setLastMergedResult({ bytes: merged, name: outName });
+        const totalPages = mergeQueue.reduce((acc, m) => acc + m.pageCount, 0);
+        setResultMsg(
+          language === 'bn'
+            ? `${buffers.length}টি পিডিএফ (${totalPages} পৃষ্ঠা) সফলভাবে মার্জ ও সেভ হয়েছে (${formatBytes(merged.byteLength)})।`
+            : `Merged ${buffers.length} PDFs (${totalPages} pages) successfully (${formatBytes(merged.byteLength)}).`
+        );
       } else if (toolId === 'split') {
         if (!primaryDoc) throw new Error('Select a PDF to split.');
         const pagesToKeep: number[] = [];
@@ -292,12 +401,19 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         setResultMsg('Document encrypted with AES-256-GCM inside your local Vault.');
       } else if (toolId === 'unlockPdf') {
         const file = uploadedFiles[0];
-        if (!file) throw new Error('Upload a password-protected PDF file.');
-        const buf = await file.arrayBuffer();
-        const unlocked = await unlockPasswordProtectedPdf(buf, passwordInput);
+        const sourceBytes = file ? await file.arrayBuffer() : primaryDoc?.pdfBytes;
+        const sourceName = file ? file.name : primaryDoc?.name;
+        if (!sourceBytes || !sourceName) {
+          throw new Error(
+            language === 'bn'
+              ? 'আনলক করতে ডিভাইস বা রিসেন্ট ফাইল থেকে একটি পিডিএফ বাছুন।'
+              : 'Select a password-protected PDF from Device Storage or Recent Files.'
+          );
+        }
+        const unlocked = await unlockPasswordProtectedPdf(sourceBytes, passwordInput);
         await saveNewPdf(
           unlocked,
-          file.name.replace(/\.pdf$/i, '_unlocked.pdf'),
+          sourceName.replace(/\.pdf$/i, '_unlocked.pdf'),
           'edited',
           'Unlocked password PDF'
         );
@@ -345,10 +461,31 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         await saveNewPdf(out, primaryDoc.name.replace(/\.pdf$/i, '_repaired.pdf'), 'edited', 'Rebuilt PDF structure');
         setResultMsg('PDF structure & cross-reference table rebuilt cleanly.');
       } else if (toolId === 'imagesToPdf') {
-        if (!uploadedFiles.length) throw new Error('Select one or more images.');
-        const pdfBytes = await imagesToPdf(uploadedFiles);
-        await saveNewPdf(pdfBytes, `Images_${Date.now().toString().slice(-4)}.pdf`, 'converted', 'Converted from images');
-        setResultMsg(`Converted ${uploadedFiles.length} image(s) into a PDF.`);
+        if (uploadedFiles.length > 0) {
+          const pdfBytes = await imagesToPdf(uploadedFiles);
+          await saveNewPdf(pdfBytes, `Images_${Date.now().toString().slice(-4)}.pdf`, 'converted', 'Converted from images');
+          setResultMsg(`Converted ${uploadedFiles.length} image(s) into a PDF.`);
+        } else if (recentExternalDocId) {
+          const rDoc = available.find((d) => d.id === recentExternalDocId);
+          if (!rDoc) throw new Error('Select images from Device Storage or a Recent file.');
+          const maxP = Math.min(rDoc.pageCount, 20);
+          const imgFiles: File[] = [];
+          for (let p = 1; p <= maxP; p++) {
+            const url = await renderPageToDataUrl(rDoc.pdfBytes, p, 1.5, 'image/jpeg');
+            const blob = await fetch(url).then((r) => r.blob());
+            imgFiles.push(new File([blob], `page_${p}.jpg`, { type: 'image/jpeg' }));
+          }
+          const pdfBytes = await imagesToPdf(imgFiles);
+          await saveNewPdf(
+            pdfBytes,
+            rDoc.name.replace(/\.pdf$/i, '_images.pdf'),
+            'converted',
+            `Converted ${imgFiles.length} pages to image PDF`
+          );
+          setResultMsg(`Created PDF from ${imgFiles.length} page image(s) of ${rDoc.name}.`);
+        } else {
+          throw new Error('Select image(s) from Device Storage or choose a Recent file.');
+        }
       } else if (toolId === 'pdfToDocx') {
         if (!primaryDoc) throw new Error('Select a PDF.');
         const docxBuf = await pdfToDocxBytes(primaryDoc.pdfBytes, primaryDoc.name);
@@ -378,38 +515,81 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         setResultMsg('Converted PDF pages into PowerPoint (.PPTX) presentation.');
       } else if (toolId === 'wordToPdf') {
         const file = uploadedFiles[0];
-        if (!file) throw new Error('Select a .DOCX file.');
-        const { pdfBytes, html } = await docxFileToPdf(file);
-        const thumb = await renderPageThumbnail(pdfBytes, 1, 200).catch(() => undefined);
-        const info = await getPdfDocumentInfo(pdfBytes).catch(() => ({ pageCount: 1 }));
-        const now = Date.now();
-        await onSaveResultDoc({
-          id: `doc_${now}`,
-          name: file.name.replace(/\.docx?$/i, '.pdf'),
-          origin: 'converted',
-          createdAt: now,
-          updatedAt: now,
-          lastOpenedAt: now,
-          sizeBytes: pdfBytes.byteLength,
-          pageCount: info.pageCount,
-          isStarred: false,
-          isShared: false,
-          isTrashed: false,
-          folderId: null,
-          thumbnailDataUrl: thumb,
-          pdfBytes: cloneBuffer(pdfBytes),
-          editableHtml: html,
-          versions: [
-            {
-              id: `ver_${now}`,
-              timestamp: now,
-              note: 'Converted from Word (.docx)',
+        if (!file && recentExternalDocId) {
+          const rDoc = available.find((d) => d.id === recentExternalDocId);
+          if (!rDoc) throw new Error('Select a .DOCX, .XLSX, or .PPTX file.');
+          const outBytes = rDoc.editableHtml
+            ? await htmlDocumentToPdf(
+                rDoc.editableHtml,
+                rDoc.wordSettings || {
+                  paperSize: 'A4',
+                  orientation: 'portrait',
+                  customWidthMm: 210,
+                  customHeightMm: 297,
+                  marginTopMm: 20,
+                  marginBottomMm: 20,
+                  marginLeftMm: 20,
+                  marginRightMm: 20,
+                  backgroundColor: '#FFFFFF',
+                  borderEnabled: false,
+                  borderColor: '#CBD5E1',
+                  headerText: '',
+                  footerText: '',
+                  pageNumbering: true,
+                }
+              )
+            : cloneBuffer(rDoc.pdfBytes);
+          await saveNewPdf(
+            outBytes,
+            rDoc.name.replace(/\.pdf$/i, '_converted.pdf'),
+            'converted',
+            'Converted from Recent Document'
+          );
+          setResultMsg(`Converted ${rDoc.name} to PDF and saved to Vault.`);
+        } else {
+          if (!file) throw new Error('Select a .DOCX, .XLSX, or .PPTX file.');
+          if (/\.(xlsx?|csv)$/i.test(file.name)) {
+            const pdfBytes = await xlsxFileToPdf(file);
+            await saveNewPdf(pdfBytes, file.name.replace(/\.(xlsx?|csv)$/i, '.pdf'), 'converted', 'Converted from Excel');
+            setResultMsg('Converted Excel spreadsheet to PDF and saved to Vault.');
+          } else if (/\.pptx?$/i.test(file.name)) {
+            const pdfBytes = await pptxFileToPdf(file);
+            await saveNewPdf(pdfBytes, file.name.replace(/\.pptx?$/i, '.pdf'), 'converted', 'Converted from PowerPoint');
+            setResultMsg('Converted PowerPoint presentation to PDF and saved to Vault.');
+          } else {
+            const { pdfBytes, html } = await docxFileToPdf(file);
+            const thumb = await renderPageThumbnail(pdfBytes, 1, 200).catch(() => undefined);
+            const info = await getPdfDocumentInfo(pdfBytes).catch(() => ({ pageCount: 1 }));
+            const now = Date.now();
+            await onSaveResultDoc({
+              id: `doc_${now}`,
+              name: file.name.replace(/\.docx?$/i, '.pdf'),
+              origin: 'converted',
+              createdAt: now,
+              updatedAt: now,
+              lastOpenedAt: now,
               sizeBytes: pdfBytes.byteLength,
+              pageCount: info.pageCount,
+              isStarred: false,
+              isShared: false,
+              isTrashed: false,
+              folderId: null,
+              thumbnailDataUrl: thumb,
               pdfBytes: cloneBuffer(pdfBytes),
-            },
-          ],
-        });
-        setResultMsg('Converted Word document to PDF and saved to Vault.');
+              editableHtml: html,
+              versions: [
+                {
+                  id: `ver_${now}`,
+                  timestamp: now,
+                  note: 'Converted from Word (.docx)',
+                  sizeBytes: pdfBytes.byteLength,
+                  pdfBytes: cloneBuffer(pdfBytes),
+                },
+              ],
+            });
+            setResultMsg('Converted Word document to PDF and saved to Vault.');
+          }
+        }
       } else if (toolId === 'excelToPdf') {
         const file = uploadedFiles[0];
         if (!file) throw new Error('Select an .XLSX or .CSV file.');
@@ -448,86 +628,352 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         {/* Input Selection */}
         <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-3">
           {needsExternalFile ? (
-            <label className="flex flex-col items-center justify-center gap-2 p-6 rounded-2xl border-2 border-dashed border-slate-300 dark:border-slate-700 cursor-pointer hover:border-[#2563EB]">
-              <FileUp className="w-7 h-7 text-[#2563EB]" />
-              <span className="text-sm font-semibold">
-                {uploadedFiles.length > 0
-                  ? `${uploadedFiles.length} file(s) selected`
-                  : 'Tap to choose file(s)'}
-              </span>
-              <span className="text-xs text-slate-500">
-                {toolId === 'imagesToPdf'
-                  ? 'PNG, JPG, WEBP'
-                  : toolId === 'wordToPdf'
-                  ? '.DOCX'
-                  : toolId === 'excelToPdf'
-                  ? '.XLSX, .XLS, .CSV'
-                  : toolId === 'pptToPdf'
-                  ? '.PPTX'
-                  : 'Password-protected .PDF'}
-              </span>
-              <input
-                type="file"
-                multiple={toolId === 'imagesToPdf'}
-                accept={
-                  toolId === 'imagesToPdf'
-                    ? 'image/*'
+            <div className="space-y-3">
+              <label className="flex flex-col items-center justify-center gap-2 p-5 rounded-2xl border-2 border-dashed border-[#2563EB]/45 bg-[#2563EB]/5 hover:bg-[#2563EB]/10 cursor-pointer transition-colors">
+                <FolderOpen className="w-6 h-6 text-[#2563EB]" />
+                <span className="text-sm font-bold text-[#142B4A] dark:text-white">
+                  {uploadedFiles.length > 0
+                    ? `${uploadedFiles.length} file(s) selected from Device`
+                    : language === 'bn'
+                    ? 'ডিভাইস স্টোরেজ থেকে ফাইল ইমপোর্ট করুন'
+                    : 'Import from Device Storage'}
+                </span>
+                <span className="text-xs text-slate-500">
+                  {toolId === 'imagesToPdf'
+                    ? 'PNG, JPG, WEBP'
                     : toolId === 'wordToPdf'
-                    ? '.docx'
+                    ? '.DOCX, .XLSX, .XLS, .CSV, .PPTX'
                     : toolId === 'excelToPdf'
-                    ? '.xlsx,.xls,.csv'
-                    : toolId === 'pptToPdf'
-                    ? '.pptx'
-                    : '.pdf'
-                }
-                onChange={(e) => setUploadedFiles(Array.from(e.target.files || []))}
-                className="hidden"
-              />
-            </label>
-          ) : toolId === 'merge' ? (
-            <div className="space-y-2">
-              <p className="text-xs font-semibold text-slate-500">
-                Select 2 or more PDFs in merge order ({selectedIds.length} selected)
-              </p>
-              <div className="max-h-56 overflow-y-auto space-y-1.5">
-                {available.map((d) => {
-                  const active = selectedIds.includes(d.id);
-                  return (
-                    <button
-                      key={d.id}
-                      onClick={() => toggleMultiDoc(d.id)}
-                      className={`w-full min-h-[46px] px-3 rounded-xl border text-left flex items-center justify-between text-xs font-medium ${
-                        active
-                          ? 'border-[#2563EB] bg-[#2563EB]/10 text-[#142B4A] dark:text-white'
-                          : 'border-slate-200 dark:border-slate-700'
-                      }`}
+                    ? '.XLSX, .XLS, .CSV'
+                    : '.PPTX'}
+                </span>
+                <input
+                  type="file"
+                  multiple={toolId === 'imagesToPdf'}
+                  accept={
+                    toolId === 'imagesToPdf'
+                      ? 'image/*'
+                      : toolId === 'wordToPdf'
+                      ? '.docx,.xlsx,.xls,.csv,.pptx'
+                      : toolId === 'excelToPdf'
+                      ? '.xlsx,.xls,.csv'
+                      : '.pptx'
+                  }
+                  onChange={(e) => {
+                    const picked = Array.from(e.target.files || []);
+                    if (picked.length > 0) {
+                      setUploadedFiles((prev) =>
+                        toolId === 'imagesToPdf' ? [...prev, ...picked] : picked
+                      );
+                      setRecentExternalDocId('');
+                    }
+                    e.target.value = '';
+                  }}
+                  className="hidden"
+                />
+              </label>
+
+              {uploadedFiles.length > 0 && (
+                <div className="space-y-1.5 max-h-36 overflow-y-auto">
+                  {uploadedFiles.map((f, idx) => (
+                    <div
+                      key={`${f.name}_${idx}`}
+                      className="px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-between gap-2 text-xs"
                     >
-                      <span className="truncate">{d.name}</span>
-                      <span className="font-mono-nums text-slate-500 ml-2 shrink-0">
-                        {d.pageCount}p · {active ? <Check className="w-4 h-4 inline text-[#2563EB]" /> : formatBytes(d.sizeBytes)}
+                      <span className="truncate font-medium">
+                        {idx + 1}. {f.name} ({formatBytes(f.size)})
                       </span>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setUploadedFiles((prev) => prev.filter((_, i) => i !== idx))
+                        }
+                        className="p-1 rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/50"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Recent Files option for external tools */}
+              {recentSorted.length > 0 && (
+                <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-1.5">
+                  <span className="text-[11px] font-bold text-slate-600 dark:text-slate-300 flex items-center gap-1.5">
+                    <Clock className="w-3.5 h-3.5 text-[#06B6D4]" />
+                    {language === 'bn'
+                      ? 'অথবা রিসেন্ট ফাইল থেকে বাছুন'
+                      : 'Or pick from Recent Files'}
+                  </span>
+                  <div className="max-h-36 overflow-y-auto space-y-1.5">
+                    {recentSorted
+                      .filter((d) =>
+                        toolId === 'wordToPdf'
+                          ? Boolean(d.editableHtml) || d.origin === 'converted' || d.origin === 'created'
+                          : true
+                      )
+                      .slice(0, 8)
+                      .map((d) => {
+                        const active = recentExternalDocId === d.id && uploadedFiles.length === 0;
+                        return (
+                          <button
+                            key={d.id}
+                            type="button"
+                            onClick={() => {
+                              setUploadedFiles([]);
+                              setRecentExternalDocId(active ? '' : d.id);
+                            }}
+                            className={`w-full px-3 py-2 rounded-xl border text-left flex items-center justify-between gap-2 text-xs transition-colors ${
+                              active
+                                ? 'border-[#2563EB] bg-[#2563EB]/10 text-[#142B4A] dark:text-white'
+                                : 'border-slate-200 dark:border-slate-700 hover:border-[#2563EB]/40'
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <p className="font-semibold truncate">{d.name}</p>
+                              <p className="text-[10.5px] font-mono-nums text-slate-500">
+                                {d.pageCount}p · {formatBytes(d.sizeBytes)} ·{' '}
+                                {formatRelativeTime(d.lastOpenedAt || d.updatedAt, language)}
+                              </p>
+                            </div>
+                            {active && <Check className="w-4 h-4 text-[#2563EB] shrink-0" />}
+                          </button>
+                        );
+                      })}
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : toolId === 'merge' ? (
+            <div className="space-y-4">
+              {/* 1. Import from Device Storage */}
+              <label className="flex items-center justify-center gap-2.5 p-4 rounded-2xl border-2 border-dashed border-[#2563EB]/50 bg-[#2563EB]/5 hover:bg-[#2563EB]/10 cursor-pointer transition-colors">
+                <FolderOpen className="w-5 h-5 text-[#2563EB] shrink-0" />
+                <div className="text-left">
+                  <p className="text-sm font-bold text-[#142B4A] dark:text-white">
+                    {language === 'bn'
+                      ? 'ডিভাইস স্টোরেজ থেকে পিডিএফ ইমপোর্ট করুন'
+                      : 'Import PDFs from Device Storage'}
+                  </p>
+                  <p className="text-[11px] text-slate-500">
+                    {language === 'bn'
+                      ? 'ফোন বা কম্পিউটার থেকে এক বা একাধিক .PDF ফাইল যোগ করুন'
+                      : 'Pick one or multiple .PDF files from your phone or computer'}
+                  </p>
+                </div>
+                <input
+                  type="file"
+                  accept="application/pdf,.pdf"
+                  multiple
+                  onChange={handleImportMergePdfs}
+                  className="hidden"
+                />
+              </label>
+
+              {/* 2. Ordered Merge Queue */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-bold text-[#142B4A] dark:text-slate-200">
+                    {language === 'bn'
+                      ? `মার্জ কিউ (${mergeQueue.length}টি ফাইল নির্বাচিত)`
+                      : `Merge Order (${mergeQueue.length} selected)`}
+                  </span>
+                  {mergeQueue.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setMergeQueue([])}
+                      className="text-[11px] font-semibold text-rose-500 hover:underline"
+                    >
+                      {language === 'bn' ? 'সব মুছুন' : 'Clear all'}
                     </button>
-                  );
-                })}
+                  )}
+                </div>
+
+                {mergeQueue.length === 0 ? (
+                  <p className="text-xs text-slate-400 py-3 px-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 text-center">
+                    {language === 'bn'
+                      ? 'উপরে ডিভাইস স্টোরেজ বা নিচের রিসেন্ট ফাইল থেকে ২ বা তার বেশি পিডিএফ যোগ করুন।'
+                      : 'Add 2 or more PDFs from Device Storage above or Recent Files below.'}
+                  </p>
+                ) : (
+                  <div className="space-y-1.5 max-h-48 overflow-y-auto">
+                    {mergeQueue.map((item, idx) => (
+                      <div
+                        key={item.id}
+                        className="min-h-[46px] px-3 py-1.5 rounded-xl border border-[#2563EB]/40 bg-[#2563EB]/5 flex items-center justify-between gap-2 text-xs"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <span className="w-5 h-5 rounded-full bg-[#2563EB] text-white text-[10px] font-mono-nums font-bold flex items-center justify-center shrink-0">
+                            {idx + 1}
+                          </span>
+                          <div className="min-w-0">
+                            <p className="font-semibold text-[#142B4A] dark:text-white truncate">
+                              {item.name}
+                            </p>
+                            <p className="text-[10.5px] font-mono-nums text-slate-500">
+                              {item.pageCount}p · {formatBytes(item.sizeBytes)} ·{' '}
+                              {item.source === 'device' ? 'Device' : 'Recent'}
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            disabled={idx === 0}
+                            onClick={() => moveMergeItem(idx, -1)}
+                            aria-label="Move up"
+                            className="p-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 disabled:opacity-30"
+                          >
+                            <ArrowUp className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            disabled={idx === mergeQueue.length - 1}
+                            onClick={() => moveMergeItem(idx, 1)}
+                            aria-label="Move down"
+                            className="p-1.5 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 disabled:opacity-30"
+                          >
+                            <ArrowDown className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setMergeQueue((prev) => prev.filter((x) => x.id !== item.id))
+                            }
+                            aria-label="Remove from merge"
+                            className="p-1.5 rounded-lg bg-rose-50 dark:bg-rose-950/50 text-rose-600 dark:text-rose-300"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* 3. Recent Files Section */}
+              <div className="space-y-2 pt-1 border-t border-slate-100 dark:border-slate-800">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-xs font-bold text-slate-600 dark:text-slate-300 flex items-center gap-1.5">
+                    <Clock className="w-3.5 h-3.5 text-[#06B6D4]" />
+                    {language === 'bn' ? 'রিসেন্ট ফাইলস' : 'Recent Files'}
+                  </span>
+                  <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 flex-1 max-w-[200px]">
+                    <Search className="w-3.5 h-3.5 text-slate-400 shrink-0" />
+                    <input
+                      type="text"
+                      value={mergeSearch}
+                      onChange={(e) => setMergeSearch(e.target.value)}
+                      placeholder={language === 'bn' ? 'খুঁজুন...' : 'Filter recent...'}
+                      className="w-full bg-transparent text-xs focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <div className="max-h-52 overflow-y-auto space-y-1.5">
+                  {recentSorted
+                    .filter((d) =>
+                      mergeSearch.trim()
+                        ? d.name.toLowerCase().includes(mergeSearch.toLowerCase())
+                        : true
+                    )
+                    .map((d) => {
+                      const inQueue = mergeQueue.some((item) => item.id === d.id);
+                      return (
+                        <button
+                          key={d.id}
+                          type="button"
+                          onClick={() => toggleRecentInMerge(d)}
+                          className={`w-full min-h-[46px] px-3 py-1.5 rounded-xl border text-left flex items-center justify-between gap-2 text-xs font-medium transition-colors ${
+                            inQueue
+                              ? 'border-[#2563EB] bg-[#2563EB]/10 text-[#142B4A] dark:text-white'
+                              : 'border-slate-200 dark:border-slate-700 hover:border-[#2563EB]/40'
+                          }`}
+                        >
+                          <div className="min-w-0">
+                            <p className="truncate font-semibold">{d.name}</p>
+                            <p className="text-[10.5px] font-mono-nums text-slate-500">
+                              {d.pageCount}p · {formatBytes(d.sizeBytes)} ·{' '}
+                              {formatRelativeTime(d.lastOpenedAt || d.updatedAt)}
+                            </p>
+                          </div>
+                          <span
+                            className={`px-2 py-1 rounded-lg text-[11px] font-semibold flex items-center gap-1 shrink-0 ${
+                              inQueue
+                                ? 'bg-[#2563EB] text-white'
+                                : 'bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+                            }`}
+                          >
+                            {inQueue ? (
+                              <>
+                                <Check className="w-3 h-3" /> Added
+                              </>
+                            ) : (
+                              <>
+                                <Plus className="w-3 h-3" /> Add
+                              </>
+                            )}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  {recentSorted.length === 0 && (
+                    <p className="text-xs text-slate-400 text-center py-3">
+                      {language === 'bn'
+                        ? 'কোনো রিসেন্ট ফাইল নেই। ডিভাইস স্টোরেজ থেকে ইমপোর্ট করুন।'
+                        : 'No recent files found. Import PDFs from device storage above.'}
+                    </p>
+                  )}
+                </div>
               </div>
             </div>
-          ) : (
-            <div>
-              <label className="block text-xs font-semibold text-slate-500 mb-1.5">
-                Select Document
-              </label>
-              <select
-                value={selectedIds[0] || ''}
-                onChange={(e) => setSelectedIds([e.target.value])}
-                className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
-              >
-                {available.map((d) => (
-                  <option key={d.id} value={d.id}>
-                    {d.name} ({d.pageCount}p · {formatBytes(d.sizeBytes)})
-                  </option>
-                ))}
-              </select>
+          ) : toolId === 'unlockPdf' ? (
+            <div className="space-y-2.5">
+              {uploadedFiles[0] && (
+                <div className="px-3 py-2 rounded-xl bg-[#2563EB]/10 border border-[#2563EB]/40 text-xs flex items-center justify-between gap-2">
+                  <span className="font-semibold truncate">
+                    {uploadedFiles[0].name} ({formatBytes(uploadedFiles[0].size)})
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setUploadedFiles([])}
+                    className="p-1 text-rose-500"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+              <PdfSourcePicker
+                language={language}
+                docs={docs}
+                selectedDocId={uploadedFiles[0] ? '' : selectedIds[0]}
+                rawFileLabel={
+                  language === 'bn'
+                    ? 'ডিভাইস স্টোরেজ থেকে পাসওয়ার্ডযুক্ত পিডিএফ বাছুন'
+                    : 'Import Password-Protected PDF from Device Storage'
+                }
+                onRawPdfFile={(file) => {
+                  setUploadedFiles([file]);
+                  setSelectedIds([]);
+                }}
+                onSelectDoc={(d) => {
+                  setUploadedFiles([]);
+                  setSelectedIds([d.id]);
+                }}
+              />
             </div>
+          ) : (
+            <PdfSourcePicker
+              language={language}
+              docs={docs}
+              selectedDocId={selectedIds[0]}
+              label={language === 'bn' ? 'ডকুমেন্ট নির্বাচন করুন' : 'Select Document'}
+              onImportDoc={onSaveResultDoc}
+              onSelectDoc={(d) => setSelectedIds([d.id])}
+            />
           )}
 
           {/* Tool-specific controls */}
@@ -789,9 +1235,29 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           </button>
 
           {resultMsg && (
-            <div className="p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-800 dark:text-emerald-200 flex items-center gap-2">
-              <ShieldCheck className="w-4 h-4 shrink-0" />
-              <span>{resultMsg}</span>
+            <div className="p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-800 dark:text-emerald-200 space-y-2">
+              <div className="flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 shrink-0" />
+                <span>{resultMsg}</span>
+              </div>
+              {lastMergedResult && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    void downloadArrayBuffer(
+                      lastMergedResult.bytes,
+                      lastMergedResult.name,
+                      'application/pdf'
+                    )
+                  }
+                  className="w-full min-h-[40px] rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold flex items-center justify-center gap-1.5"
+                >
+                  <Download className="w-4 h-4" />
+                  <span>
+                    {language === 'bn' ? 'মার্জ করা পিডিএফ ডাউনলোড করুন' : 'Download Merged PDF'}
+                  </span>
+                </button>
+              )}
             </div>
           )}
           {errorMsg && (

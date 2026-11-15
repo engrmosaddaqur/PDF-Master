@@ -651,6 +651,7 @@ export default function App() {
           onClose={() => setWorkspace({ type: 'none' })}
           onSaveDocument={upsertDoc}
           onCreateExtractedDoc={upsertDoc}
+          onImportDoc={upsertDoc}
         />
       )}
 
@@ -678,6 +679,7 @@ export default function App() {
           initialDocId={workspace.docId}
           aiConsentGranted={settings.aiConsentGranted}
           localOnlyMode={settings.localOnlyMode}
+          onImportDoc={upsertDoc}
           onGrantAiConsent={() => updateSettings({ aiConsentGranted: true })}
           onClose={() => setWorkspace({ type: 'none' })}
           onSaveSearchablePdf={upsertDoc}
@@ -705,6 +707,7 @@ export default function App() {
           docs={docs}
           initialDocA={workspace.docIdA}
           initialDocB={workspace.docIdB}
+          onImportDoc={upsertDoc}
           onClose={() => setWorkspace({ type: 'none' })}
         />
       )}
@@ -716,6 +719,7 @@ export default function App() {
           initialDocId={workspace.docId}
           aiConsentGranted={settings.aiConsentGranted}
           localOnlyMode={settings.localOnlyMode}
+          onImportDoc={upsertDoc}
           onGrantConsent={() => updateSettings({ aiConsentGranted: true })}
           onClose={() => setWorkspace({ type: 'none' })}
         />

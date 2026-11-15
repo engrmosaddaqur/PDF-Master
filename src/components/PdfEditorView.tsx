@@ -12,6 +12,7 @@ import {
   Circle,
   Crop,
   Download,
+  Hand,
   Highlighter,
   ImagePlus,
   Italic,
@@ -64,6 +65,7 @@ interface PdfEditorViewProps {
 }
 
 type EditorTool =
+  | 'pan'
   | 'editText'
   | 'addText'
   | 'addImage'
@@ -154,7 +156,13 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     attachIntegritySeal: boolean;
   } | null>(null);
 
-  const [selectedImageId, setSelectedImageId] = useState<string | null>(null);
+  const [selectedElement, setSelectedElement] = useState<{
+    kind: 'image' | 'textBox' | 'annotation';
+    id: string;
+  } | null>(null);
+  const selectedImageId = selectedElement?.kind === 'image' ? selectedElement.id : null;
+  const setSelectedImageId = (id: string | null) =>
+    setSelectedElement(id ? { kind: 'image', id } : null);
   const [cropModalImg, setCropModalImg] = useState<AddedImageOverlay | null>(null);
   const [cropInsets, setCropInsets] = useState({ top: 0, right: 0, bottom: 0, left: 0 });
   const [draggingItem, setDraggingItem] = useState<{
@@ -164,6 +172,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     startClientY: number;
     origX: number;
     origY: number;
+    origPoints?: Array<{ x: number; y: number }>;
   } | null>(null);
   const [resizingImage, setResizingImage] = useState<{
     id: string;
@@ -175,6 +184,12 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     origW: number;
     origH: number;
   } | null>(null);
+  const [resizingTextBox, setResizingTextBox] = useState<{
+    id: string;
+    startClientX: number;
+    origW: number;
+  } | null>(null);
+  const preGestureSnapshotRef = useRef<EditorStateSnapshot | null>(null);
   const pointerMovedRef = useRef(false);
   const [saving, setSaving] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
@@ -218,6 +233,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     setScale,
     minScale: 0.4,
     maxScale: 3.0,
+    dragPan: activeTool === 'pan' ? 'all' : 'mouse',
   });
 
   // Keyboard arrow / PageUp / PageDown / Delete navigation
@@ -270,14 +286,25 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       } else if (e.key === 'PageUp') {
         e.preventDefault();
         setPageNumber((p) => Math.max(1, p - 1));
-      } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedImageId) {
+      } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedElement) {
         e.preventDefault();
-        const delId = selectedImageId;
+        const targetEl = selectedElement;
         commitState((prev) => ({
           ...prev,
-          addedImages: prev.addedImages.filter((im) => im.id !== delId),
+          addedImages:
+            targetEl.kind === 'image'
+              ? prev.addedImages.filter((im) => im.id !== targetEl.id)
+              : prev.addedImages,
+          addedTexts:
+            targetEl.kind === 'textBox'
+              ? prev.addedTexts.filter((tb) => tb.id !== targetEl.id)
+              : prev.addedTexts,
+          annotations:
+            targetEl.kind === 'annotation'
+              ? prev.annotations.filter((an) => an.id !== targetEl.id)
+              : prev.annotations,
         }));
-        setSelectedImageId(null);
+        setSelectedElement(null);
       }
     };
 
@@ -289,14 +316,14 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     stickyPos,
     showSigModal,
     cropModalImg,
-    selectedImageId,
+    selectedElement,
     doc.pageCount,
   ]);
 
   const [renderScale, setRenderScale] = useState(scale);
 
   useEffect(() => {
-    const id = setTimeout(() => setRenderScale(scale), 110);
+    const id = setTimeout(() => setRenderScale(scale), 180);
     return () => clearTimeout(id);
   }, [scale]);
 
@@ -463,7 +490,21 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   };
 
   const handleOverlayPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (resizingTextBox) {
+      pointerMovedRef.current = true;
+      const dx = (e.clientX - resizingTextBox.startClientX) / scale;
+      const newW = Math.round(Math.max(80, Math.min(pageSize.width - 20, resizingTextBox.origW + dx)));
+      setState((prev) => ({
+        ...prev,
+        addedTexts: prev.addedTexts.map((tb) =>
+          tb.id === resizingTextBox.id ? { ...tb, width: newW } : tb
+        ),
+      }));
+      return;
+    }
+
     if (resizingImage) {
+      pointerMovedRef.current = true;
       const dx = (e.clientX - resizingImage.startClientX) / scale;
       const dy = (e.clientY - resizingImage.startClientY) / scale;
       const aspect = resizingImage.origW / Math.max(1, resizingImage.origH);
@@ -529,9 +570,19 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         }
         return {
           ...prev,
-          annotations: prev.annotations.map((an) =>
-            an.id === draggingItem.id ? { ...an, x: nx, y: ny } : an
-          ),
+          annotations: prev.annotations.map((an) => {
+            if (an.id !== draggingItem.id) return an;
+            if (an.kind === 'freehand' && draggingItem.origPoints) {
+              return {
+                ...an,
+                points: draggingItem.origPoints.map((pt) => ({
+                  x: pt.x + dx,
+                  y: pt.y + dy,
+                })),
+              };
+            }
+            return { ...an, x: nx, y: ny };
+          }),
         };
       });
       return;
@@ -553,16 +604,46 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     }
   };
 
+  const handleOverlayPointerCancel = () => {
+    setResizingTextBox(null);
+    setResizingImage(null);
+    setDraggingItem(null);
+    preGestureSnapshotRef.current = null;
+    dragStartRef.current = null;
+    setLiveFreehand([]);
+    setLiveBox(null);
+  };
+
   const handleOverlayPointerUp = () => {
+    if (resizingTextBox) {
+      if (pointerMovedRef.current && preGestureSnapshotRef.current) {
+        setUndoStack((u) => [...u.slice(-24), preGestureSnapshotRef.current!]);
+        setRedoStack([]);
+      }
+      preGestureSnapshotRef.current = null;
+      setResizingTextBox(null);
+      return;
+    }
     if (resizingImage) {
+      if (pointerMovedRef.current && preGestureSnapshotRef.current) {
+        setUndoStack((u) => [...u.slice(-24), preGestureSnapshotRef.current!]);
+        setRedoStack([]);
+      }
+      preGestureSnapshotRef.current = null;
       setResizingImage(null);
       return;
     }
     if (draggingItem) {
       const wasTap = !pointerMovedRef.current;
       const item = draggingItem;
+      if (!wasTap && preGestureSnapshotRef.current) {
+        setUndoStack((u) => [...u.slice(-24), preGestureSnapshotRef.current!]);
+        setRedoStack([]);
+      }
+      preGestureSnapshotRef.current = null;
       setDraggingItem(null);
       if (wasTap) {
+        setSelectedElement({ kind: item.kind, id: item.id });
         if (item.kind === 'textBox') {
           const tb = state.addedTexts.find((x) => x.id === item.id);
           if (tb) openEditAddedTextBox(tb);
@@ -790,8 +871,17 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   const pageAddedImages = state.addedImages.filter((im) => im.pageNumber === pageNumber);
   const pageAnnotations = state.annotations.filter((an) => an.pageNumber === pageNumber);
   const selectedImg = pageAddedImages.find((i) => i.id === selectedImageId);
+  const selectedTextBox =
+    selectedElement?.kind === 'textBox'
+      ? pageAddedTexts.find((tb) => tb.id === selectedElement.id)
+      : undefined;
+  const selectedAnn =
+    selectedElement?.kind === 'annotation'
+      ? pageAnnotations.find((an) => an.id === selectedElement.id)
+      : undefined;
 
   const toolsList: Array<{ id: EditorTool; label: string; icon: React.ReactNode }> = [
+    { id: 'pan', label: language === 'bn' ? 'প্যান' : 'Pan', icon: <Hand className="w-4 h-4" /> },
     { id: 'editText', label: t.editor.tools.selectText, icon: <MousePointer className="w-4 h-4" /> },
     { id: 'addText', label: t.editor.tools.addText, icon: <TypeIcon className="w-4 h-4" /> },
     { id: 'addImage', label: t.editor.tools.addImage, icon: <ImagePlus className="w-4 h-4" /> },
@@ -900,82 +990,252 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         </div>
       </div>
 
-      {/* Selected Image Manipulation Toolbar */}
-      {selectedImg && (
-        <div className="px-3 py-2 bg-[#142B4A] text-white flex items-center justify-between gap-2 text-xs">
-          <span>Selected Image</span>
-          <div className="flex items-center gap-1.5">
+      {/* Main Editable Page Canvas Area with non-shifting floating element toolbar */}
+      <div className="relative flex-1 flex flex-col overflow-hidden">
+        {(selectedImg || selectedTextBox || selectedAnn) && (
+          <div className="absolute top-2 left-1/2 -translate-x-1/2 z-30 max-w-[94vw] overflow-x-auto no-scrollbar px-3 py-1.5 rounded-2xl bg-[#142B4A]/95 backdrop-blur-md text-white shadow-xl border border-white/15 flex items-center gap-1.5 text-xs">
+            {selectedImg && (
+              <>
+                <span className="font-semibold text-cyan-300 pr-1 whitespace-nowrap">Image</span>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id
+                          ? { ...im, width: Math.round(im.width * 1.15), height: Math.round(im.height * 1.15) }
+                          : im
+                      ),
+                    }))
+                  }
+                  className="px-2.5 py-1 rounded-lg bg-white/15 whitespace-nowrap"
+                >
+                  + Size
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id
+                          ? { ...im, width: Math.max(32, Math.round(im.width * 0.85)), height: Math.max(32, Math.round(im.height * 0.85)) }
+                          : im
+                      ),
+                    }))
+                  }
+                  className="px-2.5 py-1 rounded-lg bg-white/15 whitespace-nowrap"
+                >
+                  - Size
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCropInsets({ top: 0, right: 0, bottom: 0, left: 0 });
+                    setCropModalImg(selectedImg);
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
+                >
+                  <Crop className="w-3.5 h-3.5" /> Crop
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, rotation: (im.rotation + 90) % 360 } : im
+                      ),
+                    }))
+                  }
+                  className="px-2.5 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
+                >
+                  <RotateCw className="w-3.5 h-3.5" /> 90°
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    commitState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.filter((im) => im.id !== selectedImg.id),
+                    }));
+                    setSelectedElement(null);
+                  }}
+                  aria-label="Delete selected image"
+                  className="px-2.5 py-1 rounded-lg bg-rose-500 text-white"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </>
+            )}
+
+            {selectedTextBox && (
+              <>
+                <span className="font-semibold text-cyan-300 pr-1 whitespace-nowrap">Text</span>
+                <button
+                  type="button"
+                  onClick={() => openEditAddedTextBox(selectedTextBox)}
+                  className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white font-semibold flex items-center gap-1 whitespace-nowrap"
+                >
+                  <Pencil className="w-3 h-3" /> Edit
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedTexts: prev.addedTexts.map((tb) =>
+                        tb.id === selectedTextBox.id ? { ...tb, fontSize: Math.min(64, tb.fontSize + 2) } : tb
+                      ),
+                    }))
+                  }
+                  className="px-2.5 py-1 rounded-lg bg-white/15 whitespace-nowrap"
+                >
+                  A+
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedTexts: prev.addedTexts.map((tb) =>
+                        tb.id === selectedTextBox.id ? { ...tb, fontSize: Math.max(8, tb.fontSize - 2) } : tb
+                      ),
+                    }))
+                  }
+                  className="px-2.5 py-1 rounded-lg bg-white/15 whitespace-nowrap"
+                >
+                  A-
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    commitState((prev) => ({
+                      ...prev,
+                      addedTexts: prev.addedTexts.filter((tb) => tb.id !== selectedTextBox.id),
+                    }));
+                    setSelectedElement(null);
+                  }}
+                  aria-label="Delete text box"
+                  className="px-2.5 py-1 rounded-lg bg-rose-500 text-white"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </>
+            )}
+
+            {selectedAnn && (
+              <>
+                <span className="font-semibold text-cyan-300 pr-1 capitalize whitespace-nowrap">
+                  {selectedAnn.kind}
+                </span>
+                {selectedAnn.kind === 'sticky' && (
+                  <button
+                    type="button"
+                    onClick={() => openEditStickyNote(selectedAnn)}
+                    className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white font-semibold flex items-center gap-1 whitespace-nowrap"
+                  >
+                    <Pencil className="w-3 h-3" /> Edit Note
+                  </button>
+                )}
+                {(selectedAnn.kind === 'signature' ||
+                  selectedAnn.kind === 'rect' ||
+                  selectedAnn.kind === 'circle' ||
+                  selectedAnn.kind === 'highlight') && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        commitState((prev) => ({
+                          ...prev,
+                          annotations: prev.annotations.map((an) =>
+                            an.id === selectedAnn.id
+                              ? { ...an, width: Math.round(an.width * 1.15), height: Math.round(an.height * 1.15) }
+                              : an
+                          ),
+                        }))
+                      }
+                      className="px-2.5 py-1 rounded-lg bg-white/15 whitespace-nowrap"
+                    >
+                      + Size
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        commitState((prev) => ({
+                          ...prev,
+                          annotations: prev.annotations.map((an) =>
+                            an.id === selectedAnn.id
+                              ? {
+                                  ...an,
+                                  width: Math.max(16, Math.round(an.width * 0.85)),
+                                  height: Math.max(10, Math.round(an.height * 0.85)),
+                                }
+                              : an
+                          ),
+                        }))
+                      }
+                      className="px-2.5 py-1 rounded-lg bg-white/15 whitespace-nowrap"
+                    >
+                      - Size
+                    </button>
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      annotations: prev.annotations.map((an) =>
+                        an.id === selectedAnn.id ? { ...an, color: activeColor } : an
+                      ),
+                    }))
+                  }
+                  className="px-2.5 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
+                >
+                  <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ backgroundColor: activeColor }} />
+                  Color
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    commitState((prev) => ({
+                      ...prev,
+                      annotations: prev.annotations.filter((an) => an.id !== selectedAnn.id),
+                    }));
+                    setSelectedElement(null);
+                  }}
+                  aria-label="Delete annotation"
+                  className="px-2.5 py-1 rounded-lg bg-rose-500 text-white"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+              </>
+            )}
+
             <button
-              onClick={() =>
-                commitState((prev) => ({
-                  ...prev,
-                  addedImages: prev.addedImages.map((im) =>
-                    im.id === selectedImg.id ? { ...im, width: im.width * 1.15, height: im.height * 1.15 } : im
-                  ),
-                }))
-              }
-              className="px-2.5 py-1 rounded-lg bg-white/15"
+              type="button"
+              onClick={() => setSelectedElement(null)}
+              aria-label="Deselect element"
+              className="px-1.5 py-1 rounded-lg hover:bg-white/10 text-slate-300"
             >
-              + Size
-            </button>
-            <button
-              onClick={() =>
-                commitState((prev) => ({
-                  ...prev,
-                  addedImages: prev.addedImages.map((im) =>
-                    im.id === selectedImg.id ? { ...im, width: Math.max(40, im.width * 0.85), height: Math.max(40, im.height * 0.85) } : im
-                  ),
-                }))
-              }
-              className="px-2.5 py-1 rounded-lg bg-white/15"
-            >
-              - Size
-            </button>
-            <button
-              onClick={() => {
-                setCropInsets({ top: 0, right: 0, bottom: 0, left: 0 });
-                setCropModalImg(selectedImg);
-              }}
-              className="px-2.5 py-1 rounded-lg bg-white/15 flex items-center gap-1"
-            >
-              <Crop className="w-3.5 h-3.5" /> Crop
-            </button>
-            <button
-              onClick={() =>
-                commitState((prev) => ({
-                  ...prev,
-                  addedImages: prev.addedImages.map((im) =>
-                    im.id === selectedImg.id ? { ...im, rotation: (im.rotation + 90) % 360 } : im
-                  ),
-                }))
-              }
-              className="px-2.5 py-1 rounded-lg bg-white/15 flex items-center gap-1"
-            >
-              <RotateCw className="w-3.5 h-3.5" /> 90°
-            </button>
-            <button
-              onClick={() => {
-                commitState((prev) => ({
-                  ...prev,
-                  addedImages: prev.addedImages.filter((im) => im.id !== selectedImg.id),
-                }));
-                setSelectedImageId(null);
-              }}
-              className="px-2.5 py-1 rounded-lg bg-rose-500 text-white"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
+              <X className="w-3.5 h-3.5" />
             </button>
           </div>
-        </div>
-      )}
+        )}
 
-      {/* Main Editable Page Canvas */}
       <div
         ref={canvasScrollRef}
-        style={{ touchAction: 'pan-x pan-y' }}
-        className="flex-1 overflow-auto p-3 sm:p-6 overscroll-contain"
+        style={{
+          touchAction: activeTool === 'pan' ? 'none' : 'pan-x pan-y',
+          overscrollBehavior: 'contain',
+          scrollBehavior: 'auto',
+          WebkitOverflowScrolling: 'touch',
+        }}
+        className={`flex-1 overflow-auto ${activeTool === 'pan' ? 'cursor-grab' : ''}`}
       >
-        <div className="min-w-full min-h-full w-fit flex items-start justify-center">
+        <div className="min-w-full min-h-full w-fit p-3 sm:p-6 flex items-start justify-center">
         <div
           className="relative bg-white shadow-xl rounded-md overflow-hidden select-none shrink-0"
           style={{ width: pageSize.width * scale, height: pageSize.height * scale }}
@@ -989,14 +1249,71 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             onPointerDown={handleOverlayPointerDown}
             onPointerMove={handleOverlayPointerMove}
             onPointerUp={handleOverlayPointerUp}
-            style={{ touchAction: isDragStrokeTool ? 'none' : 'pan-x pan-y' }}
+            onPointerCancel={handleOverlayPointerCancel}
+            style={{
+              touchAction: activeTool === 'pan' || isDragStrokeTool ? 'none' : 'pan-x pan-y',
+              pointerEvents: activeTool === 'pan' ? 'none' : 'auto',
+            }}
             className="absolute inset-0"
           >
-            {/* Detected native PDF text runs (clickable when editText is active) */}
+            {/* Always render committed native text replacements across all tools */}
+            {pageReplacements.map((rep) => {
+              const runMatch = textRuns.find((r) => r.id === rep.runId);
+              return (
+                <button
+                  key={rep.id}
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (runMatch) {
+                      handleOpenTextRunEditor(runMatch);
+                    } else {
+                      handleOpenTextRunEditor({
+                        id: rep.runId,
+                        pageNumber: rep.pageNumber,
+                        str: rep.originalText,
+                        x: rep.x,
+                        y: rep.y,
+                        width: rep.width,
+                        height: rep.height,
+                        fontSize: rep.fontSize,
+                        fontName: 'Helvetica',
+                      });
+                    }
+                  }}
+                  title="Tap to modify replaced text"
+                  style={{
+                    left: rep.x * scale,
+                    top: rep.y * scale,
+                    minWidth: Math.max(16, rep.width * scale),
+                    minHeight: Math.max(14, rep.height * scale),
+                  }}
+                  className="absolute text-left rounded bg-white border border-[#2563EB]/80 z-10"
+                >
+                  {!rep.deleted && (
+                    <span
+                      style={{
+                        fontSize: rep.fontSize * scale,
+                        color: rep.color,
+                        fontWeight: rep.bold ? 700 : 400,
+                        fontStyle: rep.italic ? 'italic' : 'normal',
+                        textDecoration: rep.underline ? 'underline' : 'none',
+                        letterSpacing: `${(rep.letterSpacing || 0) * scale}px`,
+                      }}
+                      className="block leading-tight whitespace-nowrap px-0.5"
+                    >
+                      {rep.newText}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+
+            {/* Untouched native PDF text runs (interactive when editText is active) */}
             {activeTool === 'editText' &&
-              textRuns.map((run) => {
-                const replaced = pageReplacements.find((r) => r.runId === run.id);
-                return (
+              textRuns
+                .filter((run) => !pageReplacements.some((r) => r.runId === run.id))
+                .map((run) => (
                   <button
                     key={run.id}
                     type="button"
@@ -1011,92 +1328,103 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       minWidth: Math.max(16, run.width * scale),
                       minHeight: Math.max(14, run.height * scale),
                     }}
-                    className={`absolute text-left rounded transition-colors ${
-                      replaced
-                        ? 'bg-white border border-[#2563EB]'
-                        : 'hover:bg-[#2563EB]/15 border border-transparent hover:border-[#2563EB]/50'
-                    }`}
-                  >
-                    {replaced && !replaced.deleted && (
-                      <span
-                        style={{
-                          fontSize: replaced.fontSize * scale,
-                          color: replaced.color,
-                          fontWeight: replaced.bold ? 700 : 400,
-                          fontStyle: replaced.italic ? 'italic' : 'normal',
-                          textDecoration: replaced.underline ? 'underline' : 'none',
-                        }}
-                        className="block leading-tight whitespace-nowrap px-0.5"
-                      >
-                        {replaced.newText}
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
+                    className="absolute text-left rounded transition-colors hover:bg-[#2563EB]/15 border border-transparent hover:border-[#2563EB]/50"
+                  />
+                ))}
 
-            {/* Added text boxes (drag to move, tap or pencil to edit, tap × to delete) */}
-            {pageAddedTexts.map((tb) => (
-              <div
-                key={tb.id}
-                onPointerDown={(e) => {
-                  e.stopPropagation();
-                  pointerMovedRef.current = false;
-                  overlayRef.current?.setPointerCapture?.(e.pointerId);
-                  setDraggingItem({
-                    kind: 'textBox',
-                    id: tb.id,
-                    startClientX: e.clientX,
-                    startClientY: e.clientY,
-                    origX: tb.x,
-                    origY: tb.y,
-                  });
-                }}
-                style={{
-                  left: tb.x * scale,
-                  top: tb.y * scale,
-                  maxWidth: tb.width * scale,
-                  fontSize: tb.fontSize * scale,
-                  color: tb.color,
-                  fontWeight: tb.bold ? 700 : 400,
-                  fontStyle: tb.italic ? 'italic' : 'normal',
-                  textDecoration: tb.underline ? 'underline' : 'none',
-                  textAlign: tb.align,
-                  letterSpacing: `${tb.letterSpacing * scale}px`,
-                }}
-                title="Drag to move · Tap to edit text"
-                className="group absolute px-1.5 py-0.5 rounded border border-dashed border-[#2563EB]/70 bg-white/90 whitespace-pre-wrap cursor-move"
-              >
-                {tb.text}
-                <button
-                  type="button"
-                  onPointerDown={(e) => e.stopPropagation()}
-                  onClick={(e) => {
+            {/* Added text boxes (drag to move, drag right handle to resize width, tap or pencil to edit, tap × to delete) */}
+            {pageAddedTexts.map((tb) => {
+              const isSelected = selectedElement?.kind === 'textBox' && selectedElement.id === tb.id;
+              return (
+                <div
+                  key={tb.id}
+                  onPointerDown={(e) => {
                     e.stopPropagation();
-                    openEditAddedTextBox(tb);
+                    pointerMovedRef.current = false;
+                    preGestureSnapshotRef.current = state;
+                    setSelectedElement({ kind: 'textBox', id: tb.id });
+                    overlayRef.current?.setPointerCapture?.(e.pointerId);
+                    setDraggingItem({
+                      kind: 'textBox',
+                      id: tb.id,
+                      startClientX: e.clientX,
+                      startClientY: e.clientY,
+                      origX: tb.x,
+                      origY: tb.y,
+                    });
                   }}
-                  aria-label="Edit text box"
-                  className="absolute -top-2.5 right-3.5 w-5 h-5 rounded-full bg-[#2563EB] text-white flex items-center justify-center shadow"
-                >
-                  <Pencil className="w-2.5 h-2.5" />
-                </button>
-                <button
-                  type="button"
-                  onPointerDown={(e) => e.stopPropagation()}
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    commitState((prev) => ({
-                      ...prev,
-                      addedTexts: prev.addedTexts.filter((x) => x.id !== tb.id),
-                    }));
+                  style={{
+                    left: tb.x * scale,
+                    top: tb.y * scale,
+                    width: tb.width * scale,
+                    fontSize: tb.fontSize * scale,
+                    color: tb.color,
+                    fontWeight: tb.bold ? 700 : 400,
+                    fontStyle: tb.italic ? 'italic' : 'normal',
+                    textDecoration: tb.underline ? 'underline' : 'none',
+                    textAlign: tb.align,
+                    letterSpacing: `${tb.letterSpacing * scale}px`,
+                    touchAction: 'none',
                   }}
-                  aria-label="Delete text box"
-                  className="absolute -top-2.5 -right-2.5 w-5 h-5 rounded-full bg-rose-600 text-white flex items-center justify-center shadow"
+                  title="Drag to move · Tap to edit text"
+                  className={`group absolute px-1.5 py-0.5 rounded bg-white/90 whitespace-pre-wrap cursor-move z-10 ${
+                    isSelected
+                      ? 'border-2 border-[#2563EB] ring-2 ring-[#2563EB]/30'
+                      : 'border border-dashed border-[#2563EB]/70'
+                  }`}
                 >
-                  <X className="w-3 h-3" />
-                </button>
-              </div>
-            ))}
+                  {tb.text}
+                  <button
+                    type="button"
+                    style={{ touchAction: 'none' }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      openEditAddedTextBox(tb);
+                    }}
+                    aria-label="Edit text box"
+                    className="absolute -top-3 right-5 w-6 h-6 rounded-full bg-[#2563EB] text-white flex items-center justify-center shadow-md"
+                  >
+                    <Pencil className="w-3 h-3" />
+                  </button>
+                  <button
+                    type="button"
+                    style={{ touchAction: 'none' }}
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      commitState((prev) => ({
+                        ...prev,
+                        addedTexts: prev.addedTexts.filter((x) => x.id !== tb.id),
+                      }));
+                      if (isSelected) setSelectedElement(null);
+                    }}
+                    aria-label="Delete text box"
+                    className="absolute -top-3 -right-2.5 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                  {/* Width resize handle */}
+                  <div
+                    style={{ touchAction: 'none' }}
+                    onPointerDown={(e) => {
+                      e.stopPropagation();
+                      pointerMovedRef.current = false;
+                      preGestureSnapshotRef.current = state;
+                      setSelectedElement({ kind: 'textBox', id: tb.id });
+                      overlayRef.current?.setPointerCapture?.(e.pointerId);
+                      setResizingTextBox({
+                        id: tb.id,
+                        startClientX: e.clientX,
+                        origW: tb.width,
+                      });
+                    }}
+                    title="Drag to resize text box width"
+                    className="absolute top-1/2 -right-2 -translate-y-1/2 w-4 h-7 rounded-full bg-white border-2 border-[#2563EB] shadow cursor-ew-resize"
+                  />
+                </div>
+              );
+            })}
 
             {/* Added images (drag to move, drag corners to resize, tap × to delete) */}
             {pageAddedImages.map((im) => {
@@ -1107,6 +1435,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   onPointerDown={(e) => {
                     e.stopPropagation();
                     pointerMovedRef.current = false;
+                    preGestureSnapshotRef.current = state;
                     setSelectedImageId(im.id);
                     overlayRef.current?.setPointerCapture?.(e.pointerId);
                     setDraggingItem({
@@ -1123,8 +1452,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     top: im.y * scale,
                     width: im.width * scale,
                     height: im.height * scale,
+                    touchAction: 'none',
                   }}
-                  className={`group absolute cursor-move select-none ${
+                  className={`group absolute cursor-move select-none z-10 ${
                     isSelected ? 'ring-2 ring-[#2563EB]' : 'hover:ring-1 hover:ring-[#2563EB]/60'
                   }`}
                 >
@@ -1139,6 +1469,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   {/* Direct on-image Delete button */}
                   <button
                     type="button"
+                    style={{ touchAction: 'none' }}
                     onPointerDown={(e) => e.stopPropagation()}
                     onClick={(e) => {
                       e.stopPropagation();
@@ -1149,27 +1480,27 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       if (isSelected) setSelectedImageId(null);
                     }}
                     aria-label="Delete image"
-                    className="absolute -top-2.5 -right-2.5 z-20 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md"
+                    className="absolute -top-3 -right-3 z-20 w-7 h-7 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md"
                   >
-                    <X className="w-3.5 h-3.5" />
+                    <X className="w-4 h-4" />
                   </button>
 
-                  {/* 4 Corner Drag-Resize Handles (drag inward/outward to resize) */}
-                  {(['nw', 'ne', 'sw', 'se'] as const).map((corner) => {
+                  {/* Corner Drag-Resize Handles (nw, sw, se) with 24px touch target */}
+                  {(['nw', 'sw', 'se'] as const).map((corner) => {
                     const posClass =
                       corner === 'nw'
-                        ? '-top-1.5 -left-1.5 cursor-nwse-resize'
-                        : corner === 'ne'
-                        ? '-top-1.5 -right-1.5 cursor-nesw-resize'
+                        ? '-top-2.5 -left-2.5 cursor-nwse-resize'
                         : corner === 'sw'
-                        ? '-bottom-1.5 -left-1.5 cursor-nesw-resize'
-                        : '-bottom-1.5 -right-1.5 cursor-nwse-resize';
-                    if (corner === 'ne') return null; // top-right hosts delete button
+                        ? '-bottom-2.5 -left-2.5 cursor-nesw-resize'
+                        : '-bottom-2.5 -right-2.5 cursor-nwse-resize';
                     return (
                       <div
                         key={corner}
+                        style={{ touchAction: 'none' }}
                         onPointerDown={(e) => {
                           e.stopPropagation();
+                          pointerMovedRef.current = false;
+                          preGestureSnapshotRef.current = state;
                           setSelectedImageId(im.id);
                           overlayRef.current?.setPointerCapture?.(e.pointerId);
                           setResizingImage({
@@ -1184,7 +1515,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                           });
                         }}
                         title="Drag to resize picture"
-                        className={`absolute ${posClass} z-10 w-4 h-4 rounded-full bg-white border-2 border-[#2563EB] shadow`}
+                        className={`absolute ${posClass} z-20 w-6 h-6 rounded-full bg-white border-2 border-[#2563EB] shadow-md`}
                       />
                     );
                   })}
@@ -1198,6 +1529,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               viewBox={`0 0 ${pageSize.width} ${pageSize.height}`}
             >
               {pageAnnotations.map((ann) => {
+                const isSel = selectedElement?.kind === 'annotation' && selectedElement.id === ann.id;
                 if (ann.kind === 'highlight') {
                   return (
                     <rect
@@ -1208,6 +1540,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       height={ann.height}
                       fill={ann.color}
                       fillOpacity={0.35}
+                      stroke={isSel ? '#2563EB' : undefined}
+                      strokeWidth={isSel ? 1.5 : undefined}
+                      strokeDasharray={isSel ? '4 2' : undefined}
                     />
                   );
                 }
@@ -1220,7 +1555,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       x2={ann.x + ann.width}
                       y2={ann.y + ann.height}
                       stroke={ann.color}
-                      strokeWidth={2}
+                      strokeWidth={isSel ? 3.5 : 2}
                     />
                   );
                 }
@@ -1233,7 +1568,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       x2={ann.x + ann.width}
                       y2={ann.y + ann.height / 2}
                       stroke={ann.color}
-                      strokeWidth={2}
+                      strokeWidth={isSel ? 3.5 : 2}
                     />
                   );
                 }
@@ -1247,7 +1582,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       height={ann.height}
                       fill="none"
                       stroke={ann.color}
-                      strokeWidth={ann.strokeWidth || 2}
+                      strokeWidth={(ann.strokeWidth || 2) + (isSel ? 1.5 : 0)}
                     />
                   );
                 }
@@ -1261,22 +1596,37 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       ry={ann.height / 2}
                       fill="none"
                       stroke={ann.color}
-                      strokeWidth={ann.strokeWidth || 2}
+                      strokeWidth={(ann.strokeWidth || 2) + (isSel ? 1.5 : 0)}
                     />
                   );
                 }
                 if (ann.kind === 'arrow') {
+                  const sx = ann.x;
+                  const sy = ann.y;
+                  const ex = ann.x + ann.width;
+                  const ey = ann.y + ann.height;
+                  const ang = Math.atan2(ey - sy, ex - sx);
+                  const headLen = 10;
                   return (
-                    <line
-                      key={ann.id}
-                      x1={ann.x}
-                      y1={ann.y}
-                      x2={ann.x + ann.width}
-                      y2={ann.y + ann.height}
-                      stroke={ann.color}
-                      strokeWidth={ann.strokeWidth || 2.5}
-                      strokeLinecap="round"
-                    />
+                    <g key={ann.id}>
+                      <line
+                        x1={sx}
+                        y1={sy}
+                        x2={ex}
+                        y2={ey}
+                        stroke={ann.color}
+                        strokeWidth={(ann.strokeWidth || 2.5) + (isSel ? 1.5 : 0)}
+                        strokeLinecap="round"
+                      />
+                      <path
+                        d={`M ${ex - headLen * Math.cos(ang - Math.PI / 6)} ${ey - headLen * Math.sin(ang - Math.PI / 6)} L ${ex} ${ey} L ${ex - headLen * Math.cos(ang + Math.PI / 6)} ${ey - headLen * Math.sin(ang + Math.PI / 6)}`}
+                        fill="none"
+                        stroke={ann.color}
+                        strokeWidth={(ann.strokeWidth || 2.5) + (isSel ? 1.5 : 0)}
+                        strokeLinecap="round"
+                        strokeLinejoin="round"
+                      />
+                    </g>
                   );
                 }
                 if (ann.kind === 'freehand' && ann.points && ann.points.length > 1) {
@@ -1289,7 +1639,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       d={d}
                       fill="none"
                       stroke={ann.color}
-                      strokeWidth={ann.strokeWidth || 2.5}
+                      strokeWidth={(ann.strokeWidth || 2.5) + (isSel ? 1.5 : 0)}
                       strokeLinecap="round"
                       strokeLinejoin="round"
                     />
@@ -1309,26 +1659,117 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               )}
 
               {liveBox && (
-                <rect
-                  x={liveBox.x}
-                  y={liveBox.y}
-                  width={Math.abs(liveBox.w)}
-                  height={Math.abs(liveBox.h)}
-                  fill="none"
-                  stroke={activeColor}
-                  strokeWidth={2}
-                  strokeDasharray="4 2"
-                />
+                activeTool === 'arrow' ? (
+                  <line
+                    x1={liveBox.x}
+                    y1={liveBox.y}
+                    x2={liveBox.x + liveBox.w}
+                    y2={liveBox.y + liveBox.h}
+                    stroke={activeColor}
+                    strokeWidth={2.5}
+                    strokeDasharray="4 2"
+                  />
+                ) : (
+                  <rect
+                    x={liveBox.x}
+                    y={liveBox.y}
+                    width={Math.abs(liveBox.w)}
+                    height={Math.abs(liveBox.h)}
+                    fill="none"
+                    stroke={activeColor}
+                    strokeWidth={2}
+                    strokeDasharray="4 2"
+                  />
+                )
               )}
             </svg>
+
+            {/* Interactive hitboxes for drawn vector annotations (tap to select, drag to move, tap × to delete) */}
+            {!isDragStrokeTool &&
+              pageAnnotations
+                .filter((a) => a.kind !== 'sticky' && a.kind !== 'stamp' && a.kind !== 'signature')
+                .map((ann) => {
+                  const isSel = selectedElement?.kind === 'annotation' && selectedElement.id === ann.id;
+                  let bx = ann.x;
+                  let by = ann.y;
+                  let bw = Math.max(20, Math.abs(ann.width));
+                  let bh = Math.max(16, Math.abs(ann.height));
+                  if (ann.kind === 'arrow') {
+                    bx = Math.min(ann.x, ann.x + ann.width) - 6;
+                    by = Math.min(ann.y, ann.y + ann.height) - 6;
+                    bw = Math.max(20, Math.abs(ann.width) + 12);
+                    bh = Math.max(20, Math.abs(ann.height) + 12);
+                  } else if (ann.kind === 'freehand' && ann.points && ann.points.length > 0) {
+                    const xs = ann.points.map((p) => p.x);
+                    const ys = ann.points.map((p) => p.y);
+                    bx = Math.min(...xs) - 6;
+                    by = Math.min(...ys) - 6;
+                    bw = Math.max(20, Math.max(...xs) - Math.min(...xs) + 12);
+                    bh = Math.max(20, Math.max(...ys) - Math.min(...ys) + 12);
+                  }
+                  return (
+                    <div
+                      key={`hit_${ann.id}`}
+                      onPointerDown={(e) => {
+                        e.stopPropagation();
+                        pointerMovedRef.current = false;
+                        preGestureSnapshotRef.current = state;
+                        setSelectedElement({ kind: 'annotation', id: ann.id });
+                        overlayRef.current?.setPointerCapture?.(e.pointerId);
+                        setDraggingItem({
+                          kind: 'annotation',
+                          id: ann.id,
+                          startClientX: e.clientX,
+                          startClientY: e.clientY,
+                          origX: ann.x,
+                          origY: ann.y,
+                          origPoints: ann.points ? ann.points.map((p) => ({ ...p })) : undefined,
+                        });
+                      }}
+                      style={{
+                        left: bx * scale,
+                        top: by * scale,
+                        width: bw * scale,
+                        height: bh * scale,
+                        touchAction: 'none',
+                      }}
+                      className={`absolute cursor-move ${
+                        isSel ? 'ring-2 ring-[#2563EB] rounded bg-[#2563EB]/5' : ''
+                      }`}
+                    >
+                      {isSel && (
+                        <button
+                          type="button"
+                          style={{ touchAction: 'none' }}
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            commitState((prev) => ({
+                              ...prev,
+                              annotations: prev.annotations.filter((x) => x.id !== ann.id),
+                            }));
+                            setSelectedElement(null);
+                          }}
+                          aria-label="Delete shape"
+                          className="absolute -top-3 -right-3 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
 
             {/* Sticky notes, stamps, signatures (drag to move, tap × to delete) */}
             {pageAnnotations
               .filter((a) => a.kind === 'sticky' || a.kind === 'stamp' || a.kind === 'signature')
               .map((ann) => {
+                const isSel = selectedElement?.kind === 'annotation' && selectedElement.id === ann.id;
                 const startDrag = (e: React.PointerEvent) => {
                   e.stopPropagation();
                   pointerMovedRef.current = false;
+                  preGestureSnapshotRef.current = state;
+                  setSelectedElement({ kind: 'annotation', id: ann.id });
                   overlayRef.current?.setPointerCapture?.(e.pointerId);
                   setDraggingItem({
                     kind: 'annotation',
@@ -1342,6 +1783,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 const removeBtn = (
                   <button
                     type="button"
+                    style={{ touchAction: 'none' }}
                     onPointerDown={(e) => e.stopPropagation()}
                     onClick={(e) => {
                       e.stopPropagation();
@@ -1349,11 +1791,12 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                         ...prev,
                         annotations: prev.annotations.filter((x) => x.id !== ann.id),
                       }));
+                      if (isSel) setSelectedElement(null);
                     }}
                     aria-label="Delete annotation"
-                    className="absolute -top-2.5 -right-2.5 w-5 h-5 rounded-full bg-rose-600 text-white flex items-center justify-center shadow"
+                    className="absolute -top-3 -right-3 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md"
                   >
-                    <X className="w-3 h-3" />
+                    <X className="w-3.5 h-3.5" />
                   </button>
                 );
 
@@ -1365,9 +1808,16 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     <div
                       key={ann.id}
                       onPointerDown={startDrag}
-                      style={{ left: ann.x * scale, top: ann.y * scale, width: 150 * scale }}
+                      style={{
+                        left: ann.x * scale,
+                        top: ann.y * scale,
+                        width: 150 * scale,
+                        touchAction: 'none',
+                      }}
                       title="Drag to move · Tap to edit note"
-                      className="absolute p-2 rounded-lg bg-amber-100 border-2 border-amber-500 text-[10px] text-slate-900 shadow-md cursor-move"
+                      className={`absolute p-2 rounded-lg bg-amber-100 border-2 text-[10px] text-slate-900 shadow-md cursor-move z-10 ${
+                        isSel ? 'border-[#2563EB] ring-2 ring-[#2563EB]/30' : 'border-amber-500'
+                      }`}
                     >
                       {/* Callout Arrow Indicator */}
                       {arrowSide === 'left' && (
@@ -1405,6 +1855,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
 
                       <button
                         type="button"
+                        style={{ touchAction: 'none' }}
                         onPointerDown={(e) => e.stopPropagation()}
                         onClick={(e) => {
                           e.stopPropagation();
@@ -1416,7 +1867,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                           }));
                         }}
                         title="Change arrow pointer direction"
-                        className="absolute -top-2.5 right-3.5 w-5 h-5 rounded-full bg-amber-500 text-white text-[9px] font-bold flex items-center justify-center shadow"
+                        className="absolute -top-3 right-5 w-6 h-6 rounded-full bg-amber-500 text-white text-[10px] font-bold flex items-center justify-center shadow-md"
                       >
                         {arrowSide === 'left' ? '←' : arrowSide === 'right' ? '→' : arrowSide === 'top' ? '↑' : '↓'}
                       </button>
@@ -1434,8 +1885,11 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                         top: ann.y * scale,
                         borderColor: ann.color,
                         color: ann.color,
+                        touchAction: 'none',
                       }}
-                      className="absolute px-2 py-0.5 rounded border-2 bg-white/90 text-[10px] font-bold cursor-move"
+                      className={`absolute px-2 py-0.5 rounded border-2 bg-white/90 text-[10px] font-bold cursor-move z-10 ${
+                        isSel ? 'ring-2 ring-[#2563EB]' : ''
+                      }`}
                     >
                       {ann.dateStr}
                       {removeBtn}
@@ -1450,8 +1904,11 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       left: ann.x * scale,
                       top: ann.y * scale,
                       width: ann.width * scale,
+                      touchAction: 'none',
                     }}
-                    className="absolute cursor-move"
+                    className={`absolute cursor-move z-10 ${
+                      isSel ? 'ring-2 ring-[#2563EB] rounded' : ''
+                    }`}
                   >
                     <img
                       src={ann.signatureDataUrl}
@@ -1471,6 +1928,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           </div>
         </div>
         </div>
+      </div>
       </div>
 
       {/* Bottom Editing Toolbar */}

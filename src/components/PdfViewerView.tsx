@@ -72,11 +72,16 @@ const LazyPageCanvas: React.FC<{
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const [shouldRender, setShouldRender] = useState(eager);
     const [rendering, setRendering] = useState(eager);
+    const [hasRendered, setHasRendered] = useState(false);
     const [dims, setDims] = useState<{ width: number; height: number }>(defaultDims);
 
     useEffect(() => {
       setDims(defaultDims);
     }, [defaultDims.width, defaultDims.height]);
+
+    useEffect(() => {
+      setHasRendered(false);
+    }, [pdfBytes, pageNumber]);
 
     useEffect(() => {
       if (eager) {
@@ -117,7 +122,7 @@ const LazyPageCanvas: React.FC<{
     const [renderScale, setRenderScale] = useState(scale);
 
     useEffect(() => {
-      const id = setTimeout(() => setRenderScale(scale), 110);
+      const id = setTimeout(() => setRenderScale(scale), 180);
       return () => clearTimeout(id);
     }, [scale]);
 
@@ -131,6 +136,7 @@ const LazyPageCanvas: React.FC<{
         .then((res) => {
           if (active && res.unscaledWidth > 0 && res.unscaledHeight > 0) {
             setDims({ width: res.unscaledWidth, height: res.unscaledHeight });
+            setHasRendered(true);
           }
         })
         .catch(() => {})
@@ -154,7 +160,7 @@ const LazyPageCanvas: React.FC<{
         style={{ width: boxW, height: boxH }}
         className="relative mx-auto my-3 bg-white shadow-md rounded-lg overflow-hidden border border-slate-200 dark:border-slate-700 shrink-0"
       >
-        {(!shouldRender || rendering) && (
+        {(!shouldRender || (rendering && !hasRendered)) && (
           <div className="absolute inset-0 bg-slate-100/70 dark:bg-slate-800/70 flex items-center justify-center z-10 pointer-events-none">
             <span className="text-xs font-mono-nums text-slate-500">Page {pageNumber}</span>
           </div>
@@ -212,6 +218,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
     setScale,
     minScale: 0.35,
     maxScale: 3.5,
+    dragPan: 'mouse',
   });
 
   const registerPageRef = useCallback((pNum: number, el: HTMLDivElement | null) => {
@@ -670,11 +677,16 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
           containerRef.current = el;
           setScrollRootEl(el);
         }}
-        style={{ touchAction: 'pan-x pan-y' }}
-        className="flex-1 overflow-auto px-2 sm:px-6 py-4 overscroll-contain"
+        style={{
+          touchAction: 'pan-x pan-y',
+          overscrollBehavior: 'contain',
+          scrollBehavior: 'auto',
+          WebkitOverflowScrolling: 'touch',
+        }}
+        className="flex-1 overflow-auto cursor-grab"
       >
         {viewMode === 'single' ? (
-          <div className="min-w-full w-fit flex flex-col items-center">
+          <div className="min-w-full min-h-full w-fit px-3 sm:px-6 py-4 flex flex-col items-center">
             <LazyPageCanvas
               pdfBytes={doc.pdfBytes}
               pageNumber={currentPage}
@@ -689,7 +701,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
             />
           </div>
         ) : (
-          <div className="min-w-full w-fit flex flex-col items-center">
+          <div className="min-w-full min-h-full w-fit px-3 sm:px-6 py-4 flex flex-col items-center">
             {Array.from({ length: doc.pageCount }, (_, i) => i + 1).map((pNum) => (
               <LazyPageCanvas
                 key={pNum}

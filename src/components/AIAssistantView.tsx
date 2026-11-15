@@ -2,6 +2,8 @@ import React, { useEffect, useState } from 'react';
 import {
   ArrowLeft,
   Check,
+  ChevronDown,
+  ChevronUp,
   Copy,
   FileText,
   Send,
@@ -13,6 +15,7 @@ import type { AppLanguage, DocumentRecord } from '../types';
 import { getT } from '../i18n/translations';
 import { extractDocumentPagesText } from '../services/pdfEngine';
 import { getApiUrl } from '../services/apiConfig';
+import { PdfSourcePicker } from './PdfSourcePicker';
 
 interface AIAssistantViewProps {
   language: AppLanguage;
@@ -20,6 +23,7 @@ interface AIAssistantViewProps {
   initialDocId?: string;
   aiConsentGranted: boolean;
   localOnlyMode: boolean;
+  onImportDoc?: (doc: DocumentRecord) => Promise<void>;
   onGrantConsent: () => void;
   onClose: () => void;
 }
@@ -36,14 +40,19 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   initialDocId,
   aiConsentGranted,
   localOnlyMode,
+  onImportDoc,
   onGrantConsent,
   onClose,
 }) => {
   const t = getT(language);
   const available = docs.filter((d) => !d.isTrashed && !d.isVaultLocked);
-  const [selectedDocId, setSelectedDocId] = useState(
-    initialDocId || available[0]?.id || ''
+  const recentFirst = [...available].sort(
+    (a, b) => (b.lastOpenedAt || b.updatedAt) - (a.lastOpenedAt || a.updatedAt)
   );
+  const [selectedDocId, setSelectedDocId] = useState(
+    initialDocId || recentFirst[0]?.id || ''
+  );
+  const [showDocPicker, setShowDocPicker] = useState<boolean>(!initialDocId && !recentFirst[0]);
   const [pages, setPages] = useState<Array<{ pageNumber: number; text: string }>>([]);
   const [extracting, setExtracting] = useState(false);
   const [messages, setMessages] = useState<ChatItem[]>([]);
@@ -200,26 +209,50 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
         <>
           {/* Document Selector & Quick Actions */}
           <div className="px-3 py-2.5 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 space-y-2.5 shrink-0">
-            <div className="flex items-center gap-2">
-              <FileText className="w-4 h-4 text-[#2563EB] shrink-0" />
-              <select
-                value={selectedDocId}
-                onChange={(e) => {
-                  setSelectedDocId(e.target.value);
-                  setMessages([]);
-                }}
-                className="flex-1 min-h-[40px] px-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-medium"
-              >
-                {available.map((d) => (
-                  <option key={d.id} value={d.id}>
-                    {d.name} ({d.pageCount}p)
-                  </option>
-                ))}
-              </select>
-              <span className="text-[11px] font-mono-nums text-slate-500 shrink-0">
-                {extracting ? '...' : `${totalExtractedChars} chars`}
-              </span>
-            </div>
+            <button
+              type="button"
+              onClick={() => setShowDocPicker((v) => !v)}
+              className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 flex items-center justify-between gap-2 text-left"
+            >
+              <div className="flex items-center gap-2 min-w-0">
+                <FileText className="w-4 h-4 text-[#2563EB] shrink-0" />
+                <span className="text-xs font-semibold truncate">
+                  {selectedDoc
+                    ? `${selectedDoc.name} (${selectedDoc.pageCount}p)`
+                    : language === 'bn'
+                    ? 'ডিভাইস বা রিসেন্ট থেকে পিডিএফ বাছুন'
+                    : 'Choose PDF from Device or Recent'}
+                </span>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <span className="text-[11px] font-mono-nums text-slate-500">
+                  {extracting ? '...' : `${totalExtractedChars} chars`}
+                </span>
+                {showDocPicker ? (
+                  <ChevronUp className="w-4 h-4 text-slate-400" />
+                ) : (
+                  <ChevronDown className="w-4 h-4 text-slate-400" />
+                )}
+              </div>
+            </button>
+
+            {showDocPicker && (
+              <div className="p-3 rounded-2xl bg-slate-50 dark:bg-slate-800/50 border border-slate-200 dark:border-slate-700">
+                <PdfSourcePicker
+                  language={language}
+                  docs={docs}
+                  selectedDocId={selectedDocId}
+                  compact
+                  maxListHeightClass="max-h-40"
+                  onImportDoc={onImportDoc}
+                  onSelectDoc={(d) => {
+                    setSelectedDocId(d.id);
+                    setMessages([]);
+                    setShowDocPicker(false);
+                  }}
+                />
+              </div>
+            )}
 
             {!extracting && selectedDoc && totalExtractedChars === 0 && (
               <p className="text-[11px] text-amber-600 dark:text-amber-400">

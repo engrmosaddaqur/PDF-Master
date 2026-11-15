@@ -604,7 +604,7 @@ export async function applyPdfEditsToBytes(
     }
   }
 
-  // 3. Added images
+  // 3. Added images (rotate around center to match editor canvas preview)
   for (const imgOv of edits.addedImages) {
     const page = pages[imgOv.pageNumber - 1];
     if (!page) continue;
@@ -618,12 +618,18 @@ export async function applyPdfEditsToBytes(
     const embedded = imgOv.dataUrl.includes('image/png')
       ? await doc.embedPng(bytes)
       : await doc.embedJpg(bytes);
+    const rotDeg = -(imgOv.rotation || 0);
+    const rad = (rotDeg * Math.PI) / 180;
+    const cx = imgOv.x + imgOv.width / 2;
+    const cy = pageH - imgOv.y - imgOv.height / 2;
+    const ox = (imgOv.width / 2) * Math.cos(rad) - (imgOv.height / 2) * Math.sin(rad);
+    const oy = (imgOv.width / 2) * Math.sin(rad) + (imgOv.height / 2) * Math.cos(rad);
     page.drawImage(embedded, {
-      x: imgOv.x,
-      y: pageH - imgOv.y - imgOv.height,
+      x: cx - ox,
+      y: cy - oy,
       width: imgOv.width,
       height: imgOv.height,
-      rotate: degrees(-imgOv.rotation),
+      rotate: degrees(rotDeg),
     });
   }
 
