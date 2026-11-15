@@ -2,14 +2,17 @@ import { Document, Packer, Paragraph, TextRun, HeadingLevel } from 'docx';
 import * as XLSX from 'xlsx';
 import mammoth from 'mammoth';
 import JSZip from 'jszip';
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, PDFFont, StandardFonts, rgb } from 'pdf-lib';
 import * as pdfjsLib from 'pdfjs-dist';
 import type { WordPageSettings } from '../types';
 import {
   PAPER_DIMENSIONS,
   cloneBuffer,
   extractDocumentPagesText,
+  hasNonWinAnsiChars,
+  hexToRgb,
   renderPageToDataUrl,
+  renderUnicodeTextPng,
 } from './pdfEngine';
 
 export async function imagesToPdf(files: File[]): Promise<ArrayBuffer> {
@@ -327,7 +330,7 @@ export async function pptxFileToPdf(file: File): Promise<ArrayBuffer> {
 
 /**
  * Renders rich HTML (English + Bengali Unicode, tables, lists, images, borders, headers, footers)
- * into clean paginated multi-page PDF bytes with exact paper size & orientation.
+ * into clean paginated multi-page PDF bytes with exact paper size, orientation, and genuine editable vector PDF text.
  */
 export async function htmlDocumentToPdf(
   htmlContent: string,
@@ -336,9 +339,9 @@ export async function htmlDocumentToPdf(
   const mmToPt = 2.83464567;
   const baseDim = PAPER_DIMENSIONS[settings.paperSize];
   let pageWidthPt =
-    settings.paperSize === 'Custom' ? settings.customWidthMm * mmToPt : baseDim.widthPt;
+    settings.paperSize === 'Custom' ? Math.max(40, settings.customWidthMm) * mmToPt : baseDim.widthPt;
   let pageHeightPt =
-    settings.paperSize === 'Custom' ? settings.customHeightMm * mmToPt : baseDim.heightPt;
+    settings.paperSize === 'Custom' ? Math.max(40, settings.customHeightMm) * mmToPt : baseDim.heightPt;
 
   if (settings.orientation === 'landscape' && pageWidthPt < pageHeightPt) {
     [pageWidthPt, pageHeightPt] = [pageHeightPt, pageWidthPt];
@@ -346,19 +349,15 @@ export async function htmlDocumentToPdf(
     [pageWidthPt, pageHeightPt] = [pageHeightPt, pageWidthPt];
   }
 
-  // Render onto high-res paginated canvas blocks
-  const pxScale = 2; // 144 DPI crisp text
-  const pageW = Math.round(pageWidthPt * pxScale);
-  const pageH = Math.round(pageHeightPt * pxScale);
-  const mTop = Math.round(settings.marginTopMm * mmToPt * pxScale);
-  const mBot = Math.round(settings.marginBottomMm * mmToPt * pxScale);
-  const mLeft = Math.round(settings.marginLeftMm * mmToPt * pxScale);
-  const mRight = Math.round(settings.marginRightMm * mmToPt * pxScale);
+  const mTopPt = Math.max(12, settings.marginTopMm * mmToPt);
+  const mBotPt = Math.max(12, settings.marginBottomMm * mmToPt);
+  const mLeftPt = Math.max(12, settings.marginLeftMm * mmToPt);
+  const mRightPt = Math.max(12, settings.marginRightMm * mmToPt);
 
-  const contentW = Math.max(200, pageW - mLeft - mRight);
-  const contentH = Math.max(200, pageH - mTop - mBot);
+  const contentW = Math.max(100, pageWidthPt - mLeftPt - mRightPt);
+  const contentH = Math.max(100, pageHeightPt - mTopPt - mBotPt);
 
-  // Parse HTML into structured blocks for crisp Unicode & Bengali pagination
+  // Parse HTML into structured blocks
   const parser = new DOMParser();
   const parsed = parser.parseFromString(`<div>${htmlContent}</div>`, 'text/html');
   const rootEl = parsed.body.firstElementChild || parsed.body;
@@ -400,23 +399,25 @@ export async function htmlDocumentToPdf(
     if (tag === 'h1' || tag === 'h2' || tag === 'h3') {
       const txt = (node.textContent || '').trim();
       if (txt) {
+        const styleAttr = node.getAttribute('style') || '';
+        const alignMatch = styleAttr.match(/text-align:\s*(left|center|right)/i);
         blocks.push({
           kind: 'heading',
           text: txt,
-          fontSize: tag === 'h1' ? 22 : tag === 'h2' ? 18 : 15,
+          fontSize: tag === 'h1' ? 20 : tag === 'h2' ? 15.5 : 13.5,
           bold: true,
           color: '#142B4A',
+          align: (alignMatch?.[1]?.toLowerCase() as 'left' | 'center' | 'right') || 'left',
         });
       }
       return;
     }
     if (tag === 'li') {
       const txt = (node.textContent || '').trim();
-      if (txt) blocks.push({ kind: 'list-item', text: `• ${txt}`, fontSize: 12.5 });
+      if (txt) blocks.push({ kind: 'list-item', text: `- ${txt}`, fontSize: 11.5 });
       return;
     }
     if (tag === 'p' || tag === 'div' || tag === 'blockquote') {
-      // Check if it contains nested block tags
       const hasBlocks = Array.from(node.children).some((c) =>
         ['p', 'div', 'h1', 'h2', 'h3', 'table', 'ul', 'ol', 'hr', 'img'].includes(
           c.tagName.toLowerCase()
@@ -435,7 +436,7 @@ export async function htmlDocumentToPdf(
           blocks.push({
             kind: 'paragraph',
             text: txt,
-            fontSize: 12.5,
+            fontSize: 11.5,
             bold,
             italic,
             align,
@@ -449,60 +450,111 @@ export async function htmlDocumentToPdf(
 
   Array.from(rootEl.children).forEach(walk);
   if (blocks.length === 0 && (rootEl.textContent || '').trim()) {
-    blocks.push({ kind: 'paragraph', text: (rootEl.textContent || '').trim(), fontSize: 12.5 });
+    blocks.push({ kind: 'paragraph', text: (rootEl.textContent || '').trim(), fontSize: 11.5 });
   }
 
-  const pageCanvases: HTMLCanvasElement[] = [];
-  const createPageCanvas = () => {
-    const c = document.createElement('canvas');
-    c.width = pageW;
-    c.height = pageH;
-    const ctx = c.getContext('2d')!;
-    ctx.fillStyle = settings.backgroundColor || '#FFFFFF';
-    ctx.fillRect(0, 0, pageW, pageH);
-    if (settings.borderEnabled) {
-      ctx.strokeStyle = settings.borderColor || '#CBD5E1';
-      ctx.lineWidth = 3;
-      ctx.strokeRect(mLeft * 0.55, mTop * 0.55, pageW - (mLeft + mRight) * 0.55, pageH - (mTop + mBot) * 0.55);
-    }
-    return { c, ctx };
+  const pdfDoc = await PDFDocument.create();
+  const fontReg = await pdfDoc.embedFont(StandardFonts.Helvetica);
+  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
+  const fontItalic = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
+  const fontBoldItalic = await pdfDoc.embedFont(StandardFonts.HelveticaBoldOblique);
+
+  const pickFont = (bold?: boolean, italic?: boolean): PDFFont => {
+    if (bold && italic) return fontBoldItalic;
+    if (bold) return fontBold;
+    if (italic) return fontItalic;
+    return fontReg;
   };
 
-  let current = createPageCanvas();
-  pageCanvases.push(current.c);
-  let cursorY = mTop;
+  const isWinAnsiSafe = (font: PDFFont, text: string): boolean => {
+    if (hasNonWinAnsiChars(text)) return false;
+    try {
+      font.encodeText(text);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const measureCanvas = document.createElement('canvas');
+  const mCtx = measureCanvas.getContext('2d')!;
+
+  const measureWidth = (text: string, font: PDFFont, fontSize: number, bold?: boolean, italic?: boolean) => {
+    if (isWinAnsiSafe(font, text)) {
+      return font.widthOfTextAtSize(text, fontSize);
+    }
+    mCtx.font = `${italic ? 'italic ' : ''}${bold ? '700 ' : '400 '}${fontSize}px 'DM Sans', 'Noto Sans Bengali', sans-serif`;
+    return mCtx.measureText(text).width;
+  };
+
+  const createdPages: ReturnType<typeof pdfDoc.addPage>[] = [];
+  const addNewPage = () => {
+    const page = pdfDoc.addPage([pageWidthPt, pageHeightPt]);
+    const bgHex = settings.backgroundColor || '#FFFFFF';
+    if (bgHex.toUpperCase() !== '#FFFFFF') {
+      page.drawRectangle({ x: 0, y: 0, width: pageWidthPt, height: pageHeightPt, color: hexToRgb(bgHex) });
+    }
+    if (settings.borderEnabled) {
+      page.drawRectangle({
+        x: mLeftPt * 0.55,
+        y: mBotPt * 0.55,
+        width: pageWidthPt - (mLeftPt + mRightPt) * 0.55,
+        height: pageHeightPt - (mTopPt + mBotPt) * 0.55,
+        borderColor: hexToRgb(settings.borderColor || '#CBD5E1'),
+        borderWidth: 1.5,
+      });
+    }
+    createdPages.push(page);
+    return page;
+  };
+
+  let currentPage = addNewPage();
+  let cursorTopOffset = mTopPt; // distance from top of page
 
   const ensureSpace = (neededH: number) => {
-    if (cursorY + neededH > mTop + contentH) {
-      current = createPageCanvas();
-      pageCanvases.push(current.c);
-      cursorY = mTop;
+    if (cursorTopOffset + neededH > mTopPt + contentH) {
+      currentPage = addNewPage();
+      cursorTopOffset = mTopPt;
     }
   };
 
   for (const blk of blocks) {
     if (blk.kind === 'page-break') {
-      current = createPageCanvas();
-      pageCanvases.push(current.c);
-      cursorY = mTop;
+      currentPage = addNewPage();
+      cursorTopOffset = mTopPt;
       continue;
     }
 
     if (blk.kind === 'image' && blk.imgSrc) {
       try {
-        const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const imgEl = await new Promise<HTMLImageElement>((resolve, reject) => {
           const el = new Image();
           el.onload = () => resolve(el);
           el.onerror = reject;
           el.src = blk.imgSrc!;
         });
-        const drawW = Math.min(contentW, img.naturalWidth * 1.5);
-        const drawH = (img.naturalHeight / img.naturalWidth) * drawW;
-        ensureSpace(drawH + 16);
-        current.ctx.drawImage(img, mLeft, cursorY, drawW, drawH);
-        cursorY += drawH + 16;
+        const c = document.createElement('canvas');
+        c.width = imgEl.naturalWidth || 400;
+        c.height = imgEl.naturalHeight || 300;
+        c.getContext('2d')!.drawImage(imgEl, 0, 0);
+        const pngData = c.toDataURL('image/png').split(',')[1];
+        const bin = atob(pngData);
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const embedded = await pdfDoc.embedPng(bytes);
+
+        const drawW = Math.min(contentW, (imgEl.naturalWidth || 300) * 0.75);
+        const drawH = ((imgEl.naturalHeight || 200) / Math.max(1, imgEl.naturalWidth || 300)) * drawW;
+        ensureSpace(drawH + 10);
+        currentPage.drawImage(embedded, {
+          x: mLeftPt,
+          y: pageHeightPt - cursorTopOffset - drawH,
+          width: drawW,
+          height: drawH,
+        });
+        cursorTopOffset += drawH + 10;
       } catch {
-        // skip broken inline image
+        // skip invalid inline image
       }
       continue;
     }
@@ -510,39 +562,71 @@ export async function htmlDocumentToPdf(
     if (blk.kind === 'table' && blk.rows) {
       const colCount = Math.max(...blk.rows.map((r) => r.length));
       const colW = contentW / Math.max(1, colCount);
-      const rowH = 26 * pxScale;
+      const rowH = 24;
       for (let rIdx = 0; rIdx < blk.rows.length; rIdx++) {
         ensureSpace(rowH);
         const row = blk.rows[rIdx];
-        current.ctx.fillStyle = rIdx === 0 ? '#EFF6FF' : rIdx % 2 === 0 ? '#F8FAFC' : '#FFFFFF';
-        current.ctx.fillRect(mLeft, cursorY, contentW, rowH);
-        current.ctx.strokeStyle = '#CBD5E1';
-        current.ctx.lineWidth = 1.5;
-        current.ctx.strokeRect(mLeft, cursorY, contentW, rowH);
-
-        current.ctx.font = `${rIdx === 0 ? '700 ' : '400 '}${11 * pxScale}px 'DM Sans', 'Noto Sans Bengali', sans-serif`;
-        current.ctx.fillStyle = '#1E293B';
-        current.ctx.textBaseline = 'middle';
-        row.forEach((cellText, cIdx) => {
-          current.ctx.fillText(cellText.slice(0, 42), mLeft + cIdx * colW + 10, cursorY + rowH / 2, colW - 20);
+        const fillHex = rIdx === 0 ? '#EFF6FF' : rIdx % 2 === 0 ? '#F8FAFC' : '#FFFFFF';
+        const rowBottomY = pageHeightPt - cursorTopOffset - rowH;
+        currentPage.drawRectangle({
+          x: mLeftPt,
+          y: rowBottomY,
+          width: contentW,
+          height: rowH,
+          color: hexToRgb(fillHex),
+          borderColor: hexToRgb('#CBD5E1'),
+          borderWidth: 0.75,
         });
-        cursorY += rowH;
+
+        const cellFont = pickFont(rIdx === 0, false);
+        for (let cIdx = 0; cIdx < row.length; cIdx++) {
+          const cellText = row[cIdx].slice(0, 42);
+          const cellX = mLeftPt + cIdx * colW + 6;
+          if (isWinAnsiSafe(cellFont, cellText)) {
+            currentPage.drawText(cellText, {
+              x: cellX,
+              y: rowBottomY + 8,
+              size: 10,
+              font: cellFont,
+              color: hexToRgb('#1E293B'),
+            });
+          } else if (cellText) {
+            const rendered = await renderUnicodeTextPng({
+              text: cellText,
+              fontSize: 10,
+              fontFamily: 'sans',
+              color: '#1E293B',
+              bold: rIdx === 0,
+              italic: false,
+              underline: false,
+              align: 'left',
+              maxWidth: Math.max(40, colW - 12),
+            });
+            const img = await pdfDoc.embedPng(rendered.pngBytes);
+            currentPage.drawImage(img, {
+              x: cellX - 2,
+              y: rowBottomY + (rowH - rendered.heightPt) / 2,
+              width: Math.min(colW - 8, rendered.widthPt),
+              height: rendered.heightPt,
+            });
+          }
+        }
+        cursorTopOffset += rowH;
       }
-      cursorY += 16;
+      cursorTopOffset += 10;
       continue;
     }
 
-    const fontSizePx = (blk.fontSize || 12.5) * pxScale;
-    const lineH = fontSizePx * 1.45;
-    const fontStr = `${blk.italic ? 'italic ' : ''}${blk.bold ? '700 ' : '400 '}${fontSizePx}px 'DM Sans', 'Noto Sans Bengali', sans-serif`;
-    current.ctx.font = fontStr;
-
+    const fontSize = blk.fontSize || 11.5;
+    const lineH = fontSize * 1.48;
+    const font = pickFont(blk.bold, blk.italic);
     const words = (blk.text || '').split(/\s+/);
     const lines: string[] = [];
     let curLine = '';
+
     for (const w of words) {
       const test = curLine ? `${curLine} ${w}` : w;
-      if (current.ctx.measureText(test).width > contentW && curLine) {
+      if (measureWidth(test, font, fontSize, blk.bold, blk.italic) > contentW && curLine) {
         lines.push(curLine);
         curLine = w;
       } else {
@@ -551,53 +635,132 @@ export async function htmlDocumentToPdf(
     }
     if (curLine) lines.push(curLine);
 
-    if (blk.kind === 'heading') cursorY += 10;
+    if (blk.kind === 'heading') cursorTopOffset += 6;
 
     for (const line of lines) {
       ensureSpace(lineH);
-      current.ctx.font = fontStr;
-      current.ctx.fillStyle = blk.color || '#1E293B';
-      current.ctx.textBaseline = 'top';
-      let x = mLeft;
-      const lw = current.ctx.measureText(line).width;
-      if (blk.align === 'center') x = mLeft + (contentW - lw) / 2;
-      if (blk.align === 'right') x = mLeft + contentW - lw;
-      current.ctx.fillText(line, x, cursorY);
-      cursorY += lineH;
+      const colorHex = blk.color || '#1E293B';
+      if (isWinAnsiSafe(font, line)) {
+        const lw = font.widthOfTextAtSize(line, fontSize);
+        let x = mLeftPt;
+        if (blk.align === 'center') x = mLeftPt + Math.max(0, (contentW - lw) / 2);
+        if (blk.align === 'right') x = mLeftPt + Math.max(0, contentW - lw);
+        currentPage.drawText(line, {
+          x,
+          y: pageHeightPt - cursorTopOffset - fontSize * 0.9,
+          size: fontSize,
+          font,
+          color: hexToRgb(colorHex),
+        });
+      } else {
+        const rendered = await renderUnicodeTextPng({
+          text: line,
+          fontSize,
+          fontFamily: 'sans',
+          color: colorHex,
+          bold: Boolean(blk.bold),
+          italic: Boolean(blk.italic),
+          underline: false,
+          align: blk.align || 'left',
+          maxWidth: contentW,
+        });
+        const img = await pdfDoc.embedPng(rendered.pngBytes);
+        let x = mLeftPt - 4;
+        if (blk.align === 'center') x = mLeftPt + Math.max(0, (contentW - rendered.widthPt) / 2);
+        if (blk.align === 'right') x = mLeftPt + Math.max(0, contentW - rendered.widthPt);
+        currentPage.drawImage(img, {
+          x,
+          y: pageHeightPt - cursorTopOffset - rendered.heightPt + 2,
+          width: rendered.widthPt,
+          height: rendered.heightPt,
+        });
+      }
+      cursorTopOffset += lineH;
     }
-    cursorY += blk.kind === 'heading' ? 12 : 10;
+
+    cursorTopOffset += blk.kind === 'heading' ? 8 : 6;
   }
 
   // Draw Header, Footer & Page Numbers
-  const totalPages = pageCanvases.length;
-  const pdfDoc = await PDFDocument.create();
-
+  const totalPages = createdPages.length;
   for (let i = 0; i < totalPages; i++) {
-    const c = pageCanvases[i];
-    const ctx = c.getContext('2d')!;
-    ctx.font = `500 ${9.5 * pxScale}px 'DM Sans', 'Noto Sans Bengali', sans-serif`;
-    ctx.fillStyle = '#64748B';
-    ctx.textBaseline = 'middle';
+    const page = createdPages[i];
+    const headerStr = settings.headerText.trim();
+    const footerStr = settings.footerText.trim();
 
-    if (settings.headerText.trim()) {
-      ctx.fillText(settings.headerText.trim(), mLeft, mTop * 0.5);
+    if (headerStr) {
+      if (isWinAnsiSafe(fontReg, headerStr)) {
+        page.drawText(headerStr, {
+          x: mLeftPt,
+          y: pageHeightPt - mTopPt * 0.55,
+          size: 9,
+          font: fontReg,
+          color: rgb(0.39, 0.45, 0.55),
+        });
+      } else {
+        const rendered = await renderUnicodeTextPng({
+          text: headerStr,
+          fontSize: 9,
+          fontFamily: 'sans',
+          color: '#64748B',
+          bold: false,
+          italic: false,
+          underline: false,
+          align: 'left',
+          maxWidth: contentW,
+        });
+        const img = await pdfDoc.embedPng(rendered.pngBytes);
+        page.drawImage(img, {
+          x: mLeftPt,
+          y: pageHeightPt - mTopPt * 0.55 - 4,
+          width: rendered.widthPt,
+          height: rendered.heightPt,
+        });
+      }
     }
-    if (settings.footerText.trim()) {
-      ctx.fillText(settings.footerText.trim(), mLeft, pageH - mBot * 0.5);
+
+    if (footerStr) {
+      if (isWinAnsiSafe(fontReg, footerStr)) {
+        page.drawText(footerStr, {
+          x: mLeftPt,
+          y: mBotPt * 0.5,
+          size: 9,
+          font: fontReg,
+          color: rgb(0.39, 0.45, 0.55),
+        });
+      } else {
+        const rendered = await renderUnicodeTextPng({
+          text: footerStr,
+          fontSize: 9,
+          fontFamily: 'sans',
+          color: '#64748B',
+          bold: false,
+          italic: false,
+          underline: false,
+          align: 'left',
+          maxWidth: contentW,
+        });
+        const img = await pdfDoc.embedPng(rendered.pngBytes);
+        page.drawImage(img, {
+          x: mLeftPt,
+          y: mBotPt * 0.45,
+          width: rendered.widthPt,
+          height: rendered.heightPt,
+        });
+      }
     }
+
     if (settings.pageNumbering) {
       const pn = `${i + 1} / ${totalPages}`;
-      const pw = ctx.measureText(pn).width;
-      ctx.fillText(pn, pageW - mRight - pw, pageH - mBot * 0.5);
+      const pw = fontReg.widthOfTextAtSize(pn, 9);
+      page.drawText(pn, {
+        x: pageWidthPt - mRightPt - pw,
+        y: mBotPt * 0.5,
+        size: 9,
+        font: fontReg,
+        color: rgb(0.39, 0.45, 0.55),
+      });
     }
-
-    const jpgUrl = c.toDataURL('image/jpeg', 0.92);
-    const bin = atob(jpgUrl.split(',')[1]);
-    const bytes = new Uint8Array(bin.length);
-    for (let j = 0; j < bin.length; j++) bytes[j] = bin.charCodeAt(j);
-    const img = await pdfDoc.embedJpg(bytes);
-    const page = pdfDoc.addPage([pageWidthPt, pageHeightPt]);
-    page.drawImage(img, { x: 0, y: 0, width: pageWidthPt, height: pageHeightPt });
   }
 
   pdfDoc.setProducer('PDF MASTER Document Creator');

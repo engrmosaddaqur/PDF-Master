@@ -8,8 +8,9 @@ import {
   ShieldCheck,
   Unlock,
 } from 'lucide-react';
-import type { AppLanguage, DocumentRecord } from '../types';
+import type { AppLanguage, DocumentRecord, PaperSizeKey } from '../types';
 import {
+  PAPER_DIMENSIONS,
   addHeaderFooterToPdf,
   addPageNumbersToPdf,
   addWatermarkToPdf,
@@ -21,6 +22,7 @@ import {
   mergePdfs,
   renderPageThumbnail,
   repairPdfBytes,
+  resizePdfPages,
   rotateAllPages,
   splitPdfByRanges,
   unlockPasswordProtectedPdf,
@@ -53,6 +55,7 @@ const TOOL_TITLES: Record<string, string> = {
   split: 'Split PDF',
   compress: 'Compress PDF',
   rotate: 'Rotate PDF',
+  pageSetup: 'Page Size & Orientation',
   watermark: 'Add Watermark',
   pageNumbers: 'Add Page Numbers',
   headerFooter: 'Add Header & Footer',
@@ -92,6 +95,10 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
   const [splitRange, setSplitRange] = useState('1');
   const [compressMode, setCompressMode] = useState<'object-streams' | 'raster-medium' | 'raster-compact'>('raster-medium');
   const [rotateAngle, setRotateAngle] = useState(90);
+  const [targetPaperSize, setTargetPaperSize] = useState<PaperSizeKey>('A4');
+  const [targetOrientation, setTargetOrientation] = useState<'portrait' | 'landscape'>('portrait');
+  const [customWidthMm, setCustomWidthMm] = useState(210);
+  const [customHeightMm, setCustomHeightMm] = useState(297);
   const [watermarkText, setWatermarkText] = useState('CONFIDENTIAL');
   const [watermarkOpacity, setWatermarkOpacity] = useState(0.25);
   const [watermarkColor, setWatermarkColor] = useState('#2563EB');
@@ -230,6 +237,22 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         const out = await rotateAllPages(primaryDoc.pdfBytes, rotateAngle);
         await saveNewPdf(out, primaryDoc.name.replace(/\.pdf$/i, `_rot${rotateAngle}.pdf`), 'edited', `Rotated ${rotateAngle}°`);
         setResultMsg(`Saved rotated PDF (${rotateAngle}°).`);
+      } else if (toolId === 'pageSetup') {
+        if (!primaryDoc) throw new Error('Select a PDF to resize.');
+        const out = await resizePdfPages(
+          primaryDoc.pdfBytes,
+          targetPaperSize,
+          targetOrientation,
+          customWidthMm,
+          customHeightMm
+        );
+        await saveNewPdf(
+          out,
+          primaryDoc.name.replace(/\.pdf$/i, `_${targetPaperSize}_${targetOrientation}.pdf`),
+          'edited',
+          `Changed page size to ${targetPaperSize} (${targetOrientation})`
+        );
+        setResultMsg(`Saved resized PDF (${targetPaperSize} · ${targetOrientation}).`);
       } else if (toolId === 'watermark') {
         if (!primaryDoc) throw new Error('Select a PDF.');
         const out = await addWatermarkToPdf(primaryDoc.pdfBytes, {
@@ -561,6 +584,68 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                   {deg}°
                 </button>
               ))}
+            </div>
+          )}
+
+          {toolId === 'pageSetup' && (
+            <div className="space-y-3 text-xs">
+              <div>
+                <label className="block font-semibold text-slate-500 mb-1">Paper Size</label>
+                <select
+                  value={targetPaperSize}
+                  onChange={(e) => setTargetPaperSize(e.target.value as PaperSizeKey)}
+                  className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
+                >
+                  {Object.values(PAPER_DIMENSIONS).map((p) => (
+                    <option key={p.key} value={p.key}>
+                      {p.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              {targetPaperSize === 'Custom' && (
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="block font-semibold text-slate-500 mb-1">Width (mm)</label>
+                    <input
+                      type="number"
+                      min={40}
+                      value={customWidthMm}
+                      onChange={(e) => setCustomWidthMm(Number(e.target.value) || 210)}
+                      className="w-full min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
+                    />
+                  </div>
+                  <div>
+                    <label className="block font-semibold text-slate-500 mb-1">Height (mm)</label>
+                    <input
+                      type="number"
+                      min={40}
+                      value={customHeightMm}
+                      onChange={(e) => setCustomHeightMm(Number(e.target.value) || 297)}
+                      className="w-full min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
+                    />
+                  </div>
+                </div>
+              )}
+              <div>
+                <label className="block font-semibold text-slate-500 mb-1">Orientation</label>
+                <div className="grid grid-cols-2 gap-2">
+                  {(['portrait', 'landscape'] as const).map((ori) => (
+                    <button
+                      key={ori}
+                      type="button"
+                      onClick={() => setTargetOrientation(ori)}
+                      className={`min-h-[42px] rounded-xl font-semibold capitalize border ${
+                        targetOrientation === ori
+                          ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                          : 'border-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      {ori}
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
           )}
 

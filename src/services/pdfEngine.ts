@@ -55,7 +55,7 @@ export function hexToRgb(hex: string) {
   return rgb(r, g, b);
 }
 
-function hasNonWinAnsiChars(text: string): boolean {
+export function hasNonWinAnsiChars(text: string): boolean {
   for (let i = 0; i < text.length; i++) {
     const code = text.charCodeAt(i);
     if (code > 255) return true;
@@ -67,7 +67,7 @@ function hasNonWinAnsiChars(text: string): boolean {
  * Renders text (including full Bengali & Unicode scripts, bold/italic/underline/spacing)
  * onto a transparent high-DPI canvas and returns PNG bytes so pdf-lib embeds any script crisply.
  */
-async function renderUnicodeTextPng(opts: {
+export async function renderUnicodeTextPng(opts: {
   text: string;
   fontSize: number;
   fontFamily: 'sans' | 'serif' | 'mono';
@@ -90,6 +90,15 @@ async function renderUnicodeTextPng(opts: {
   const measureCanvas = document.createElement('canvas');
   const mCtx = measureCanvas.getContext('2d')!;
   mCtx.font = fontSpec;
+  if (opts.letterSpacing && 'letterSpacing' in mCtx) {
+    (mCtx as CanvasRenderingContext2D & { letterSpacing: string }).letterSpacing = `${opts.letterSpacing}px`;
+  }
+
+  const measureInkWidth = (txt: string): number => {
+    const m = mCtx.measureText(txt);
+    const bboxW = (m.actualBoundingBoxRight || 0) + Math.max(0, m.actualBoundingBoxLeft || 0);
+    return Math.max(m.width, bboxW);
+  };
 
   const lines = opts.text.split('\n');
   const wrappedLines: string[] = [];
@@ -104,7 +113,7 @@ async function renderUnicodeTextPng(opts: {
     let cur = '';
     for (const w of words) {
       const test = cur ? `${cur} ${w}` : w;
-      if (mCtx.measureText(test).width > limit && cur) {
+      if (measureInkWidth(test) > limit && cur) {
         wrappedLines.push(cur);
         cur = w;
       } else {
@@ -114,13 +123,14 @@ async function renderUnicodeTextPng(opts: {
     wrappedLines.push(cur);
   }
 
-  let widest = 10;
+  let widest = 12;
   for (const l of wrappedLines) {
-    widest = Math.max(widest, mCtx.measureText(l).width);
+    widest = Math.max(widest, measureInkWidth(l));
   }
-  const lineHeight = opts.fontSize * 1.35;
-  const widthPt = Math.ceil(Math.max(widest + 8, opts.maxWidth ? Math.min(opts.maxWidth, widest + 8) : widest + 8));
-  const heightPt = Math.ceil(wrappedLines.length * lineHeight + 6);
+  const lineHeight = opts.fontSize * 1.38;
+  const padX = 16;
+  const widthPt = Math.ceil(Math.max(widest + padX, opts.maxWidth && opts.align !== 'left' ? Math.max(opts.maxWidth, widest + padX) : widest + padX));
+  const heightPt = Math.ceil(wrappedLines.length * lineHeight + 10);
 
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.ceil(widthPt * dpr));
@@ -135,11 +145,12 @@ async function renderUnicodeTextPng(opts: {
   }
 
   wrappedLines.forEach((line, idx) => {
-    const y = 3 + idx * lineHeight;
-    const lw = ctx.measureText(line).width;
-    let x = 2;
+    const y = 4 + idx * lineHeight;
+    const m = ctx.measureText(line);
+    const lw = Math.max(m.width, (m.actualBoundingBoxRight || 0) + Math.max(0, m.actualBoundingBoxLeft || 0));
+    let x = 4;
     if (opts.align === 'center') x = (widthPt - lw) / 2;
-    if (opts.align === 'right') x = widthPt - lw - 2;
+    if (opts.align === 'right') x = widthPt - lw - 4;
     ctx.fillText(line, x, y);
     if (opts.underline && lw > 0) {
       ctx.strokeStyle = opts.color;
@@ -466,7 +477,7 @@ export async function applyPdfEditsToBytes(
     });
 
     if (!rep.deleted && rep.newText.trim()) {
-      if (hasNonWinAnsiChars(rep.newText) || rep.underline || rep.align !== 'left' || rep.letterSpacing !== 0) {
+      if (hasNonWinAnsiChars(rep.newText) || (rep.letterSpacing || 0) !== 0) {
         const rendered = await renderUnicodeTextPng({
           text: rep.newText,
           fontSize: rep.fontSize,
@@ -477,7 +488,7 @@ export async function applyPdfEditsToBytes(
           underline: rep.underline,
           align: rep.align,
           letterSpacing: rep.letterSpacing,
-          maxWidth: Math.max(rep.width, 120),
+          maxWidth: Math.max(rep.width, 180),
         });
         const img = await doc.embedPng(rendered.pngBytes);
         page.drawImage(img, {
@@ -488,13 +499,28 @@ export async function applyPdfEditsToBytes(
         });
       } else {
         const font = pickStandardFont(rep.fontFamily, rep.bold, rep.italic);
+        const col = hexToRgb(rep.color);
+        const tw = font.widthOfTextAtSize(rep.newText, rep.fontSize);
+        const boxW = Math.max(rep.width, tw);
+        let drawX = rep.x;
+        if (rep.align === 'center') drawX = rep.x + (boxW - tw) / 2;
+        if (rep.align === 'right') drawX = rep.x + boxW - tw;
+        const baselineY = pageH - rep.y - rep.fontSize * 0.9;
         page.drawText(rep.newText, {
-          x: rep.x,
-          y: pageH - rep.y - rep.fontSize * 0.9,
+          x: drawX,
+          y: baselineY,
           size: rep.fontSize,
           font,
-          color: hexToRgb(rep.color),
+          color: col,
         });
+        if (rep.underline && tw > 0) {
+          page.drawLine({
+            start: { x: drawX, y: baselineY - 2 },
+            end: { x: drawX + tw, y: baselineY - 2 },
+            thickness: Math.max(0.8, rep.fontSize * 0.07),
+            color: col,
+          });
+        }
       }
     }
   }
@@ -505,13 +531,7 @@ export async function applyPdfEditsToBytes(
     if (!page || !tb.text.trim()) continue;
     const { height: pageH } = page.getSize();
 
-    if (
-      hasNonWinAnsiChars(tb.text) ||
-      tb.underline ||
-      tb.align !== 'left' ||
-      tb.letterSpacing !== 0 ||
-      tb.text.includes('\n')
-    ) {
+    if (hasNonWinAnsiChars(tb.text) || (tb.letterSpacing || 0) !== 0) {
       const rendered = await renderUnicodeTextPng({
         text: tb.text,
         fontSize: tb.fontSize,
@@ -532,14 +552,54 @@ export async function applyPdfEditsToBytes(
         height: rendered.heightPt,
       });
     } else {
+      // Emit genuine editable vector PDF text for WinAnsi added text boxes (even multiline/aligned/underlined)
       const font = pickStandardFont(tb.fontFamily, tb.bold, tb.italic);
-      page.drawText(tb.text, {
-        x: tb.x,
-        y: pageH - tb.y - tb.fontSize,
-        size: tb.fontSize,
-        font,
-        color: hexToRgb(tb.color),
-        maxWidth: tb.width,
+      const col = hexToRgb(tb.color);
+      const lineStep = tb.fontSize * 1.32;
+      const boxW = Math.max(80, tb.width || 260);
+      const outLines: string[] = [];
+
+      for (const rawLine of tb.text.split('\n')) {
+        if (!rawLine.trim()) {
+          outLines.push('');
+          continue;
+        }
+        const words = rawLine.split(/\s+/);
+        let cur = '';
+        for (const w of words) {
+          const test = cur ? `${cur} ${w}` : w;
+          if (font.widthOfTextAtSize(test, tb.fontSize) > boxW && cur) {
+            outLines.push(cur);
+            cur = w;
+          } else {
+            cur = test;
+          }
+        }
+        if (cur) outLines.push(cur);
+      }
+
+      outLines.forEach((line, idx) => {
+        if (!line) return;
+        const tw = font.widthOfTextAtSize(line, tb.fontSize);
+        let drawX = tb.x;
+        if (tb.align === 'center') drawX = tb.x + Math.max(0, (boxW - tw) / 2);
+        if (tb.align === 'right') drawX = tb.x + Math.max(0, boxW - tw);
+        const baselineY = pageH - tb.y - tb.fontSize - idx * lineStep;
+        page.drawText(line, {
+          x: drawX,
+          y: baselineY,
+          size: tb.fontSize,
+          font,
+          color: col,
+        });
+        if (tb.underline && tw > 0) {
+          page.drawLine({
+            start: { x: drawX, y: baselineY - 2 },
+            end: { x: drawX + tw, y: baselineY - 2 },
+            thickness: Math.max(0.8, tb.fontSize * 0.07),
+            color: col,
+          });
+        }
       });
     }
   }
@@ -862,6 +922,46 @@ export async function rotateAllPages(buf: ArrayBuffer, angleDelta: number): Prom
     page.setRotation(degrees((cur + angleDelta + 360) % 360));
   }
   const out = await doc.save();
+  return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
+}
+
+export async function resizePdfPages(
+  buf: ArrayBuffer,
+  paperSize: PaperSizeKey,
+  orientation: 'portrait' | 'landscape',
+  customWidthMm = 210,
+  customHeightMm = 297
+): Promise<ArrayBuffer> {
+  const mmToPt = 2.83464567;
+  const baseDim = PAPER_DIMENSIONS[paperSize];
+  let targetW = paperSize === 'Custom' ? Math.max(40, customWidthMm) * mmToPt : baseDim.widthPt;
+  let targetH = paperSize === 'Custom' ? Math.max(40, customHeightMm) * mmToPt : baseDim.heightPt;
+
+  if (orientation === 'landscape' && targetW < targetH) {
+    [targetW, targetH] = [targetH, targetW];
+  } else if (orientation === 'portrait' && targetW > targetH) {
+    [targetW, targetH] = [targetH, targetW];
+  }
+
+  const srcDoc = await PDFDocument.load(cloneBuffer(buf), { ignoreEncryption: true });
+  const outDoc = await PDFDocument.create();
+  const srcPages = srcDoc.getPages();
+
+  for (const srcPage of srcPages) {
+    const { width: srcW, height: srcH } = srcPage.getSize();
+    const embedded = await outDoc.embedPage(srcPage);
+    const scaleFactor = Math.min(targetW / Math.max(1, srcW), targetH / Math.max(1, srcH));
+    const drawW = srcW * scaleFactor;
+    const drawH = srcH * scaleFactor;
+    const x = (targetW - drawW) / 2;
+    const y = (targetH - drawH) / 2;
+
+    const newPage = outDoc.addPage([targetW, targetH]);
+    newPage.drawRectangle({ x: 0, y: 0, width: targetW, height: targetH, color: rgb(1, 1, 1) });
+    newPage.drawPage(embedded, { x, y, width: drawW, height: drawH });
+  }
+
+  const out = await outDoc.save();
   return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
 }
 

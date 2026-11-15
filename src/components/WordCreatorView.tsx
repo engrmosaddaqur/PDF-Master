@@ -306,9 +306,10 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
           <button
             onClick={() => setShowPageSettings(true)}
             aria-label="Page settings"
-            className="min-h-[42px] min-w-[42px] flex items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200"
+            className="min-h-[42px] px-2.5 flex items-center justify-center gap-1.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-semibold"
           >
-            <Settings2 className="w-4 h-4" />
+            <Settings2 className="w-4 h-4 shrink-0" />
+            <span className="hidden sm:inline">Page Setup</span>
           </button>
           <button
             onClick={() => handleSaveAndExport('downloadPdf')}
@@ -485,10 +486,41 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
       </div>
 
       {/* Bottom Export Dock */}
-      <footer className="bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 px-3 py-2 pb-safe flex items-center justify-between gap-2 shrink-0">
-        <span className="text-[11px] font-mono-nums text-slate-500">
-          {settings.paperSize} · {settings.orientation}
-        </span>
+      <footer className="bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 px-3 py-2 pb-safe flex flex-wrap items-center justify-between gap-2 shrink-0">
+        <div className="flex items-center gap-1.5 flex-wrap">
+          <select
+            aria-label={t.creator.paperSize}
+            value={settings.paperSize}
+            onChange={(e) => {
+              const val = e.target.value as PaperSizeKey;
+              setSettings((s) => ({ ...s, paperSize: val }));
+              if (val === 'Custom') setShowPageSettings(true);
+            }}
+            className="h-9 px-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800 text-xs font-semibold text-[#142B4A] dark:text-white"
+          >
+            {Object.values(PAPER_DIMENSIONS).map((p) => (
+              <option key={p.key} value={p.key}>
+                {p.label}
+              </option>
+            ))}
+          </select>
+          <div className="flex items-center p-0.5 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+            {(['portrait', 'landscape'] as const).map((ori) => (
+              <button
+                key={ori}
+                type="button"
+                onClick={() => setSettings((s) => ({ ...s, orientation: ori }))}
+                className={`h-8 px-2.5 rounded-lg text-xs font-semibold capitalize transition-colors ${
+                  settings.orientation === ori
+                    ? 'bg-[#2563EB] text-white shadow-sm'
+                    : 'text-slate-600 dark:text-slate-300'
+                }`}
+              >
+                {ori === 'portrait' ? t.creator.portrait : t.creator.landscape}
+              </button>
+            ))}
+          </div>
+        </div>
         <div className="flex items-center gap-2">
           <button
             onClick={() => handleSaveAndExport('print')}

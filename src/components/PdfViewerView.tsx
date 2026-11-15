@@ -290,6 +290,75 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
     [doc.pageCount, viewMode]
   );
 
+  // Keyboard arrow / PageUp / PageDown / Home / End navigation
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (showTextModal) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      const c = containerRef.current;
+
+      if (e.key === 'Escape' && isFullscreen) {
+        e.preventDefault();
+        setIsFullscreen(false);
+        return;
+      }
+
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (viewMode === 'continuous' && c && c.scrollHeight > c.clientHeight + 4) {
+          c.scrollBy({ top: 140, behavior: 'auto' });
+        } else {
+          jumpToPage(currentPage + 1);
+        }
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (viewMode === 'continuous' && c && c.scrollHeight > c.clientHeight + 4) {
+          c.scrollBy({ top: -140, behavior: 'auto' });
+        } else {
+          jumpToPage(currentPage - 1);
+        }
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        if (c && c.scrollWidth > c.clientWidth + 10 && c.scrollLeft + c.clientWidth < c.scrollWidth - 4) {
+          c.scrollBy({ left: 100, behavior: 'auto' });
+        } else {
+          jumpToPage(currentPage + 1);
+        }
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        if (c && c.scrollWidth > c.clientWidth + 10 && c.scrollLeft > 4) {
+          c.scrollBy({ left: -100, behavior: 'auto' });
+        } else {
+          jumpToPage(currentPage - 1);
+        }
+      } else if (e.key === 'PageDown') {
+        e.preventDefault();
+        jumpToPage(currentPage + 1);
+      } else if (e.key === 'PageUp') {
+        e.preventDefault();
+        jumpToPage(currentPage - 1);
+      } else if (e.key === 'Home') {
+        e.preventDefault();
+        jumpToPage(1);
+      } else if (e.key === 'End') {
+        e.preventDefault();
+        jumpToPage(doc.pageCount);
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [showTextModal, isFullscreen, viewMode, currentPage, doc.pageCount, jumpToPage]);
+
   useEffect(() => {
     if (!searchQuery.trim()) {
       setSearchMatches([]);

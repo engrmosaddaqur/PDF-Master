@@ -180,6 +180,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
 
   // Drawing interaction
   const editorRootRef = useRef<HTMLDivElement | null>(null);
+  const canvasScrollRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
@@ -224,6 +225,79 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     root.addEventListener('wheel', onWheel, { passive: false });
     return () => root.removeEventListener('wheel', onWheel);
   }, []);
+
+  // Keyboard arrow / PageUp / PageDown / Delete navigation
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (editingRun || addingBoxPos || stickyPos || showSigModal || cropModalImg) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === 'INPUT' ||
+          target.tagName === 'TEXTAREA' ||
+          target.tagName === 'SELECT' ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+
+      const sc = canvasScrollRef.current;
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (sc && sc.scrollHeight > sc.clientHeight + 4 && sc.scrollTop + sc.clientHeight < sc.scrollHeight - 4) {
+          sc.scrollBy({ top: 110, behavior: 'auto' });
+        } else {
+          setPageNumber((p) => Math.min(doc.pageCount, p + 1));
+        }
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (sc && sc.scrollHeight > sc.clientHeight + 4 && sc.scrollTop > 4) {
+          sc.scrollBy({ top: -110, behavior: 'auto' });
+        } else {
+          setPageNumber((p) => Math.max(1, p - 1));
+        }
+      } else if (e.key === 'ArrowRight') {
+        e.preventDefault();
+        if (sc && sc.scrollWidth > sc.clientWidth + 10 && sc.scrollLeft + sc.clientWidth < sc.scrollWidth - 4) {
+          sc.scrollBy({ left: 100, behavior: 'auto' });
+        } else {
+          setPageNumber((p) => Math.min(doc.pageCount, p + 1));
+        }
+      } else if (e.key === 'ArrowLeft') {
+        e.preventDefault();
+        if (sc && sc.scrollWidth > sc.clientWidth + 10 && sc.scrollLeft > 4) {
+          sc.scrollBy({ left: -100, behavior: 'auto' });
+        } else {
+          setPageNumber((p) => Math.max(1, p - 1));
+        }
+      } else if (e.key === 'PageDown') {
+        e.preventDefault();
+        setPageNumber((p) => Math.min(doc.pageCount, p + 1));
+      } else if (e.key === 'PageUp') {
+        e.preventDefault();
+        setPageNumber((p) => Math.max(1, p - 1));
+      } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedImageId) {
+        e.preventDefault();
+        const delId = selectedImageId;
+        commitState((prev) => ({
+          ...prev,
+          addedImages: prev.addedImages.filter((im) => im.id !== delId),
+        }));
+        setSelectedImageId(null);
+      }
+    };
+
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [
+    editingRun,
+    addingBoxPos,
+    stickyPos,
+    showSigModal,
+    cropModalImg,
+    selectedImageId,
+    doc.pageCount,
+  ]);
 
   useEffect(() => {
     let active = true;
@@ -865,7 +939,10 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       )}
 
       {/* Main Editable Page Canvas */}
-      <div className="flex-1 overflow-auto p-3 sm:p-6 flex justify-center items-start">
+      <div
+        ref={canvasScrollRef}
+        className="flex-1 overflow-auto p-3 sm:p-6 flex justify-center items-start"
+      >
         <div
           className="relative bg-white shadow-xl rounded-md overflow-hidden select-none"
           style={{ width: pageSize.width * scale, height: pageSize.height * scale }}

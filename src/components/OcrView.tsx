@@ -4,7 +4,9 @@ import {
   Copy,
   Download,
   FileText,
+  FileUp,
   ImagePlus,
+  Loader2,
   ScanText,
   Search,
   ShieldAlert,
@@ -15,6 +17,7 @@ import { getT } from '../i18n/translations';
 import {
   cloneBuffer,
   createSearchablePdfFromOcr,
+  getPdfDocumentInfo,
   renderPageThumbnail,
   renderPageToDataUrl,
 } from '../services/pdfEngine';
@@ -45,10 +48,15 @@ export const OcrView: React.FC<OcrViewProps> = ({
   onOpenInWordCreator,
 }) => {
   const t = getT(language);
-  const [sourceType, setSourceType] = useState<'pdf' | 'image'>(initialDocId ? 'pdf' : 'image');
+  const [sourceType, setSourceType] = useState<'pdf' | 'image'>(initialDocId ? 'pdf' : 'pdf');
   const [selectedDocId, setSelectedDocId] = useState<string>(
     initialDocId || docs.find((d) => !d.isTrashed && !d.isVaultLocked)?.id || ''
   );
+  const [uploadedPdf, setUploadedPdf] = useState<{ name: string; bytes: ArrayBuffer } | null>(null);
+  const [pdfPageTotal, setPdfPageTotal] = useState(0);
+  const [pdfRenderLimit, setPdfRenderLimit] = useState(10);
+  const [loadingPdfPages, setLoadingPdfPages] = useState(false);
+
   const [pageImages, setPageImages] = useState<string[]>([]);
   const [ocrLang, setOcrLang] = useState<OcrLanguage>('eng+ben');
   const [engine, setEngine] = useState<'device' | 'ai'>('device');
@@ -61,45 +69,114 @@ export const OcrView: React.FC<OcrViewProps> = ({
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
 
-  const selectedDoc = docs.find((d) => d.id === selectedDocId);
+  const vaultDocs = docs.filter((d) => !d.isTrashed && !d.isVaultLocked);
+  const selectedDoc = vaultDocs.find((d) => d.id === selectedDocId);
+  const activePdfBytes = uploadedPdf ? uploadedPdf.bytes : selectedDoc?.pdfBytes || null;
+  const activePdfName = uploadedPdf ? uploadedPdf.name : selectedDoc?.name || '';
 
   useEffect(() => {
-    if (sourceType !== 'pdf' || !selectedDoc) return;
+    if (sourceType !== 'pdf' || !activePdfBytes) {
+      if (sourceType === 'pdf') {
+        setPageImages([]);
+        setPdfPageTotal(0);
+      }
+      return;
+    }
+
     let active = true;
     const loadPreview = async () => {
-      const imgs: string[] = [];
-      const limit = Math.min(selectedDoc.pageCount, 8);
-      for (let p = 1; p <= limit; p++) {
-        const url = await renderPageToDataUrl(selectedDoc.pdfBytes, p, 1.8, 'image/jpeg');
-        imgs.push(url);
+      setLoadingPdfPages(true);
+      setErrorMsg(null);
+      try {
+        const info = await getPdfDocumentInfo(activePdfBytes);
+        if (!active) return;
+        setPdfPageTotal(info.pageCount);
+        const imgs: string[] = [];
+        const limit = Math.min(info.pageCount, pdfRenderLimit);
+        for (let p = 1; p <= limit; p++) {
+          const url = await renderPageToDataUrl(activePdfBytes, p, 1.8, 'image/jpeg');
+          if (!active) return;
+          imgs.push(url);
+        }
+        if (active) {
+          setPageImages(imgs);
+        }
+      } catch (err) {
+        if (active) {
+          setErrorMsg(err instanceof Error ? err.message : 'Unable to read PDF pages for OCR.');
+          setPageImages([]);
+        }
+      } finally {
+        if (active) setLoadingPdfPages(false);
       }
-      if (active) setPageImages(imgs);
     };
-    loadPreview().catch(() => {});
+
+    loadPreview();
     return () => {
       active = false;
     };
-  }, [sourceType, selectedDocId]);
+  }, [sourceType, activePdfBytes, pdfRenderLimit]);
 
-  const handleUploadImage = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleUploadPdfFile = async (file: File) => {
+    setErrorMsg(null);
+    try {
+      const buf = await file.arrayBuffer();
+      setSourceType('pdf');
+      setPdfRenderLimit(10);
+      setUploadedPdf({ name: file.name, bytes: buf });
+      setExtractedPages([]);
+      setCombinedText('');
+    } catch {
+      setErrorMsg('Failed to read selected PDF file.');
+    }
+  };
+
+  const handleUploadImage = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
+    e.target.value = '';
     if (!files.length) return;
-    Promise.all(
-      files.map(
+    setErrorMsg(null);
+
+    const pdfFile = files.find(
+      (f) => f.type === 'application/pdf' || /\.pdf$/i.test(f.name)
+    );
+    if (pdfFile) {
+      await handleUploadPdfFile(pdfFile);
+      return;
+    }
+
+    const imageFiles = files.filter(
+      (f) => f.type.startsWith('image/') || /\.(png|jpe?g|webp|bmp|gif)$/i.test(f.name)
+    );
+    if (!imageFiles.length) {
+      setErrorMsg('Please select valid image files (PNG, JPG, WEBP) or switch to PDF OCR.');
+      return;
+    }
+
+    const urls = await Promise.all(
+      imageFiles.map(
         (file) =>
-          new Promise<string>((resolve) => {
+          new Promise<string | null>((resolve) => {
             const reader = new FileReader();
-            reader.onload = () => resolve(reader.result as string);
+            reader.onload = () => {
+              const res = typeof reader.result === 'string' ? reader.result : '';
+              resolve(res.startsWith('data:image/') ? res : null);
+            };
+            reader.onerror = () => resolve(null);
             reader.readAsDataURL(file);
           })
       )
-    ).then((urls) => {
-      setSourceType('image');
-      setPageImages(urls);
-      setExtractedPages([]);
-      setCombinedText('');
-    });
-    e.target.value = '';
+    );
+    const validUrls = urls.filter((u): u is string => Boolean(u));
+    if (!validUrls.length) {
+      setErrorMsg('Selected image could not be decoded.');
+      return;
+    }
+    setSourceType('image');
+    setUploadedPdf(null);
+    setPageImages(validUrls);
+    setExtractedPages([]);
+    setCombinedText('');
   };
 
   const handleRunOcr = async () => {
@@ -149,8 +226,8 @@ export const OcrView: React.FC<OcrViewProps> = ({
     const thumb = await renderPageThumbnail(pdfBytes, 1, 200).catch(() => extractedPages[0].imageDataUrl);
     const now = Date.now();
     const baseName =
-      sourceType === 'pdf' && selectedDoc
-        ? selectedDoc.name.replace(/\.pdf$/i, '_searchable.pdf')
+      sourceType === 'pdf' && activePdfName
+        ? activePdfName.replace(/\.pdf$/i, '_searchable.pdf')
         : `OCR_Searchable_${new Date(now).toISOString().slice(0, 10)}.pdf`;
 
     await onSaveSearchablePdf({
@@ -210,17 +287,30 @@ export const OcrView: React.FC<OcrViewProps> = ({
         <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-3">
           <div className="grid grid-cols-2 gap-1 p-1 rounded-xl bg-slate-100 dark:bg-slate-800">
             <button
-              onClick={() => setSourceType('pdf')}
+              onClick={() => {
+                setSourceType('pdf');
+                setErrorMsg(null);
+                setExtractedPages([]);
+                setCombinedText('');
+              }}
               className={`min-h-[40px] rounded-lg text-xs font-semibold ${
                 sourceType === 'pdf'
                   ? 'bg-white dark:bg-slate-900 text-[#142B4A] dark:text-white shadow-sm'
                   : 'text-slate-500'
               }`}
             >
-              Scanned PDF from Vault
+              PDF File (Upload or Vault)
             </button>
             <button
-              onClick={() => setSourceType('image')}
+              onClick={() => {
+                setSourceType('image');
+                setErrorMsg(null);
+                if (uploadedPdf || selectedDocId) {
+                  setPageImages([]);
+                }
+                setExtractedPages([]);
+                setCombinedText('');
+              }}
               className={`min-h-[40px] rounded-lg text-xs font-semibold ${
                 sourceType === 'image'
                   ? 'bg-white dark:bg-slate-900 text-[#142B4A] dark:text-white shadow-sm'
@@ -232,23 +322,78 @@ export const OcrView: React.FC<OcrViewProps> = ({
           </div>
 
           {sourceType === 'pdf' ? (
-            <select
-              value={selectedDocId}
-              onChange={(e) => setSelectedDocId(e.target.value)}
-              className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
-            >
-              {docs
-                .filter((d) => !d.isTrashed && !d.isVaultLocked)
-                .map((d) => (
-                  <option key={d.id} value={d.id}>
-                    {d.name} ({d.pageCount} pages)
-                  </option>
-                ))}
-            </select>
+            <div className="space-y-2.5">
+              <label className="flex items-center justify-center gap-2 min-h-[54px] px-3 rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 cursor-pointer hover:border-[#2563EB] text-sm font-semibold text-[#2563EB]">
+                <FileUp className="w-5 h-5 shrink-0" />
+                <span className="truncate">
+                  {uploadedPdf ? `Selected PDF: ${uploadedPdf.name}` : 'Upload PDF File from Device'}
+                </span>
+                <input
+                  type="file"
+                  accept="application/pdf,.pdf"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    e.target.value = '';
+                    if (file) handleUploadPdfFile(file);
+                  }}
+                  className="hidden"
+                />
+              </label>
+
+              {vaultDocs.length > 0 && (
+                <div>
+                  <label className="block text-[11px] font-semibold text-slate-500 mb-1">
+                    Or choose a PDF from Vault
+                  </label>
+                  <select
+                    value={uploadedPdf ? '' : selectedDocId}
+                    onChange={(e) => {
+                      setUploadedPdf(null);
+                      setPdfRenderLimit(10);
+                      setSelectedDocId(e.target.value);
+                      setExtractedPages([]);
+                      setCombinedText('');
+                    }}
+                    className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
+                  >
+                    {uploadedPdf && <option value="">-- Using uploaded file --</option>}
+                    {vaultDocs.map((d) => (
+                      <option key={d.id} value={d.id}>
+                        {d.name} ({d.pageCount} pages)
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              )}
+
+              {loadingPdfPages && (
+                <div className="flex items-center gap-2 text-xs text-[#2563EB]">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <span>Rendering PDF pages for OCR...</span>
+                </div>
+              )}
+
+              {!loadingPdfPages && pdfPageTotal > 0 && (
+                <div className="flex items-center justify-between text-[11px] text-slate-500">
+                  <span>
+                    Ready: {pageImages.length} of {pdfPageTotal} page(s) loaded
+                  </span>
+                  {pdfPageTotal > pageImages.length && (
+                    <button
+                      type="button"
+                      onClick={() => setPdfRenderLimit((n) => Math.min(pdfPageTotal, n + 10))}
+                      className="text-[#2563EB] font-semibold hover:underline"
+                    >
+                      Load more pages (+10)
+                    </button>
+                  )}
+                </div>
+              )}
+            </div>
           ) : (
             <label className="flex items-center justify-center gap-2 min-h-[56px] rounded-xl border-2 border-dashed border-slate-300 dark:border-slate-700 cursor-pointer hover:border-[#2563EB] text-sm font-semibold text-[#2563EB]">
               <ImagePlus className="w-5 h-5" />
-              <span>Select Photo or Scanned Image</span>
+              <span>Select Photo or Scanned Image (PNG / JPG)</span>
               <input
                 type="file"
                 accept="image/*"
@@ -262,12 +407,22 @@ export const OcrView: React.FC<OcrViewProps> = ({
           {pageImages.length > 0 && (
             <div className="flex items-center gap-2 overflow-x-auto no-scrollbar pt-1">
               {pageImages.map((img, i) => (
-                <img
+                <div
                   key={i}
-                  src={img}
-                  alt={`Page ${i + 1}`}
-                  className="h-24 w-auto rounded-lg border border-slate-200 dark:border-slate-700 shrink-0"
-                />
+                  className="relative shrink-0 rounded-lg border border-slate-200 dark:border-slate-700 overflow-hidden bg-slate-50 dark:bg-slate-800"
+                >
+                  <img
+                    src={img}
+                    alt={`Page ${i + 1}`}
+                    onError={() => {
+                      setPageImages((prev) => prev.filter((_, idx) => idx !== i));
+                    }}
+                    className="h-24 w-auto block"
+                  />
+                  <span className="absolute bottom-1 right-1 px-1.5 py-0.5 rounded bg-slate-900/75 text-white text-[10px] font-mono-nums">
+                    P{i + 1}
+                  </span>
+                </div>
               ))}
             </div>
           )}
@@ -352,7 +507,7 @@ export const OcrView: React.FC<OcrViewProps> = ({
 
           <button
             onClick={handleRunOcr}
-            disabled={running || pageImages.length === 0 || (engine === 'ai' && !aiConsentGranted)}
+            disabled={running || loadingPdfPages || pageImages.length === 0 || (engine === 'ai' && !aiConsentGranted)}
             className="w-full min-h-[48px] rounded-xl bg-[#2563EB] disabled:opacity-40 text-white text-sm font-semibold flex items-center justify-center gap-2"
           >
             <ScanText className="w-4 h-4" />

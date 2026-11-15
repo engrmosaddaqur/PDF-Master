@@ -14,6 +14,7 @@ import {
   PenTool,
   Presentation,
   RotateCw,
+  Scaling,
   ScanText,
   Scissors,
   Search,
@@ -104,6 +105,14 @@ export const ToolsTab: React.FC<ToolsTabProps> = ({
       category: 'edit',
       icon: <RotateCw className="w-5 h-5 text-sky-600" />,
       onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'rotate' }),
+    },
+    {
+      id: 'pageSetup',
+      name: 'Page Size & Orientation',
+      desc: 'Change paper size (A0–A6, Letter, Legal) & Portrait/Landscape',
+      category: 'edit',
+      icon: <Scaling className="w-5 h-5 text-[#2563EB]" />,
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'pageSetup' }),
     },
     {
       id: 'watermark',
