@@ -6,10 +6,11 @@ import {
   Download,
   ExternalLink,
   FolderArchive,
-  Globe,
   HardDrive,
   Info,
+  Languages,
   Loader2,
+  Monitor,
   Moon,
   RefreshCw,
   Shield,
@@ -28,6 +29,7 @@ import {
   downloadArrayBuffer,
   formatBytes,
 } from '../services/storageService';
+import { PdfMasterLogo } from './Logo';
 import { PWAInstallButton } from './PWAComponents';
 
 interface ApkStatusResponse {
@@ -56,14 +58,29 @@ interface SettingsTabProps {
   docs: DocumentRecord[];
   onUpdateSettings: (patch: Partial<AppSettings>) => void;
   onEmptyTrash: () => Promise<void>;
+  onDeleteAllFiles: () => Promise<void>;
   onRestoreBackupDocs: (docs: DocumentRecord[]) => Promise<void>;
 }
+
+const DEFAULT_PAPER_CHOICES: PaperSizeKey[] = [
+  'A0',
+  'A1',
+  'A2',
+  'A3',
+  'A4',
+  'A5',
+  'A6',
+  'Letter',
+  'Legal',
+  'Executive',
+];
 
 export const SettingsTab: React.FC<SettingsTabProps> = ({
   settings,
   docs,
   onUpdateSettings,
   onEmptyTrash,
+  onDeleteAllFiles,
   onRestoreBackupDocs,
 }) => {
   const t = getT(settings.language);
@@ -74,6 +91,7 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
   const [apkChecking, setApkChecking] = useState(false);
   const [apkError, setApkError] = useState<string | null>(null);
   const [copiedCmds, setCopiedCmds] = useState(false);
+  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
 
   const isNativeAndroid = Capacitor.isNativePlatform();
   const totalBytes = docs.reduce((sum, d) => sum + d.sizeBytes, 0);
@@ -134,7 +152,7 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
       `pdf-master-backup-${new Date().toISOString().slice(0, 10)}.json`,
       'application/json'
     );
-    setBackupNotice('Encrypted/local vault backup exported.');
+    setBackupNotice('Vault backup exported.');
     setTimeout(() => setBackupNotice(null), 2500);
   };
 
@@ -183,29 +201,270 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
 
   return (
     <div className="space-y-4 pb-8 max-w-2xl mx-auto">
+      <h1 className="font-display text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white">
+        {t.settings.title}
+      </h1>
+
+      {/* Language Card */}
+      <section className="rounded-3xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] p-4 space-y-3">
+        <h2 className="font-display text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+          <Languages className="w-4 h-4 text-[#3B82F6]" />
+          {t.settings.language}
+        </h2>
+        <div className="grid grid-cols-2 gap-2.5">
+          {(
+            [
+              { id: 'en', label: 'English' },
+              { id: 'bn', label: 'বাংলা' },
+            ] as const
+          ).map((item) => {
+            const active = settings.language === item.id;
+            return (
+              <button
+                key={item.id}
+                onClick={() => onUpdateSettings({ language: item.id })}
+                className={`min-h-[46px] rounded-full border text-sm font-bold transition-all ${
+                  active
+                    ? 'border-[#3B82F6] bg-[#2563EB]/15 text-[#2563EB] dark:text-[#60A5FA]'
+                    : 'border-slate-200 dark:border-[#1E293B] bg-slate-50 dark:bg-[#0D1322] text-slate-700 dark:text-slate-300'
+                }`}
+              >
+                {item.label}
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* Appearance Card (Light | Dark | Automatic) */}
+      <section className="rounded-3xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] p-4 space-y-3">
+        <h2 className="font-display text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+          <Sun className="w-4 h-4 text-[#3B82F6]" />
+          {t.settings.appearance}
+        </h2>
+        <div className="grid grid-cols-3 gap-2.5">
+          {(
+            [
+              { id: 'light', label: t.settings.light, icon: <Sun className="w-4 h-4" /> },
+              { id: 'dark', label: t.settings.dark, icon: <Moon className="w-4 h-4" /> },
+              { id: 'auto', label: t.settings.auto, icon: <Monitor className="w-4 h-4" /> },
+            ] as const
+          ).map((item) => {
+            const active = settings.theme === item.id;
+            return (
+              <button
+                key={item.id}
+                onClick={() => onUpdateSettings({ theme: item.id })}
+                className={`min-h-[68px] px-2 rounded-2xl border flex flex-col items-center justify-center gap-1.5 text-xs font-bold transition-all ${
+                  active
+                    ? 'border-[#3B82F6] bg-[#2563EB]/15 text-[#2563EB] dark:text-[#60A5FA]'
+                    : 'border-slate-200 dark:border-[#1E293B] bg-slate-50 dark:bg-[#0D1322] text-slate-700 dark:text-slate-300'
+                }`}
+              >
+                {item.icon}
+                <span>{item.label}</span>
+              </button>
+            );
+          })}
+        </div>
+      </section>
+
+      {/* Viewer Card */}
+      <section className="rounded-3xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] p-4 space-y-4">
+        <h2 className="font-display text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+          <Monitor className="w-4 h-4 text-[#3B82F6]" />
+          {t.settings.preferences}
+        </h2>
+
+        <div className="space-y-2">
+          <p className="text-xs font-semibold text-slate-500 dark:text-slate-400">
+            {t.settings.defaultView}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {(
+              [
+                { id: 'continuous', label: settings.language === 'bn' ? 'ধারাবাহিক' : 'Continuous' },
+                { id: 'single', label: settings.language === 'bn' ? 'একক পৃষ্ঠা' : 'Single page' },
+              ] as const
+            ).map((item) => {
+              const active = settings.defaultViewMode === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => onUpdateSettings({ defaultViewMode: item.id })}
+                  className={`min-h-[40px] px-5 rounded-full border text-xs font-bold transition-all ${
+                    active
+                      ? 'border-[#3B82F6] bg-[#2563EB]/15 text-[#2563EB] dark:text-[#60A5FA]'
+                      : 'border-slate-200 dark:border-[#1E293B] bg-slate-50 dark:bg-[#0D1322] text-slate-700 dark:text-slate-300'
+                  }`}
+                >
+                  {item.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <p className="text-xs font-semibold text-slate-500 dark:text-slate-400">
+            {t.settings.defaultPaper}
+          </p>
+          <div className="flex flex-wrap gap-2">
+            {DEFAULT_PAPER_CHOICES.filter((k) => PAPER_DIMENSIONS[k]).map((key) => {
+              const active = settings.defaultPageSize === key;
+              return (
+                <button
+                  key={key}
+                  onClick={() => onUpdateSettings({ defaultPageSize: key })}
+                  className={`min-h-[38px] px-4 rounded-full border text-xs font-bold transition-all ${
+                    active
+                      ? 'border-[#3B82F6] bg-[#2563EB]/15 text-[#2563EB] dark:text-[#60A5FA]'
+                      : 'border-slate-200 dark:border-[#1E293B] bg-slate-50 dark:bg-[#0D1322] text-slate-700 dark:text-slate-300'
+                  }`}
+                >
+                  {key}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <label className="flex items-center justify-between gap-3 pt-1 cursor-pointer min-h-[40px]">
+          <span className="text-xs font-semibold text-slate-600 dark:text-slate-300">
+            {t.settings.autoCrop}
+          </span>
+          <input
+            type="checkbox"
+            checked={settings.scannerAutoCrop}
+            onChange={(e) => onUpdateSettings({ scannerAutoCrop: e.target.checked })}
+            className="w-5 h-5 accent-[#3B82F6]"
+          />
+        </label>
+      </section>
+
+      {/* Storage Card */}
+      <section className="rounded-3xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] p-4 space-y-3">
+        <h2 className="font-display text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+          <HardDrive className="w-4 h-4 text-[#3B82F6]" />
+          {t.settings.storageTitle}
+        </h2>
+
+        <div>
+          <p className="text-sm font-bold text-slate-900 dark:text-white font-mono-nums">
+            {docs.length} {settings.language === 'bn' ? 'টি ফাইল সংরক্ষিত' : 'files stored'}
+          </p>
+          <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 font-mono-nums">
+            {formatBytes(totalBytes)}{' '}
+            {settings.language === 'bn' ? 'এই ডিভাইসে ব্যবহৃত' : 'used on this device'}
+          </p>
+        </div>
+
+        {backupNotice && (
+          <p className="text-xs text-[#3B82F6] font-semibold">{backupNotice}</p>
+        )}
+
+        <div className="grid grid-cols-2 gap-2">
+          <button
+            onClick={handleExportBackup}
+            className="min-h-[42px] rounded-2xl bg-slate-100 dark:bg-[#0D1322] border border-slate-200 dark:border-[#1E293B] text-xs font-semibold flex items-center justify-center gap-1.5"
+          >
+            <Download className="w-4 h-4" />
+            {t.settings.exportBackup}
+          </button>
+          <button
+            onClick={() => backupInputRef.current?.click()}
+            className="min-h-[42px] rounded-2xl bg-slate-100 dark:bg-[#0D1322] border border-slate-200 dark:border-[#1E293B] text-xs font-semibold flex items-center justify-center gap-1.5"
+          >
+            <Upload className="w-4 h-4" />
+            {t.settings.importBackup}
+          </button>
+        </div>
+        <input
+          ref={backupInputRef}
+          type="file"
+          accept=".json"
+          onChange={handleImportBackup}
+          className="hidden"
+        />
+
+        <div className="flex flex-wrap items-center gap-3 pt-1">
+          {docs.length > 0 && (
+            <button
+              onClick={() => setConfirmDeleteAll(true)}
+              className="min-h-[40px] px-2 text-xs font-bold text-rose-500 hover:text-rose-400 flex items-center gap-1.5"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span>{t.settings.deleteAllFiles}</span>
+            </button>
+          )}
+          {trashedCount > 0 && (
+            <button
+              onClick={onEmptyTrash}
+              className="min-h-[40px] px-2 text-xs font-bold text-amber-500 hover:text-amber-400 flex items-center gap-1.5"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span>
+                {t.settings.emptyTrash} ({trashedCount})
+              </span>
+            </button>
+          )}
+        </div>
+      </section>
+
+      {/* Privacy Card */}
+      <section className="rounded-3xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] p-4 space-y-3">
+        <h2 className="font-display text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+          <Shield className="w-4 h-4 text-[#3B82F6]" />
+          {t.settings.privacyTitle}
+        </h2>
+        <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
+          {settings.language === 'bn'
+            ? 'আপনার ফাইলগুলো কেবল আপনার ডিভাইসেই প্রক্রিয়াজাত ও সংরক্ষিত হয়। অনুমতি ছাড়া কিছুই আপলোড করা হয় না।'
+            : 'Your files are processed and stored only on this device. Nothing is uploaded.'}
+        </p>
+
+        <label className="flex items-center justify-between gap-3 cursor-pointer min-h-[40px]">
+          <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+            {t.settings.aiConsent}
+          </span>
+          <input
+            type="checkbox"
+            checked={settings.aiConsentGranted}
+            onChange={(e) => onUpdateSettings({ aiConsentGranted: e.target.checked })}
+            className="w-5 h-5 accent-[#3B82F6]"
+          />
+        </label>
+
+        <label className="flex items-center justify-between gap-3 cursor-pointer min-h-[40px]">
+          <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+            {t.settings.localOnly}
+          </span>
+          <input
+            type="checkbox"
+            checked={settings.localOnlyMode}
+            onChange={(e) => onUpdateSettings({ localOnlyMode: e.target.checked })}
+            className="w-5 h-5 accent-[#3B82F6]"
+          />
+        </label>
+      </section>
+
       {/* PWA Install Card */}
       <PWAInstallButton label={t.settings.installApp} />
 
       {/* Android APK Easy Builder & Downloader */}
       {!isNativeAndroid && (
-        <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-3">
+        <section className="rounded-3xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] p-4 space-y-3">
           <div className="flex items-center justify-between gap-2">
-            <h2 className="font-display text-sm font-bold text-[#142B4A] dark:text-white flex items-center gap-2">
-              <Smartphone className="w-4 h-4 text-[#2563EB]" />
+            <h2 className="font-display text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+              <Smartphone className="w-4 h-4 text-[#3B82F6]" />
               {settings.language === 'bn'
                 ? 'অ্যান্ড্রয়েড APK ডাউনলোড ও বিল্ডার'
                 : 'Android APK Download & Easy Builder'}
             </h2>
-            <span className="text-[11px] font-semibold px-2 py-0.5 rounded-md bg-blue-50 dark:bg-blue-950/60 text-[#2563EB]">
+            <span className="text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-[#2563EB]/15 text-[#3B82F6]">
               PDF-Master.apk
             </span>
           </div>
-
-          <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
-            {settings.language === 'bn'
-              ? 'সহজেই সম্পূর্ণ প্রজেক্ট ZIP ডাউনলোড করে এক ক্লিকে GitHub থেকে PDF-Master.apk তৈরি ও ডাউনলোড করুন।'
-              : 'Download the ready-to-build Android project ZIP (with 1-click scripts) or check your GitHub release for the latest PDF-Master.apk.'}
-          </p>
 
           <div className="flex items-center gap-2">
             <input
@@ -213,12 +472,12 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
               value={repoSlug}
               onChange={(e) => setRepoSlug(e.target.value)}
               placeholder="username/repository-name"
-              className="flex-1 min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-mono text-[#142B4A] dark:text-white"
+              className="flex-1 min-h-[42px] px-3.5 rounded-2xl border border-slate-200 dark:border-[#1E293B] bg-slate-50 dark:bg-[#0D1322] text-xs font-mono text-slate-900 dark:text-white"
             />
             <button
               onClick={checkApkStatus}
               disabled={apkChecking}
-              className="min-h-[42px] px-3.5 rounded-xl bg-[#142B4A] dark:bg-[#2563EB] text-white text-xs font-semibold flex items-center gap-1.5 shrink-0 disabled:opacity-60"
+              className="min-h-[42px] px-3.5 rounded-2xl bg-[#3B82F6] text-white text-xs font-bold flex items-center gap-1.5 shrink-0 disabled:opacity-60"
             >
               {apkChecking ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -229,19 +488,19 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
             </button>
           </div>
 
-          {apkError && <p className="text-xs text-rose-600 dark:text-rose-400">{apkError}</p>}
+          {apkError && <p className="text-xs text-rose-500">{apkError}</p>}
 
           {apkStatus?.release && (
-            <div className="rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 p-3 space-y-2">
+            <div className="rounded-2xl bg-emerald-500/10 border border-emerald-500/30 p-3 space-y-2">
               <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2 text-emerald-700 dark:text-emerald-300 text-xs font-bold">
+                <div className="flex items-center gap-2 text-emerald-500 text-xs font-bold">
                   <CheckCircle2 className="w-4 h-4 shrink-0" />
                   <span>
                     {apkStatus.release.apkName} ({apkStatus.release.tag})
                   </span>
                 </div>
                 {apkStatus.release.apkSizeBytes > 0 && (
-                  <span className="text-[11px] font-mono-nums text-emerald-700 dark:text-emerald-300">
+                  <span className="text-[11px] font-mono-nums text-emerald-500">
                     {formatBytes(apkStatus.release.apkSizeBytes)}
                   </span>
                 )}
@@ -260,21 +519,18 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
           )}
 
           {apkStatus && !apkStatus.release && apkStatus.latestRun && (
-            <div className="rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 p-3 flex items-center justify-between gap-2">
-              <div className="text-xs text-amber-800 dark:text-amber-200">
+            <div className="rounded-2xl bg-amber-500/10 border border-amber-500/30 p-3 flex items-center justify-between gap-2">
+              <div className="text-xs text-amber-500">
                 <p className="font-bold">
                   GitHub Build: {apkStatus.latestRun.status}
                   {apkStatus.latestRun.conclusion ? ` (${apkStatus.latestRun.conclusion})` : ''}
-                </p>
-                <p className="text-[11px] opacity-80">
-                  Wait ~2 minutes if running, then tap Check APK again.
                 </p>
               </div>
               <a
                 href={apkStatus.latestRun.htmlUrl}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="min-h-[36px] px-3 rounded-lg bg-amber-600 text-white text-xs font-semibold flex items-center gap-1 shrink-0"
+                className="min-h-[36px] px-3 rounded-xl bg-amber-600 text-white text-xs font-semibold flex items-center gap-1 shrink-0"
               >
                 <span>Logs</span>
                 <ExternalLink className="w-3 h-3" />
@@ -282,17 +538,11 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
             </div>
           )}
 
-          {apkStatus && !apkStatus.repoExists && (
-            <div className="rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 p-3 text-xs text-slate-600 dark:text-slate-300">
-              Repository <span className="font-mono font-semibold">{apkStatus.repo}</span> is not published on GitHub yet. Use Step 1 &amp; 2 below to generate the APK automatically.
-            </div>
-          )}
-
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
             <a
               href={getApiUrl(`/api/apk/project-zip?repo=${encodeURIComponent(repoSlug.trim() || 'engrmosaddaqur/PDF-Master')}`)}
               download="PDF-Master-Android-APK-Kit.zip"
-              className="min-h-[44px] px-3 rounded-xl bg-[#2563EB] hover:bg-[#1D4ED8] text-white text-xs font-semibold flex items-center justify-center gap-2"
+              className="min-h-[44px] px-3 rounded-2xl bg-gradient-to-r from-[#3B82F6] to-[#06B6D4] text-white text-xs font-bold flex items-center justify-center gap-2"
             >
               <FolderArchive className="w-4 h-4 shrink-0" />
               <span>
@@ -302,265 +552,68 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
               </span>
             </a>
 
-            <a
-              href={`https://github.com/new?name=${encodeURIComponent((repoSlug.split('/')[1] || 'PDF-Master').trim())}`}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="min-h-[44px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-[#142B4A] dark:text-slate-100 text-xs font-semibold flex items-center justify-center gap-2"
+            <button
+              onClick={handleCopyPushCommands}
+              className="min-h-[44px] px-3 rounded-2xl bg-slate-100 dark:bg-[#0D1322] border border-slate-200 dark:border-[#1E293B] text-slate-900 dark:text-slate-100 text-xs font-bold flex items-center justify-center gap-2"
             >
-              <ExternalLink className="w-4 h-4 shrink-0 text-[#2563EB]" />
-              <span>
-                {settings.language === 'bn'
-                  ? '২. GitHub রিপো তৈরি করুন'
-                  : '2. Create GitHub Repo'}
-              </span>
-            </a>
-          </div>
-
-          <div className="rounded-xl bg-slate-50 dark:bg-slate-800/60 p-3 space-y-2 text-[11px] text-slate-600 dark:text-slate-300">
-            <div className="flex items-center justify-between gap-2">
-              <span className="font-semibold text-[#142B4A] dark:text-white">
-                {settings.language === 'bn'
-                  ? 'ZIP খুলে যেকোনো একটি স্ক্রিপ্ট চালান:'
-                  : 'Extract the ZIP and run one script:'}
-              </span>
-              <button
-                onClick={handleCopyPushCommands}
-                className="inline-flex items-center gap-1 px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-[#2563EB]"
-              >
-                <Copy className="w-3 h-3" />
-                <span>{copiedCmds ? 'Copied!' : 'Copy Git Cmds'}</span>
-              </button>
-            </div>
-            <ul className="space-y-1 list-disc pl-4">
-              <li>
-                Windows: double-click <span className="font-mono font-semibold">1-CLICK-GITHUB-APK.bat</span>
-              </li>
-              <li>
-                Mac / Linux / Termux: run <span className="font-mono font-semibold">bash 1-CLICK-GITHUB-APK.sh</span>
-              </li>
-              <li>
-                Local Android Studio/JDK build: run <span className="font-mono font-semibold">BUILD-LOCAL-APK.bat</span> or <span className="font-mono font-semibold">.sh</span>
-              </li>
-            </ul>
+              <Copy className="w-4 h-4 shrink-0 text-[#3B82F6]" />
+              <span>{copiedCmds ? 'Copied!' : 'Copy Git Commands'}</span>
+            </button>
           </div>
         </section>
       )}
 
-      {/* Appearance & Language */}
-      <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-4">
-        <h2 className="font-display text-sm font-bold text-[#142B4A] dark:text-white flex items-center gap-2">
-          <Globe className="w-4 h-4 text-[#2563EB]" />
-          {t.settings.appearance}
-        </h2>
-
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-sm font-medium">{t.settings.language}</span>
-          <div className="flex items-center p-1 rounded-xl bg-slate-100 dark:bg-slate-800">
-            <button
-              onClick={() => onUpdateSettings({ language: 'en' })}
-              className={`min-h-[36px] px-3 rounded-lg text-xs font-semibold ${
-                settings.language === 'en'
-                  ? 'bg-white dark:bg-slate-900 text-[#142B4A] dark:text-white shadow-sm'
-                  : 'text-slate-500'
-              }`}
-            >
-              English
-            </button>
-            <button
-              onClick={() => onUpdateSettings({ language: 'bn' })}
-              className={`min-h-[36px] px-3 rounded-lg text-xs font-semibold ${
-                settings.language === 'bn'
-                  ? 'bg-white dark:bg-slate-900 text-[#142B4A] dark:text-white shadow-sm'
-                  : 'text-slate-500'
-              }`}
-            >
-              বাংলা
-            </button>
-          </div>
-        </div>
-
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-sm font-medium">{t.settings.theme}</span>
-          <div className="flex items-center p-1 rounded-xl bg-slate-100 dark:bg-slate-800">
-            <button
-              onClick={() => onUpdateSettings({ theme: 'light' })}
-              className={`min-h-[36px] px-3 rounded-lg text-xs font-semibold flex items-center gap-1.5 ${
-                settings.theme === 'light'
-                  ? 'bg-white text-[#142B4A] shadow-sm'
-                  : 'text-slate-400'
-              }`}
-            >
-              <Sun className="w-3.5 h-3.5" /> {t.settings.light}
-            </button>
-            <button
-              onClick={() => onUpdateSettings({ theme: 'dark' })}
-              className={`min-h-[36px] px-3 rounded-lg text-xs font-semibold flex items-center gap-1.5 ${
-                settings.theme === 'dark'
-                  ? 'bg-slate-900 text-white shadow-sm'
-                  : 'text-slate-500'
-              }`}
-            >
-              <Moon className="w-3.5 h-3.5" /> {t.settings.dark}
-            </button>
-          </div>
-        </div>
-      </section>
-
-      {/* PDF & Creator Defaults */}
-      <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-3">
-        <h2 className="font-display text-sm font-bold text-[#142B4A] dark:text-white">
-          {t.settings.preferences}
-        </h2>
-
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-sm">{t.settings.defaultView}</span>
-          <select
-            value={settings.defaultViewMode}
-            onChange={(e) =>
-              onUpdateSettings({ defaultViewMode: e.target.value as 'continuous' | 'single' })
-            }
-            className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-semibold"
-          >
-            <option value="continuous">Continuous Scroll</option>
-            <option value="single">Single Page</option>
-          </select>
-        </div>
-
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-sm">{t.settings.defaultPaper}</span>
-          <select
-            value={settings.defaultPageSize}
-            onChange={(e) =>
-              onUpdateSettings({ defaultPageSize: e.target.value as PaperSizeKey })
-            }
-            className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-semibold"
-          >
-            {Object.values(PAPER_DIMENSIONS).map((p) => (
-              <option key={p.key} value={p.key}>
-                {p.key}
-              </option>
-            ))}
-          </select>
-        </div>
-
-        <div className="flex items-center justify-between gap-3">
-          <span className="text-sm">{t.settings.exportQuality}</span>
-          <select
-            value={settings.exportQuality}
-            onChange={(e) =>
-              onUpdateSettings({
-                exportQuality: e.target.value as AppSettings['exportQuality'],
-              })
-            }
-            className="min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-semibold"
-          >
-            <option value="standard">Standard</option>
-            <option value="high">High (Recommended)</option>
-            <option value="maximum">Maximum</option>
-          </select>
-        </div>
-
-        <label className="flex items-center justify-between gap-3 pt-1 cursor-pointer min-h-[40px]">
-          <span className="text-sm">{t.settings.autoCrop}</span>
-          <input
-            type="checkbox"
-            checked={settings.scannerAutoCrop}
-            onChange={(e) => onUpdateSettings({ scannerAutoCrop: e.target.checked })}
-            className="w-5 h-5 accent-[#2563EB]"
-          />
-        </label>
-      </section>
-
-      {/* Storage & Backup */}
-      <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-3">
-        <div className="flex items-center justify-between">
-          <h2 className="font-display text-sm font-bold text-[#142B4A] dark:text-white flex items-center gap-2">
-            <HardDrive className="w-4 h-4 text-[#2563EB]" />
-            {t.settings.storageTitle}
-          </h2>
-          <span className="text-xs font-mono-nums text-slate-500">
-            {docs.length} files · {formatBytes(totalBytes)}
-          </span>
-        </div>
-
-        {backupNotice && (
-          <p className="text-xs text-[#2563EB] font-semibold">{backupNotice}</p>
-        )}
-
-        <div className="grid grid-cols-2 gap-2">
-          <button
-            onClick={handleExportBackup}
-            className="min-h-[44px] rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center justify-center gap-1.5"
-          >
-            <Download className="w-4 h-4" />
-            {t.settings.exportBackup}
-          </button>
-          <button
-            onClick={() => backupInputRef.current?.click()}
-            className="min-h-[44px] rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center justify-center gap-1.5"
-          >
-            <Upload className="w-4 h-4" />
-            {t.settings.importBackup}
-          </button>
-        </div>
-        <input
-          ref={backupInputRef}
-          type="file"
-          accept=".json"
-          onChange={handleImportBackup}
-          className="hidden"
-        />
-
-        {trashedCount > 0 && (
-          <button
-            onClick={onEmptyTrash}
-            className="w-full min-h-[44px] rounded-xl bg-rose-50 dark:bg-rose-950/40 text-rose-600 dark:text-rose-300 text-xs font-semibold flex items-center justify-center gap-1.5"
-          >
-            <Trash2 className="w-4 h-4" />
-            {t.settings.emptyTrash} ({trashedCount})
-          </button>
-        )}
-      </section>
-
-      {/* Privacy & Security */}
-      <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-3">
-        <h2 className="font-display text-sm font-bold text-[#142B4A] dark:text-white flex items-center gap-2">
-          <Shield className="w-4 h-4 text-[#06B6D4]" />
-          {t.settings.privacyTitle}
-        </h2>
-
-        <label className="flex items-center justify-between gap-3 cursor-pointer min-h-[40px]">
-          <span className="text-sm">{t.settings.aiConsent}</span>
-          <input
-            type="checkbox"
-            checked={settings.aiConsentGranted}
-            onChange={(e) => onUpdateSettings({ aiConsentGranted: e.target.checked })}
-            className="w-5 h-5 accent-[#2563EB]"
-          />
-        </label>
-
-        <label className="flex items-center justify-between gap-3 cursor-pointer min-h-[40px]">
-          <span className="text-sm">{t.settings.localOnly}</span>
-          <input
-            type="checkbox"
-            checked={settings.localOnlyMode}
-            onChange={(e) => onUpdateSettings({ localOnlyMode: e.target.checked })}
-            className="w-5 h-5 accent-[#2563EB]"
-          />
-        </label>
-      </section>
-
-      {/* About & Architecture */}
-      <section className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-1.5">
-        <h2 className="font-display text-sm font-bold text-[#142B4A] dark:text-white flex items-center gap-2">
-          <Info className="w-4 h-4 text-[#2563EB]" />
+      {/* About Card matching Screenshot */}
+      <section className="rounded-3xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] p-4 space-y-3">
+        <h2 className="font-display text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+          <Info className="w-4 h-4 text-[#3B82F6]" />
           {t.settings.aboutTitle}
         </h2>
-        <p className="text-xs text-slate-600 dark:text-slate-400 leading-relaxed">
-          PDF MASTER — Everything PDF. One Powerful App. Built as an installable mobile-first PWA powered by PDF.js rendering, pdf-lib binary editing, Canvas homography document scanning, Tesseract.js English &amp; বাংলা OCR, IndexedDB local vault storage, and server-side Gemini AI document analysis.
+        <div className="flex items-center gap-3">
+          <PdfMasterLogo
+            size={48}
+            showWordmark
+            showTagline
+            tagline={t.tagline}
+          />
+        </div>
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          Version 1.0.5
         </p>
       </section>
+
+      {/* In-App Delete All Files Confirmation Modal (No window.confirm) */}
+      {confirmDeleteAll && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="w-full max-w-sm rounded-3xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] p-5 shadow-2xl space-y-4">
+            <h3 className="font-display text-base font-bold text-slate-900 dark:text-white">
+              {settings.language === 'bn' ? 'সব ফাইল মুছে ফেলবেন?' : 'Delete all files?'}
+            </h3>
+            <p className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed">
+              {settings.language === 'bn'
+                ? 'এই ডিভাইস থেকে সংরক্ষিত সব পিডিএফ স্থায়ীভাবে মুছে যাবে। আগে ব্যাকআপ এক্সপোর্ট করে নিতে পারেন।'
+                : 'This permanently removes all documents stored on this device. Export a backup first if you want to keep a copy.'}
+            </p>
+            <div className="grid grid-cols-2 gap-2.5">
+              <button
+                onClick={() => setConfirmDeleteAll(false)}
+                className="min-h-[44px] rounded-xl bg-slate-100 dark:bg-[#1A243B] text-xs font-semibold"
+              >
+                {settings.language === 'bn' ? 'বাতিল' : 'Cancel'}
+              </button>
+              <button
+                onClick={async () => {
+                  await onDeleteAllFiles();
+                  setConfirmDeleteAll(false);
+                }}
+                className="min-h-[44px] rounded-xl bg-rose-600 text-white text-xs font-bold"
+              >
+                {settings.language === 'bn' ? 'সব মুছুন' : 'Delete all'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

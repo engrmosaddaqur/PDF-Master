@@ -1,5 +1,6 @@
 import React, { useMemo, useState } from 'react';
 import {
+  Bot,
   Camera,
   Combine,
   Edit3,
@@ -8,7 +9,8 @@ import {
   GitCompare,
   Hash,
   Image as ImageIcon,
-  Layers,
+  Info,
+  LayoutGrid,
   Lock,
   Minimize2,
   PenTool,
@@ -18,14 +20,12 @@ import {
   ScanText,
   Scissors,
   Search,
-  Sparkles,
   Stamp,
   Type,
   Unlock,
   Wrench,
 } from 'lucide-react';
 import type { ActiveWorkspace, AppLanguage, DocumentRecord } from '../types';
-import { getT } from '../i18n/translations';
 
 interface ToolsTabProps {
   language: AppLanguage;
@@ -33,331 +33,353 @@ interface ToolsTabProps {
   onOpenWorkspace: (ws: ActiveWorkspace) => void;
 }
 
-type ToolCat = 'all' | 'edit' | 'convert' | 'security' | 'ai';
+type ToolGroupId = 'organize' | 'convert' | 'edit' | 'security' | 'smart';
+
+interface ToolCardItem {
+  id: string;
+  name: string;
+  desc: string;
+  group: ToolGroupId;
+  icon: React.ReactNode;
+  iconBg: string;
+  onClick: () => void;
+}
 
 export const ToolsTab: React.FC<ToolsTabProps> = ({
   language,
   docs,
   onOpenWorkspace,
 }) => {
-  const t = getT(language);
   const [query, setQuery] = useState('');
-  const [cat, setCat] = useState<ToolCat>('all');
 
   const firstDoc = docs.find((d) => !d.isTrashed && !d.isVaultLocked);
 
-  const tools: Array<{
-    id: string;
-    name: string;
-    desc: string;
-    category: Exclude<ToolCat, 'all'>;
-    icon: React.ReactNode;
-    onClick: () => void;
-  }> = [
+  const tools: ToolCardItem[] = [
+    // ORGANIZE
+    {
+      id: 'merge',
+      name: language === 'bn' ? 'মার্জ পিডিএফ' : 'Merge PDF',
+      desc: language === 'bn' ? 'একাধিক পিডিএফ একটি ফাইলে যোগ করুন' : 'Combine several PDFs into one',
+      group: 'organize',
+      icon: <Combine className="w-5 h-5 text-[#3B82F6]" />,
+      iconBg: 'bg-[#2563EB]/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'merge' }),
+    },
+    {
+      id: 'split',
+      name: language === 'bn' ? 'স্প্লিট ও এক্সট্র্যাক্ট' : 'Split & Extract',
+      desc: language === 'bn' ? 'প্রয়োজনীয় পৃষ্ঠা বেছে আলাদা করুন' : 'Pick pages to keep or split every page',
+      group: 'organize',
+      icon: <Scissors className="w-5 h-5 text-rose-500" />,
+      iconBg: 'bg-rose-500/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'split' }),
+    },
+    {
+      id: 'rotate',
+      name: language === 'bn' ? 'রোটেট পিডিএফ' : 'Rotate PDF',
+      desc: language === 'bn' ? 'সব পৃষ্ঠা বামে বা ডানে ঘোরান' : 'Turn all pages left or right',
+      group: 'organize',
+      icon: <RotateCw className="w-5 h-5 text-[#06B6D4]" />,
+      iconBg: 'bg-[#06B6D4]/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'rotate' }),
+    },
+    {
+      id: 'organize',
+      name: language === 'bn' ? 'পৃষ্ঠা সাজান' : 'Organize pages',
+      desc: language === 'bn' ? 'পৃষ্ঠা ক্রম পরিবর্তন, ডিলিট ও ডুপ্লিকেট' : 'Reorder, delete and duplicate pages',
+      group: 'organize',
+      icon: <LayoutGrid className="w-5 h-5 text-[#3B82F6]" />,
+      iconBg: 'bg-[#2563EB]/15',
+      onClick: () =>
+        firstDoc
+          ? onOpenWorkspace({ type: 'organizer', docId: firstDoc.id })
+          : onOpenWorkspace({ type: 'toolRunner', toolId: 'split' }),
+    },
+    {
+      id: 'pageSetup',
+      name: language === 'bn' ? 'পেজ সাইজ ও দিক' : 'Page Size & Orientation',
+      desc: language === 'bn' ? 'A0–A6, Letter, Legal ও Portrait/Landscape' : 'Resize pages and switch orientation',
+      group: 'organize',
+      icon: <Scaling className="w-5 h-5 text-indigo-400" />,
+      iconBg: 'bg-indigo-500/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'pageSetup' }),
+    },
+    {
+      id: 'compare',
+      name: language === 'bn' ? 'পিডিএফ তুলনা' : 'Compare PDFs',
+      desc: language === 'bn' ? 'দুটি ফাইলের পার্থক্য দেখুন' : 'Spot differences between two files',
+      group: 'organize',
+      icon: <GitCompare className="w-5 h-5 text-amber-500" />,
+      iconBg: 'bg-amber-500/15',
+      onClick: () => onOpenWorkspace({ type: 'compare' }),
+    },
+
+    // CONVERT
+    {
+      id: 'imagesToPdf',
+      name: language === 'bn' ? 'ছবি থেকে পিডিএফ' : 'Images to PDF',
+      desc: language === 'bn' ? 'JPG ও PNG ছবি পিডিএফ বানান' : 'Turn JPG and PNG photos into a PDF',
+      group: 'convert',
+      icon: <ImageIcon className="w-5 h-5 text-emerald-500" />,
+      iconBg: 'bg-emerald-500/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'imagesToPdf' }),
+    },
+    {
+      id: 'extractText',
+      name: language === 'bn' ? 'পিডিএফ থেকে টেক্সট' : 'PDF to Text',
+      desc: language === 'bn' ? 'সব লেখা .TXT হিসেবে বের করুন' : 'Pull out all the text in a PDF',
+      group: 'convert',
+      icon: <FileText className="w-5 h-5 text-[#3B82F6]" />,
+      iconBg: 'bg-[#2563EB]/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'extractText' }),
+    },
+    {
+      id: 'extractImages',
+      name: language === 'bn' ? 'পিডিএফ থেকে ছবি' : 'PDF to Images',
+      desc: language === 'bn' ? 'প্রতিটি পৃষ্ঠা ছবি হিসেবে সেভ' : 'Save each page as a picture',
+      group: 'convert',
+      icon: <ImageIcon className="w-5 h-5 text-amber-500" />,
+      iconBg: 'bg-amber-500/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'extractImages' }),
+    },
+    {
+      id: 'pdfToDocx',
+      name: language === 'bn' ? 'পিডিএফ থেকে ওয়ার্ড' : 'PDF to Word',
+      desc: language === 'bn' ? 'সম্পাদনাযোগ্য DOCX ফাইলে নিন' : 'Convert to an editable DOCX',
+      group: 'convert',
+      icon: <FileText className="w-5 h-5 text-[#3B82F6]" />,
+      iconBg: 'bg-[#2563EB]/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'pdfToDocx' }),
+    },
+    {
+      id: 'wordToPdf',
+      name: 'Word / Excel / PPT to PDF',
+      desc: 'Convert Office files into paginated PDF',
+      group: 'convert',
+      icon: <Presentation className="w-5 h-5 text-rose-500" />,
+      iconBg: 'bg-rose-500/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'wordToPdf' }),
+    },
+    {
+      id: 'compress',
+      name: language === 'bn' ? 'কমপ্রেস পিডিএফ' : 'Compress PDF',
+      desc: language === 'bn' ? 'পিডিএফের ফাইল সাইজ ছোট করুন' : 'Make a PDF smaller cleanly',
+      group: 'convert',
+      icon: <Minimize2 className="w-5 h-5 text-[#06B6D4]" />,
+      iconBg: 'bg-[#06B6D4]/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'compress' }),
+    },
+    {
+      id: 'pdfToXlsx',
+      name: 'PDF to Excel (.XLSX)',
+      desc: 'Extract tables into Excel spreadsheets',
+      group: 'convert',
+      icon: <FileSpreadsheet className="w-5 h-5 text-emerald-500" />,
+      iconBg: 'bg-emerald-500/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'pdfToXlsx' }),
+    },
+    {
+      id: 'pdfToPptx',
+      name: 'PDF to PowerPoint',
+      desc: 'Convert pages into .PPTX slide decks',
+      group: 'convert',
+      icon: <Presentation className="w-5 h-5 text-amber-500" />,
+      iconBg: 'bg-amber-500/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'pdfToPptx' }),
+    },
+
+    // EDIT & ANNOTATE
+    {
+      id: 'watermark',
+      name: language === 'bn' ? 'ওয়াটারমার্ক যোগ' : 'Add Watermark',
+      desc: language === 'bn' ? 'সব পৃষ্ঠায় জলছাপ বসান' : 'Stamp text across every page',
+      group: 'edit',
+      icon: <Stamp className="w-5 h-5 text-[#06B6D4]" />,
+      iconBg: 'bg-[#06B6D4]/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'watermark' }),
+    },
+    {
+      id: 'pageNumbers',
+      name: language === 'bn' ? 'পেজ নম্বর' : 'Page Numbers',
+      desc: language === 'bn' ? 'প্রতিটি পৃষ্ঠায় নম্বর বসান' : 'Number every page automatically',
+      group: 'edit',
+      icon: <Hash className="w-5 h-5 text-amber-500" />,
+      iconBg: 'bg-amber-500/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'pageNumbers' }),
+    },
+    {
+      id: 'editMetadata',
+      name: language === 'bn' ? 'মেটাডাটা এডিট' : 'Edit Metadata',
+      desc: language === 'bn' ? 'শিরোনাম, লেখক ও কিওয়ার্ড বদলান' : 'Change title, author and keywords',
+      group: 'edit',
+      icon: <Info className="w-5 h-5 text-emerald-500" />,
+      iconBg: 'bg-emerald-500/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'editMetadata' }),
+    },
     {
       id: 'editPdf',
-      name: 'Edit PDF',
-      desc: 'Edit existing text, add text, images & annotations',
-      category: 'edit',
-      icon: <Edit3 className="w-5 h-5 text-[#2563EB]" />,
+      name: language === 'bn' ? 'পিডিএফ টেক্সট এডিট' : 'Edit PDF text',
+      desc: language === 'bn' ? 'পিডিএফের লেখা, ছবি ও নোট বদলান' : 'Change the words inside a PDF',
+      group: 'edit',
+      icon: <Edit3 className="w-5 h-5 text-[#3B82F6]" />,
+      iconBg: 'bg-[#2563EB]/15',
       onClick: () =>
         firstDoc
           ? onOpenWorkspace({ type: 'editor', docId: firstDoc.id })
           : onOpenWorkspace({ type: 'wordCreator' }),
     },
     {
-      id: 'organize',
-      name: 'Organize Pages',
-      desc: 'Reorder, rotate, duplicate, insert & delete pages',
-      category: 'edit',
-      icon: <Layers className="w-5 h-5 text-[#2563EB]" />,
+      id: 'signature',
+      name: language === 'bn' ? 'স্বাক্ষর যোগ করুন' : 'Sign PDF',
+      desc: language === 'bn' ? 'হাতে এঁকে বা ছবি থেকে স্বাক্ষর' : 'Draw and place your signature',
+      group: 'edit',
+      icon: <PenTool className="w-5 h-5 text-indigo-400" />,
+      iconBg: 'bg-indigo-500/15',
       onClick: () =>
-        firstDoc && onOpenWorkspace({ type: 'organizer', docId: firstDoc.id }),
-    },
-    {
-      id: 'merge',
-      name: 'Merge PDF',
-      desc: 'Combine multiple PDF documents into one',
-      category: 'edit',
-      icon: <Combine className="w-5 h-5 text-indigo-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'merge' }),
-    },
-    {
-      id: 'split',
-      name: 'Split PDF',
-      desc: 'Extract specific page ranges into a new PDF',
-      category: 'edit',
-      icon: <Scissors className="w-5 h-5 text-indigo-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'split' }),
-    },
-    {
-      id: 'compress',
-      name: 'Compress PDF',
-      desc: 'Reduce PDF file size cleanly',
-      category: 'edit',
-      icon: <Minimize2 className="w-5 h-5 text-amber-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'compress' }),
-    },
-    {
-      id: 'rotate',
-      name: 'Rotate PDF',
-      desc: 'Rotate all pages 90°, 180°, or 270°',
-      category: 'edit',
-      icon: <RotateCw className="w-5 h-5 text-sky-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'rotate' }),
-    },
-    {
-      id: 'pageSetup',
-      name: 'Page Size & Orientation',
-      desc: 'Change paper size (A0–A6, Letter, Legal) & Portrait/Landscape',
-      category: 'edit',
-      icon: <Scaling className="w-5 h-5 text-[#2563EB]" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'pageSetup' }),
-    },
-    {
-      id: 'watermark',
-      name: 'Add Watermark',
-      desc: 'Stamp custom English or বাংলা watermarks',
-      category: 'edit',
-      icon: <Stamp className="w-5 h-5 text-cyan-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'watermark' }),
-    },
-    {
-      id: 'pageNumbers',
-      name: 'Page Numbers',
-      desc: 'Add automatic page numbering to PDFs',
-      category: 'edit',
-      icon: <Hash className="w-5 h-5 text-slate-700 dark:text-slate-300" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'pageNumbers' }),
+        firstDoc
+          ? onOpenWorkspace({ type: 'editor', docId: firstDoc.id })
+          : onOpenWorkspace({ type: 'wordCreator' }),
     },
     {
       id: 'headerFooter',
-      name: 'Header & Footer',
-      desc: 'Apply top and bottom margin labels across pages',
-      category: 'edit',
-      icon: <Type className="w-5 h-5 text-slate-700 dark:text-slate-300" />,
+      name: language === 'bn' ? 'হেডার ও ফুটার' : 'Header & Footer',
+      desc: language === 'bn' ? 'উপরে ও নিচে লেখা যোগ করুন' : 'Apply top and bottom margin labels',
+      group: 'edit',
+      icon: <Type className="w-5 h-5 text-[#3B82F6]" />,
+      iconBg: 'bg-[#2563EB]/15',
       onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'headerFooter' }),
     },
-    {
-      id: 'editMetadata',
-      name: 'Edit Metadata',
-      desc: 'Modify Title, Author, Subject & Keywords',
-      category: 'edit',
-      icon: <FileText className="w-5 h-5 text-slate-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'editMetadata' }),
-    },
-    {
-      id: 'repairPdf',
-      name: 'Repair PDF',
-      desc: 'Rebuild cross-reference tables & object streams',
-      category: 'edit',
-      icon: <Wrench className="w-5 h-5 text-orange-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'repairPdf' }),
-    },
-    // Convert tools
-    {
-      id: 'imagesToPdf',
-      name: 'Images to PDF',
-      desc: 'Convert PNG, JPG, or WEBP photos into PDF',
-      category: 'convert',
-      icon: <ImageIcon className="w-5 h-5 text-emerald-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'imagesToPdf' }),
-    },
-    {
-      id: 'extractImages',
-      name: 'PDF to Images',
-      desc: 'Render every PDF page as PNG & export ZIP',
-      category: 'convert',
-      icon: <ImageIcon className="w-5 h-5 text-emerald-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'extractImages' }),
-    },
-    {
-      id: 'extractText',
-      name: 'PDF to Text',
-      desc: 'Extract all embedded text into a .TXT file',
-      category: 'convert',
-      icon: <FileText className="w-5 h-5 text-emerald-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'extractText' }),
-    },
-    {
-      id: 'pdfToDocx',
-      name: 'PDF to Word (.DOCX)',
-      desc: 'Convert PDF pages into editable Word document',
-      category: 'convert',
-      icon: <FileText className="w-5 h-5 text-[#2563EB]" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'pdfToDocx' }),
-    },
-    {
-      id: 'pdfToXlsx',
-      name: 'PDF to Excel (.XLSX)',
-      desc: 'Extract tabular rows into Excel spreadsheets',
-      category: 'convert',
-      icon: <FileSpreadsheet className="w-5 h-5 text-emerald-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'pdfToXlsx' }),
-    },
-    {
-      id: 'pdfToPptx',
-      name: 'PDF to PowerPoint',
-      desc: 'Export PDF pages into .PPTX presentation slides',
-      category: 'convert',
-      icon: <Presentation className="w-5 h-5 text-amber-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'pdfToPptx' }),
-    },
-    {
-      id: 'wordToPdf',
-      name: 'Word (.DOCX) to PDF',
-      desc: 'Convert Word files into crisp paginated PDFs',
-      category: 'convert',
-      icon: <FileText className="w-5 h-5 text-[#2563EB]" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'wordToPdf' }),
-    },
-    {
-      id: 'excelToPdf',
-      name: 'Excel (.XLSX) to PDF',
-      desc: 'Convert spreadsheets and CSVs to PDF',
-      category: 'convert',
-      icon: <FileSpreadsheet className="w-5 h-5 text-emerald-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'excelToPdf' }),
-    },
-    {
-      id: 'pptToPdf',
-      name: 'PowerPoint to PDF',
-      desc: 'Convert .PPTX slide decks into PDF',
-      category: 'convert',
-      icon: <Presentation className="w-5 h-5 text-amber-600" />,
-      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'pptToPdf' }),
-    },
-    // Sign, Compare & Security
-    {
-      id: 'signature',
-      name: 'Sign PDF',
-      desc: 'Draw or upload signature with SHA-256 seal',
-      category: 'security',
-      icon: <PenTool className="w-5 h-5 text-[#2563EB]" />,
-      onClick: () =>
-        firstDoc && onOpenWorkspace({ type: 'editor', docId: firstDoc.id }),
-    },
-    {
-      id: 'compare',
-      name: 'Compare PDFs',
-      desc: 'Side-by-side & line-by-line text difference check',
-      category: 'security',
-      icon: <GitCompare className="w-5 h-5 text-indigo-600" />,
-      onClick: () => onOpenWorkspace({ type: 'compare' }),
-    },
+
+    // SECURITY
     {
       id: 'protectVault',
-      name: 'Protect PDF (AES-256)',
-      desc: 'Encrypt document in local Vault with password',
-      category: 'security',
-      icon: <Lock className="w-5 h-5 text-rose-600" />,
+      name: language === 'bn' ? 'পাসওয়ার্ড সুরক্ষা' : 'Protect with password',
+      desc: language === 'bn' ? 'AES-256 দিয়ে পিডিএফ লক করুন' : 'Lock a PDF with a password',
+      group: 'security',
+      icon: <Lock className="w-5 h-5 text-rose-500" />,
+      iconBg: 'bg-rose-500/15',
       onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'protectVault' }),
     },
     {
       id: 'unlockPdf',
-      name: 'Unlock PDF Password',
-      desc: 'Remove password from authorized PDF documents',
-      category: 'security',
-      icon: <Unlock className="w-5 h-5 text-emerald-600" />,
+      name: language === 'bn' ? 'পাসওয়ার্ড সরান' : 'Remove password',
+      desc: language === 'bn' ? 'আপনার পিডিএফ আনলক করুন' : 'Unlock a PDF you own',
+      group: 'security',
+      icon: <Unlock className="w-5 h-5 text-emerald-500" />,
+      iconBg: 'bg-emerald-500/15',
       onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'unlockPdf' }),
     },
-    // Scan, OCR & AI
+    {
+      id: 'repairPdf',
+      name: language === 'bn' ? 'রিপেয়ার পিডিএফ' : 'Repair PDF',
+      desc: language === 'bn' ? 'ক্ষতিগ্রস্ত পিডিএফ ঠিক করুন' : 'Rebuild damaged PDF structure',
+      group: 'security',
+      icon: <Wrench className="w-5 h-5 text-amber-500" />,
+      iconBg: 'bg-amber-500/15',
+      onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'repairPdf' }),
+    },
+
+    // SMART TOOLS
     {
       id: 'scanner',
-      name: 'Smart Doc Scanner',
-      desc: 'Auto-crop, perspective warp & Magic Color filter',
-      category: 'ai',
+      name: language === 'bn' ? 'ডকুমেন্ট স্ক্যানার' : 'Document scanner',
+      desc: language === 'bn' ? 'ক্যামেরা দিয়ে কাগজ স্ক্যান করুন' : 'Scan paper with your camera',
+      group: 'smart',
       icon: <Camera className="w-5 h-5 text-[#06B6D4]" />,
+      iconBg: 'bg-[#06B6D4]/15',
       onClick: () => onOpenWorkspace({ type: 'scanner' }),
     },
     {
       id: 'ocr',
-      name: 'OCR (English + বাংলা)',
-      desc: 'Extract editable text & create searchable PDFs',
-      category: 'ai',
-      icon: <ScanText className="w-5 h-5 text-[#2563EB]" />,
+      name: 'OCR – Image & PDF to text',
+      desc: 'Read text from scans (English & বাংলা)',
+      group: 'smart',
+      icon: <ScanText className="w-5 h-5 text-amber-500" />,
+      iconBg: 'bg-amber-500/15',
       onClick: () => onOpenWorkspace({ type: 'ocr' }),
     },
     {
       id: 'aiAssistant',
-      name: 'AI PDF Assistant',
-      desc: 'Summarize, translate, extract tables & Q&A',
-      category: 'ai',
-      icon: <Sparkles className="w-5 h-5 text-[#2563EB]" />,
+      name: language === 'bn' ? 'এআই পিডিএফ অ্যাসিস্ট্যান্ট' : 'AI PDF Assistant',
+      desc: language === 'bn' ? 'সারসংক্ষেপ ও প্রশ্নোত্তর' : 'Summarize and ask questions',
+      group: 'smart',
+      icon: <Bot className="w-5 h-5 text-[#3B82F6]" />,
+      iconBg: 'bg-[#2563EB]/15',
       onClick: () => onOpenWorkspace({ type: 'aiAssistant', docId: firstDoc?.id }),
     },
   ];
 
-  const filtered = useMemo(() => {
-    return tools.filter((item) => {
-      if (cat !== 'all' && item.category !== cat) return false;
-      if (query.trim()) {
-        const q = query.toLowerCase();
-        return (
-          item.name.toLowerCase().includes(q) ||
-          item.desc.toLowerCase().includes(q)
-        );
-      }
-      return true;
-    });
-  }, [cat, query, firstDoc?.id]);
-
-  const tabs: Array<{ id: ToolCat; label: string }> = [
-    { id: 'all', label: t.tools.categories.all },
-    { id: 'edit', label: t.tools.categories.edit },
-    { id: 'convert', label: t.tools.categories.convert },
-    { id: 'security', label: t.tools.categories.security },
-    { id: 'ai', label: t.tools.categories.ai },
+  const groups: Array<{ id: ToolGroupId; label: string }> = [
+    { id: 'organize', label: language === 'bn' ? 'সাজান' : 'ORGANIZE' },
+    { id: 'convert', label: language === 'bn' ? 'কনভার্ট' : 'CONVERT' },
+    { id: 'edit', label: language === 'bn' ? 'এডিট ও টীকা' : 'EDIT & ANNOTATE' },
+    { id: 'security', label: language === 'bn' ? 'সুরক্ষা' : 'SECURITY' },
+    { id: 'smart', label: language === 'bn' ? 'স্মার্ট টুলস' : 'SMART TOOLS' },
   ];
 
+  const filteredTools = useMemo(() => {
+    if (!query.trim()) return tools;
+    const q = query.toLowerCase();
+    return tools.filter(
+      (item) =>
+        item.name.toLowerCase().includes(q) || item.desc.toLowerCase().includes(q)
+    );
+  }, [query, firstDoc?.id, language]);
+
   return (
-    <div className="space-y-4 pb-8">
-      <div className="flex items-center gap-2 min-h-[46px] px-3.5 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+    <div className="space-y-6 pb-8">
+      {/* Page Title */}
+      <h1 className="font-display text-2xl font-extrabold tracking-tight text-slate-900 dark:text-white">
+        {language === 'bn' ? 'পিডিএফ টুলস' : 'PDF Tools'}
+      </h1>
+
+      {/* Search Pill */}
+      <div className="flex items-center gap-2.5 min-h-[46px] px-4 rounded-full bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B]">
         <Search className="w-4 h-4 text-slate-400 shrink-0" />
         <input
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder={t.tools.searchPlaceholder}
-          className="flex-1 bg-transparent text-sm focus:outline-none"
+          placeholder={language === 'bn' ? 'টুল খুঁজুন' : 'Search tools'}
+          className="flex-1 bg-transparent text-sm text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none"
         />
       </div>
 
-      <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pb-1">
-        {tabs.map((tb) => (
-          <button
-            key={tb.id}
-            onClick={() => setCat(tb.id)}
-            className={`min-h-[40px] px-3.5 rounded-xl text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
-              cat === tb.id
-                ? 'bg-[#142B4A] dark:bg-[#2563EB] text-white'
-                : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300'
-            }`}
-          >
-            {tb.label}
-          </button>
-        ))}
-      </div>
-
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
-        {filtered.map((tool) => (
-          <button
-            key={tool.id}
-            onClick={tool.onClick}
-            className="flex items-center gap-3.5 p-3.5 min-h-[74px] rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-[#2563EB]/50 text-left active:scale-[0.99] transition-all"
-          >
-            <div className="w-11 h-11 rounded-xl bg-slate-100 dark:bg-slate-800 flex items-center justify-center shrink-0">
-              {tool.icon}
+      {/* Categorized Sections matching Screenshot */}
+      {groups.map((grp) => {
+        const items = filteredTools.filter((item) => item.group === grp.id);
+        if (items.length === 0) return null;
+        return (
+          <section key={grp.id} className="space-y-3">
+            <h2 className="text-[11px] font-bold tracking-widest uppercase text-slate-500 dark:text-slate-400">
+              {grp.label}
+            </h2>
+            <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+              {items.map((tool) => (
+                <button
+                  key={tool.id}
+                  onClick={tool.onClick}
+                  className="rounded-2xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] hover:border-[#3B82F6]/50 p-4 text-left flex flex-col justify-between gap-3 min-h-[136px] active:scale-[0.98] transition-all"
+                >
+                  <div
+                    className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${tool.iconBg}`}
+                  >
+                    {tool.icon}
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-sm font-bold text-slate-900 dark:text-white leading-snug">
+                      {tool.name}
+                    </p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400 line-clamp-2 mt-1 leading-relaxed">
+                      {tool.desc}
+                    </p>
+                  </div>
+                </button>
+              ))}
             </div>
-            <div className="min-w-0">
-              <p className="text-sm font-bold text-[#142B4A] dark:text-white truncate">
-                {tool.name}
-              </p>
-              <p className="text-xs text-slate-500 line-clamp-1 mt-0.5">{tool.desc}</p>
-            </div>
-          </button>
-        ))}
-      </div>
+          </section>
+        );
+      })}
     </div>
   );
 };

@@ -3,12 +3,13 @@ import {
   Camera,
   FilePlus2,
   FileUp,
-  FolderOpen,
+  Folder,
   Home,
   Image as ImageIcon,
+  LayoutGrid,
   Plus,
+  PlusCircle,
   Settings as SettingsIcon,
-  Wrench,
   X,
 } from 'lucide-react';
 import type {
@@ -18,14 +19,17 @@ import type {
   DocumentRecord,
   FolderRecord,
   NavTab,
+  PaperSizeKey,
 } from './types';
 import { getT } from './i18n/translations';
 import {
   cloneBuffer,
+  createBlankPdf,
   getPdfDocumentInfo,
   renderPageThumbnail,
 } from './services/pdfEngine';
 import {
+  deleteAllDocuments,
   deleteDocumentForever,
   getAllDocuments,
   getAllFolders,
@@ -66,10 +70,24 @@ export default function App() {
 
   const t = getT(settings.language);
 
-  // Sync light/dark class on <html>
+  // Sync light/dark/auto class on <html>
   useEffect(() => {
-    document.documentElement.classList.toggle('dark', settings.theme === 'dark');
-    document.documentElement.lang = settings.language;
+    const applyTheme = () => {
+      const prefersDark =
+        typeof window !== 'undefined' &&
+        window.matchMedia?.('(prefers-color-scheme: dark)').matches;
+      const isDark =
+        settings.theme === 'dark' || (settings.theme === 'auto' && prefersDark);
+      document.documentElement.classList.toggle('dark', isDark);
+      document.documentElement.lang = settings.language;
+    };
+
+    applyTheme();
+    if (settings.theme === 'auto' && window.matchMedia) {
+      const mq = window.matchMedia('(prefers-color-scheme: dark)');
+      mq.addEventListener('change', applyTheme);
+      return () => mq.removeEventListener('change', applyTheme);
+    }
   }, [settings.theme, settings.language]);
 
   // Load Vault documents & folders
@@ -151,6 +169,50 @@ export default function App() {
     e.target.value = '';
   };
 
+  const handleCreateBlankPdf = async (options: {
+    paperSize: PaperSizeKey;
+    orientation: 'portrait' | 'landscape';
+    pageCount: number;
+    fileName: string;
+    customWidthMm?: number;
+    customHeightMm?: number;
+  }) => {
+    const pdfBytes = await createBlankPdf(options);
+    const thumb = await renderPageThumbnail(pdfBytes, 1, 200).catch(() => undefined);
+    const now = Date.now();
+    const baseName = options.fileName.trim() || `Untitled ${options.paperSize}`;
+    const normalizedName = baseName.toLowerCase().endsWith('.pdf')
+      ? baseName
+      : `${baseName}.pdf`;
+    const record: DocumentRecord = {
+      id: `doc_blank_${now}_${Math.random().toString(36).slice(2, 6)}`,
+      name: normalizedName,
+      origin: 'created',
+      createdAt: now,
+      updatedAt: now,
+      lastOpenedAt: now,
+      sizeBytes: pdfBytes.byteLength,
+      pageCount: Math.max(1, Math.min(200, options.pageCount)),
+      isStarred: false,
+      isShared: false,
+      isTrashed: false,
+      folderId: null,
+      thumbnailDataUrl: thumb,
+      pdfBytes: cloneBuffer(pdfBytes),
+      versions: [
+        {
+          id: `ver_${now}`,
+          timestamp: now,
+          note: `Blank ${options.paperSize} (${options.orientation})`,
+          sizeBytes: pdfBytes.byteLength,
+          pdfBytes: cloneBuffer(pdfBytes),
+        },
+      ],
+    };
+    await upsertDoc(record);
+    setWorkspace({ type: 'viewer', docId: record.id });
+  };
+
   const handleDuplicateDoc = async (doc: DocumentRecord) => {
     const now = Date.now();
     const copy: DocumentRecord = {
@@ -187,6 +249,11 @@ export default function App() {
     setDocs((prev) => prev.filter((d) => !d.isTrashed));
   };
 
+  const handleDeleteAllFiles = async () => {
+    await deleteAllDocuments();
+    setDocs([]);
+  };
+
   const handleCreateFolder = async (name: string) => {
     const folder: FolderRecord = {
       id: `fld_${Date.now()}`,
@@ -214,9 +281,9 @@ export default function App() {
 
   const navItems: Array<{ id: NavTab; label: string; icon: React.ReactNode }> = [
     { id: 'home', label: t.nav.home, icon: <Home className="w-5 h-5" /> },
-    { id: 'files', label: t.nav.files, icon: <FolderOpen className="w-5 h-5" /> },
-    { id: 'tools', label: t.nav.tools, icon: <Wrench className="w-5 h-5" /> },
-    { id: 'create', label: t.nav.create, icon: <FilePlus2 className="w-5 h-5" /> },
+    { id: 'files', label: t.nav.files, icon: <Folder className="w-5 h-5" /> },
+    { id: 'tools', label: t.nav.tools, icon: <LayoutGrid className="w-5 h-5" /> },
+    { id: 'create', label: t.nav.create, icon: <PlusCircle className="w-5 h-5" /> },
     { id: 'settings', label: t.nav.settings, icon: <SettingsIcon className="w-5 h-5" /> },
   ];
 
@@ -226,23 +293,22 @@ export default function App() {
       : undefined;
 
   return (
-    <div className="min-h-screen flex flex-col bg-[#F8FAFC] dark:bg-[#0B1120] text-[#1E293B] dark:text-[#F1F5F9]">
+    <div className="min-h-screen flex flex-col bg-[#F4F7FB] dark:bg-[#0A0F1A] text-slate-900 dark:text-slate-100">
       <OfflineIndicator />
 
-      {/* Sticky Compact Top App Bar (3-zone contract, <=56px) */}
-      <header className="sticky top-0 z-30 h-14 px-4 bg-white/90 dark:bg-slate-900/90 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-4 pt-safe">
-        <PdfMasterLogo size={32} />
+      {/* Desktop / Tablet Top App Bar (Hidden on mobile so screenshots match edge-to-edge mobile layout) */}
+      <header className="hidden md:flex sticky top-0 z-30 h-14 px-5 bg-white/90 dark:bg-[#0D1322]/90 backdrop-blur-md border-b border-slate-200 dark:border-[#1E293B] items-center justify-between gap-4 pt-safe">
+        <PdfMasterLogo size={34} />
 
-        {/* Desktop / Tablet single-line navigation links */}
-        <nav className="hidden md:flex items-center gap-6 text-sm font-semibold">
+        <nav className="flex items-center gap-6 text-sm font-semibold">
           {navItems.map((item) => (
             <button
               key={item.id}
               onClick={() => setActiveTab(item.id)}
               className={`min-h-[40px] px-1 whitespace-nowrap shrink-0 transition-colors border-b-2 ${
                 activeTab === item.id
-                  ? 'border-[#2563EB] text-[#2563EB]'
-                  : 'border-transparent text-slate-600 dark:text-slate-300 hover:text-[#142B4A] dark:hover:text-white'
+                  ? 'border-[#3B82F6] text-[#2563EB] dark:text-[#60A5FA]'
+                  : 'border-transparent text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white'
               }`}
             >
               {item.label}
@@ -251,12 +317,10 @@ export default function App() {
         </nav>
 
         <div className="flex items-center gap-2 shrink-0">
-          <div className="hidden sm:block">
-            <PWAInstallButton compact label="Install" />
-          </div>
+          <PWAInstallButton compact label="Install" />
           <button
             onClick={() => importInputRef.current?.click()}
-            className="min-h-[40px] px-3.5 rounded-xl bg-[#2563EB] text-white text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 active:scale-[0.98] transition-transform"
+            className="min-h-[40px] px-4 rounded-xl bg-gradient-to-r from-[#3B82F6] to-[#06B6D4] text-white text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 shadow-md shadow-blue-500/20 active:scale-[0.98] transition-transform"
           >
             <FileUp className="w-4 h-4" />
             <span>{t.home.importPdf}</span>
@@ -265,9 +329,13 @@ export default function App() {
       </header>
 
       {/* Main Scrollable Viewport */}
-      <main className="flex-1 w-full max-w-6xl mx-auto px-4 pt-4 pb-24 md:pb-10">
+      <main
+        className={`flex-1 w-full max-w-6xl mx-auto px-4 pb-24 md:pb-10 ${
+          activeTab === 'home' ? 'pt-0 md:pt-5' : 'pt-4 md:pt-5'
+        }`}
+      >
         {loadingVault ? (
-          <div className="py-20 text-center text-sm text-slate-500">
+          <div className="py-24 text-center text-sm text-slate-500 dark:text-slate-400">
             Loading Document Vault...
           </div>
         ) : (
@@ -295,6 +363,7 @@ export default function App() {
                 docs={docs}
                 folders={folders}
                 initialCategory={filesInitialCat}
+                onImportPdf={() => importInputRef.current?.click()}
                 onOpenDoc={openDocumentInViewer}
                 onEditDoc={(doc) => setWorkspace({ type: 'editor', docId: doc.id })}
                 onUpdateDoc={upsertDoc}
@@ -316,6 +385,8 @@ export default function App() {
               <CreateTab
                 language={settings.language}
                 docs={docs}
+                defaultPageSize={settings.defaultPageSize}
+                onCreateBlankPdf={handleCreateBlankPdf}
                 onOpenWorkspace={(ws) => {
                   setCreatorTemplateHtml(undefined);
                   setWorkspace(ws);
@@ -333,6 +404,7 @@ export default function App() {
                 docs={docs}
                 onUpdateSettings={updateSettings}
                 onEmptyTrash={handleEmptyTrash}
+                onDeleteAllFiles={handleDeleteAllFiles}
                 onRestoreBackupDocs={handleRestoreBackupDocs}
               />
             )}
@@ -340,34 +412,41 @@ export default function App() {
         )}
       </main>
 
-      {/* Floating Action Button (Quick Create / Import) */}
-      {workspace.type === 'none' && (
-        <button
-          onClick={() => setShowFabSheet(true)}
-          aria-label="Quick create or import"
-          className="fixed bottom-20 md:bottom-6 right-4 z-30 w-14 h-14 rounded-2xl bg-[#2563EB] text-white shadow-xl shadow-[#2563EB]/30 flex items-center justify-center active:scale-95 transition-transform"
-        >
-          <Plus className="w-6 h-6" />
-        </button>
-      )}
+      {/* Circular Gradient Floating Action Button */}
+      {workspace.type === 'none' &&
+        (activeTab === 'home' || activeTab === 'files' || activeTab === 'tools') && (
+          <button
+            onClick={() => setShowFabSheet(true)}
+            aria-label="Quick create or import"
+            className="fixed bottom-20 md:bottom-6 right-4 z-30 w-14 h-14 rounded-full bg-gradient-to-br from-[#3B82F6] to-[#06B6D4] text-white shadow-xl shadow-cyan-500/30 flex items-center justify-center active:scale-95 transition-transform"
+          >
+            <Plus className="w-7 h-7 stroke-[2.5]" />
+          </button>
+        )}
 
-      {/* Mobile Bottom Navigation Bar (5 destinations, <=64px height) */}
-      <nav className="md:hidden fixed bottom-0 left-0 right-0 z-30 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 pb-safe">
-        <div className="grid grid-cols-5 items-center h-16">
+      {/* Mobile Bottom Navigation Bar (Matches Screenshot Pill Indicator) */}
+      <nav className="md:hidden fixed bottom-0 left-0 right-0 z-30 bg-white/95 dark:bg-[#0D1322]/95 backdrop-blur-md border-t border-slate-200 dark:border-[#1E293B] pb-safe">
+        <div className="grid grid-cols-5 items-center h-[64px]">
           {navItems.map((item) => {
             const active = activeTab === item.id;
             return (
               <button
                 key={item.id}
                 onClick={() => setActiveTab(item.id)}
-                className={`min-h-[44px] flex flex-col items-center justify-center transition-colors ${
+                className={`min-h-[44px] flex flex-col items-center justify-center gap-0.5 transition-colors ${
                   active
-                    ? 'text-[#2563EB]'
+                    ? 'text-[#2563EB] dark:text-[#3B82F6]'
                     : 'text-slate-500 dark:text-slate-400'
                 }`}
               >
-                {item.icon}
-                <span className="text-[10px] font-semibold tracking-tight mt-1 whitespace-nowrap">
+                <span
+                  className={`px-4 py-1 rounded-full transition-colors ${
+                    active ? 'bg-[#2563EB]/12 dark:bg-[#2563EB]/20' : ''
+                  }`}
+                >
+                  {item.icon}
+                </span>
+                <span className="text-[10.5px] font-semibold tracking-tight whitespace-nowrap">
                   {item.label}
                 </span>
               </button>
@@ -389,40 +468,41 @@ export default function App() {
       {/* FAB Quick Action Bottom Sheet */}
       {showFabSheet && (
         <div
-          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-sm"
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-sm"
           onClick={() => setShowFabSheet(false)}
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-2"
+            className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-[#121929] border-t sm:border border-slate-200 dark:border-[#1E293B] p-5 shadow-2xl space-y-2"
           >
+            <div className="w-10 h-1.5 bg-slate-300 dark:bg-slate-700 rounded-full mx-auto mb-1 sm:hidden" />
             <div className="flex items-center justify-between mb-1">
-              <h3 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
-                Quick Create or Import
+              <h3 className="font-display text-base font-bold text-slate-900 dark:text-white">
+                {settings.language === 'bn' ? 'দ্রুত শুরু করুন' : 'Quick Create or Import'}
               </h3>
               <button
                 onClick={() => setShowFabSheet(false)}
-                className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-full"
+                className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-full text-slate-500 dark:text-slate-300"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
             <button
               onClick={() => importInputRef.current?.click()}
-              className="w-full min-h-[52px] px-4 rounded-2xl bg-slate-50 dark:bg-slate-800 flex items-center gap-3 text-sm font-semibold"
+              className="w-full min-h-[52px] px-4 rounded-2xl bg-slate-100 dark:bg-[#1A243B] flex items-center gap-3 text-sm font-semibold text-slate-900 dark:text-white"
             >
-              <FileUp className="w-5 h-5 text-[#2563EB]" />
-              <span>Import PDF from Device</span>
+              <FileUp className="w-5 h-5 text-[#3B82F6]" />
+              <span>{settings.language === 'bn' ? 'ডিভাইস থেকে পিডিএফ আনুন' : 'Import PDF from Device'}</span>
             </button>
             <button
               onClick={() => {
                 setShowFabSheet(false);
                 setWorkspace({ type: 'scanner' });
               }}
-              className="w-full min-h-[52px] px-4 rounded-2xl bg-slate-50 dark:bg-slate-800 flex items-center gap-3 text-sm font-semibold"
+              className="w-full min-h-[52px] px-4 rounded-2xl bg-slate-100 dark:bg-[#1A243B] flex items-center gap-3 text-sm font-semibold text-slate-900 dark:text-white"
             >
               <Camera className="w-5 h-5 text-[#06B6D4]" />
-              <span>Scan Document with Camera</span>
+              <span>{settings.language === 'bn' ? 'ক্যামেরা দিয়ে স্ক্যান করুন' : 'Scan Document with Camera'}</span>
             </button>
             <button
               onClick={() => {
@@ -430,20 +510,20 @@ export default function App() {
                 setCreatorTemplateHtml(undefined);
                 setWorkspace({ type: 'wordCreator' });
               }}
-              className="w-full min-h-[52px] px-4 rounded-2xl bg-slate-50 dark:bg-slate-800 flex items-center gap-3 text-sm font-semibold"
+              className="w-full min-h-[52px] px-4 rounded-2xl bg-slate-100 dark:bg-[#1A243B] flex items-center gap-3 text-sm font-semibold text-slate-900 dark:text-white"
             >
-              <FilePlus2 className="w-5 h-5 text-emerald-600" />
-              <span>Create New Word-Like Document</span>
+              <FilePlus2 className="w-5 h-5 text-emerald-500" />
+              <span>{settings.language === 'bn' ? 'নতুন ওয়ার্ড ডকুমেন্ট তৈরি' : 'Create Word-Style Document'}</span>
             </button>
             <button
               onClick={() => {
                 setShowFabSheet(false);
                 setWorkspace({ type: 'toolRunner', toolId: 'imagesToPdf' });
               }}
-              className="w-full min-h-[52px] px-4 rounded-2xl bg-slate-50 dark:bg-slate-800 flex items-center gap-3 text-sm font-semibold"
+              className="w-full min-h-[52px] px-4 rounded-2xl bg-slate-100 dark:bg-[#1A243B] flex items-center gap-3 text-sm font-semibold text-slate-900 dark:text-white"
             >
-              <ImageIcon className="w-5 h-5 text-indigo-600" />
-              <span>Convert Images to PDF</span>
+              <ImageIcon className="w-5 h-5 text-indigo-400" />
+              <span>{settings.language === 'bn' ? 'ছবি থেকে পিডিএফ তৈরি' : 'Convert Images to PDF'}</span>
             </button>
           </div>
         </div>

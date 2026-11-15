@@ -20,7 +20,7 @@ const SEEDED_FLAG = 'pdf_master_seeded_v1';
 
 export const DEFAULT_SETTINGS: AppSettings = {
   language: 'en',
-  theme: 'light',
+  theme: 'dark',
   defaultViewMode: 'continuous',
   defaultPageSize: 'A4',
   defaultFont: 'DM Sans',
@@ -109,6 +109,16 @@ export async function deleteDocumentForever(id: string): Promise<void> {
   await deleteFromStore(STORE_DOCS, id);
 }
 
+export async function deleteAllDocuments(): Promise<void> {
+  const db = await openVaultDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE_DOCS, 'readwrite');
+    tx.objectStore(STORE_DOCS).clear();
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+  });
+}
+
 export async function getAllFolders(): Promise<FolderRecord[]> {
   const folders = await getAllFromStore<FolderRecord>(STORE_FOLDERS);
   return folders.sort((a, b) => a.createdAt - b.createdAt);
@@ -189,6 +199,26 @@ export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+export function formatRelativeTime(timestamp: number, lang: 'en' | 'bn' = 'en'): string {
+  const diffSec = Math.max(0, Math.floor((Date.now() - timestamp) / 1000));
+  if (diffSec < 60) return lang === 'bn' ? 'এইমাত্র' : 'Just now';
+  const mins = Math.floor(diffSec / 60);
+  if (mins < 60) return lang === 'bn' ? `${mins} মি. আগে` : `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) {
+    return lang === 'bn'
+      ? `${hrs} ঘণ্টা আগে`
+      : `${hrs} ${hrs === 1 ? 'hour' : 'hours'} ago`;
+  }
+  const days = Math.floor(hrs / 24);
+  if (days < 30) {
+    return lang === 'bn'
+      ? `${days} দিন আগে`
+      : `${days} ${days === 1 ? 'day' : 'days'} ago`;
+  }
+  return new Date(timestamp).toLocaleDateString();
 }
 
 export function downloadArrayBuffer(buf: ArrayBuffer, filename: string, mime = 'application/pdf') {

@@ -1,5 +1,5 @@
 export type AppLanguage = 'en' | 'bn';
-export type ThemeMode = 'light' | 'dark';
+export type ThemeMode = 'light' | 'dark' | 'auto';
 export type NavTab = 'home' | 'files' | 'tools' | 'create' | 'settings';
 
 export type DocumentCategory =

@@ -1,17 +1,20 @@
 import React, { useMemo, useState } from 'react';
 import {
+  Bot,
   Camera,
   ChevronRight,
   Combine,
   Edit3,
   FilePlus2,
   FileText,
-  FolderOpen,
+  Folder,
+  Image as ImageIcon,
+  LayoutGrid,
   Minimize2,
   RefreshCw,
-  ScanText,
+  RotateCw,
+  Scissors,
   Search,
-  Sparkles,
   Star,
 } from 'lucide-react';
 import type {
@@ -21,7 +24,8 @@ import type {
   DocumentRecord,
 } from '../types';
 import { getT } from '../i18n/translations';
-import { formatBytes } from '../services/storageService';
+import { formatRelativeTime } from '../services/storageService';
+import { PdfMasterLogo } from './Logo';
 
 interface HomeTabProps {
   language: AppLanguage;
@@ -49,9 +53,9 @@ export const HomeTab: React.FC<HomeTabProps> = ({
   );
 
   const filteredDocs = useMemo(() => {
-    if (!search.trim()) return activeDocs.slice(0, 6);
+    if (!search.trim()) return activeDocs.slice(0, 10);
     const q = search.toLowerCase();
-    return activeDocs.filter((d) => d.name.toLowerCase().includes(q)).slice(0, 8);
+    return activeDocs.filter((d) => d.name.toLowerCase().includes(q)).slice(0, 12);
   }, [activeDocs, search]);
 
   const firstEditableDoc = activeDocs.find((d) => !d.isVaultLocked);
@@ -59,9 +63,9 @@ export const HomeTab: React.FC<HomeTabProps> = ({
   const quickActions = [
     {
       id: 'edit',
-      label: t.home.actions.editPdf,
+      label: language === 'bn' ? 'এডিট পিডিএফ' : 'Edit PDF',
       icon: <Edit3 className="w-5 h-5" />,
-      tint: 'bg-[#2563EB]/10 text-[#2563EB] dark:bg-[#2563EB]/20 dark:text-[#60A5FA]',
+      tint: 'bg-[#172542] text-[#3B82F6] dark:bg-[#172542] dark:text-[#60A5FA]',
       onClick: () => {
         if (firstEditableDoc) {
           onOpenWorkspace({ type: 'editor', docId: firstEditableDoc.id });
@@ -72,53 +76,53 @@ export const HomeTab: React.FC<HomeTabProps> = ({
     },
     {
       id: 'scan',
-      label: t.home.actions.scanDoc,
+      label: language === 'bn' ? 'স্ক্যান' : 'Scan',
       icon: <Camera className="w-5 h-5" />,
-      tint: 'bg-[#06B6D4]/12 text-[#0891B2] dark:bg-[#06B6D4]/20 dark:text-[#22D3EE]',
+      tint: 'bg-[#0F2A3A] text-[#06B6D4] dark:bg-[#0F2A3A] dark:text-[#22D3EE]',
       onClick: () => onOpenWorkspace({ type: 'scanner' }),
     },
     {
       id: 'create',
-      label: t.home.actions.createDoc,
+      label: language === 'bn' ? 'নতুন ডকুমেন্ট' : 'New document',
       icon: <FilePlus2 className="w-5 h-5" />,
-      tint: 'bg-[#142B4A]/10 text-[#142B4A] dark:bg-slate-800 dark:text-slate-100',
+      tint: 'bg-[#112A27] text-emerald-500 dark:bg-[#112A27] dark:text-emerald-400',
       onClick: () => onOpenWorkspace({ type: 'wordCreator' }),
     },
     {
       id: 'merge',
-      label: t.home.actions.mergePdf,
+      label: language === 'bn' ? 'মার্জ পিডিএফ' : 'Merge PDF',
       icon: <Combine className="w-5 h-5" />,
-      tint: 'bg-indigo-500/10 text-indigo-600 dark:text-indigo-300',
+      tint: 'bg-[#2C1826] text-rose-500 dark:bg-[#2C1826] dark:text-rose-400',
       onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'merge' }),
     },
     {
       id: 'convert',
-      label: t.home.actions.convertPdf,
+      label: language === 'bn' ? 'কনভার্ট' : 'Convert',
       icon: <RefreshCw className="w-5 h-5" />,
-      tint: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-300',
+      tint: 'bg-[#2B2214] text-amber-500 dark:bg-[#2B2214] dark:text-amber-400',
       onClick: () => onNavigateTools(),
     },
     {
       id: 'compress',
-      label: t.home.actions.compressPdf,
+      label: language === 'bn' ? 'কমপ্রেস' : 'Compress',
       icon: <Minimize2 className="w-5 h-5" />,
-      tint: 'bg-amber-500/10 text-amber-600 dark:text-amber-300',
+      tint: 'bg-[#172542] text-indigo-400 dark:bg-[#172542] dark:text-indigo-300',
       onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'compress' }),
     },
     {
-      id: 'ocr',
-      label: t.home.actions.ocrText,
-      icon: <ScanText className="w-5 h-5" />,
-      tint: 'bg-sky-500/10 text-sky-600 dark:text-sky-300',
-      onClick: () => onOpenWorkspace({ type: 'ocr' }),
-    },
-    {
       id: 'ai',
-      label: t.home.actions.aiAssistant,
-      icon: <Sparkles className="w-5 h-5" />,
-      tint: 'bg-[#2563EB] text-white',
+      label: language === 'bn' ? 'এআই অ্যাসিস্ট্যান্ট' : 'AI Assistant',
+      icon: <Bot className="w-5 h-5" />,
+      tint: 'bg-[#172542] text-[#3B82F6] dark:bg-[#172542] dark:text-[#60A5FA]',
       onClick: () =>
         onOpenWorkspace({ type: 'aiAssistant', docId: firstEditableDoc?.id }),
+    },
+    {
+      id: 'tools',
+      label: language === 'bn' ? 'টুলস' : 'Tools',
+      icon: <LayoutGrid className="w-5 h-5" />,
+      tint: 'bg-[#0F2A3A] text-[#06B6D4] dark:bg-[#0F2A3A] dark:text-[#22D3EE]',
+      onClick: () => onNavigateTools(),
     },
   ];
 
@@ -127,79 +131,127 @@ export const HomeTab: React.FC<HomeTabProps> = ({
     label: string;
     count: number;
     icon: React.ReactNode;
+    iconBg: string;
   }> = [
     {
       id: 'my',
-      label: t.home.myDocs,
+      label: language === 'bn' ? 'আমার ডকুমেন্ট' : 'My documents',
       count: activeDocs.length,
-      icon: <FolderOpen className="w-4 h-4 text-[#2563EB]" />,
+      icon: <Folder className="w-5 h-5 text-[#3B82F6]" />,
+      iconBg: 'bg-[#2563EB]/15',
     },
     {
       id: 'scanned',
-      label: t.home.scannedDocs,
+      label: language === 'bn' ? 'স্ক্যান করা' : 'Scanned',
       count: activeDocs.filter((d) => d.origin === 'scanned').length,
-      icon: <Camera className="w-4 h-4 text-[#06B6D4]" />,
+      icon: <Camera className="w-5 h-5 text-[#06B6D4]" />,
+      iconBg: 'bg-[#06B6D4]/15',
     },
     {
       id: 'created',
-      label: t.home.createdDocs,
+      label: language === 'bn' ? 'তৈরি করা' : 'Created',
       count: activeDocs.filter((d) => d.origin === 'created').length,
-      icon: <FilePlus2 className="w-4 h-4 text-emerald-600" />,
+      icon: <FilePlus2 className="w-5 h-5 text-emerald-500" />,
+      iconBg: 'bg-emerald-500/15',
     },
     {
       id: 'starred',
-      label: t.home.starredDocs,
+      label: language === 'bn' ? 'তারকাচিহ্নিত' : 'Starred',
       count: activeDocs.filter((d) => d.isStarred).length,
-      icon: <Star className="w-4 h-4 text-amber-500" />,
+      icon: <Star className="w-5 h-5 text-amber-500" />,
+      iconBg: 'bg-amber-500/15',
+    },
+  ];
+
+  const featuredTools = [
+    {
+      id: 'merge',
+      name: language === 'bn' ? 'মার্জ পিডিএফ' : 'Merge PDF',
+      desc: language === 'bn' ? 'একাধিক পিডিএফ একত্রিত করুন' : 'Combine several PDFs into one',
+      icon: <Combine className="w-5 h-5 text-[#3B82F6]" />,
+      iconBg: 'bg-[#2563EB]/15',
+    },
+    {
+      id: 'split',
+      name: language === 'bn' ? 'স্প্লিট ও এক্সট্র্যাক্ট' : 'Split & Extract',
+      desc: language === 'bn' ? 'প্রয়োজনীয় পৃষ্ঠা আলাদা করুন' : 'Pick pages to keep or split every page',
+      icon: <Scissors className="w-5 h-5 text-rose-500" />,
+      iconBg: 'bg-rose-500/15',
+    },
+    {
+      id: 'rotate',
+      name: language === 'bn' ? 'রোটেট পিডিএফ' : 'Rotate PDF',
+      desc: language === 'bn' ? 'সব পৃষ্ঠা বামে বা ডানে ঘোরান' : 'Turn all pages left or right',
+      icon: <RotateCw className="w-5 h-5 text-[#06B6D4]" />,
+      iconBg: 'bg-[#06B6D4]/15',
+    },
+    {
+      id: 'imagesToPdf',
+      name: language === 'bn' ? 'ছবি থেকে পিডিএফ' : 'Images to PDF',
+      desc: language === 'bn' ? 'JPG ও PNG ছবি পিডিএফ করুন' : 'Turn JPG and PNG photos into a PDF',
+      icon: <ImageIcon className="w-5 h-5 text-emerald-500" />,
+      iconBg: 'bg-emerald-500/15',
+    },
+    {
+      id: 'extractText',
+      name: language === 'bn' ? 'পিডিএফ থেকে টেক্সট' : 'PDF to Text',
+      desc: language === 'bn' ? 'পিডিএফ থেকে সব টেক্সট বের করুন' : 'Pull out all the text in a PDF',
+      icon: <FileText className="w-5 h-5 text-[#3B82F6]" />,
+      iconBg: 'bg-[#2563EB]/15',
     },
   ];
 
   return (
     <div className="space-y-6 pb-8">
-      {/* Search Bar */}
-      <div className="flex items-center gap-2 min-h-[48px] px-4 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-xs">
-        <Search className="w-4 h-4 text-slate-400 shrink-0" />
-        <input
-          type="text"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder={t.home.searchPlaceholder}
-          className="flex-1 bg-transparent text-sm text-slate-900 dark:text-white focus:outline-none"
+      {/* Top Hero Header (Blue-to-Navy Gradient Banner matching Screenshot) */}
+      <section className="-mx-4 md:mx-0 px-5 pt-5 pb-6 md:rounded-3xl bg-gradient-to-b from-[#1E40AF] via-[#15285A] to-[#0A0F1A] dark:from-[#1B3A7A] dark:via-[#111E3F] dark:to-[#0A0F1A] text-white space-y-5 shadow-lg shadow-blue-950/20">
+        <PdfMasterLogo
+          size={44}
+          showWordmark
+          showTagline
+          inverse
+          tagline={t.tagline}
         />
-        <button
-          onClick={onImportPdf}
-          className="min-h-[36px] px-3 rounded-xl bg-[#142B4A] dark:bg-[#2563EB] text-white text-xs font-semibold whitespace-nowrap shrink-0"
-        >
-          {t.home.importPdf}
-        </button>
-      </div>
 
-      {/* Quick Actions Grid */}
-      <section className="space-y-3">
-        <div className="flex items-center justify-between">
-          <h2 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
-            {t.home.quickActions}
-          </h2>
-          <button
-            onClick={onNavigateTools}
-            className="min-h-[36px] px-2 text-xs font-semibold text-[#2563EB] flex items-center gap-0.5"
-          >
-            <span>{t.home.allTools}</span>
-            <ChevronRight className="w-3.5 h-3.5" />
-          </button>
+        <h1 className="font-display text-2xl sm:text-3xl font-extrabold tracking-tight leading-snug max-w-md">
+          {language === 'bn'
+            ? 'আপনার সব ডকুমেন্ট, এক জায়গায়'
+            : 'Your documents, all in one place'}
+        </h1>
+
+        <div className="flex items-center gap-2.5 min-h-[48px] px-4 rounded-full bg-[#0A0F1A]/75 border border-white/15 backdrop-blur-md">
+          <Search className="w-4 h-4 text-slate-400 shrink-0" />
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder={
+              language === 'bn' ? 'আপনার ডকুমেন্ট খুঁজুন' : 'Search your documents'
+            }
+            className="flex-1 bg-transparent text-sm text-white placeholder:text-slate-400 focus:outline-none"
+          />
         </div>
+      </section>
 
-        <div className="grid grid-cols-4 sm:grid-cols-4 lg:grid-cols-8 gap-2.5">
+      {/* Quick Actions 4x2 Circular Grid */}
+      <section className="space-y-3">
+        <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">
+          {language === 'bn' ? 'দ্রুত কাজ' : 'Quick actions'}
+        </h2>
+
+        <div className="grid grid-cols-4 lg:grid-cols-8 gap-y-4 gap-x-2">
           {quickActions.map((act) => (
             <button
               key={act.id}
               onClick={act.onClick}
-              className="flex flex-col items-center justify-center gap-2 p-2.5 min-h-[86px] rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-[#2563EB]/50 active:scale-[0.97] transition-all"
+              className="flex flex-col items-center gap-2 min-h-[76px] active:scale-95 transition-transform group"
             >
-              <div className={`w-10 h-10 rounded-xl flex items-center justify-center ${act.tint}`}>
+              <div
+                className={`w-14 h-14 rounded-full flex items-center justify-center shadow-sm border border-slate-200/70 dark:border-white/5 ${act.tint}`}
+              >
                 {act.icon}
               </div>
-              <span className="text-[11px] font-semibold text-slate-700 dark:text-slate-200 text-center leading-tight line-clamp-2">
+              <span className="text-[11.5px] font-semibold text-slate-700 dark:text-slate-200 text-center leading-tight line-clamp-2">
                 {act.label}
               </span>
             </button>
@@ -207,93 +259,125 @@ export const HomeTab: React.FC<HomeTabProps> = ({
         </div>
       </section>
 
-      {/* Recent Documents */}
+      {/* Recent Documents Portrait Carousel / Grid */}
       <section className="space-y-3">
         <div className="flex items-center justify-between">
-          <h2 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
-            {t.home.recentDocs}
+          <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">
+            {language === 'bn' ? 'সাম্প্রতিক ডকুমেন্ট' : 'Recent documents'}
           </h2>
           <button
             onClick={() => onNavigateFiles('recent')}
-            className="min-h-[36px] px-2 text-xs font-semibold text-[#2563EB] flex items-center gap-0.5"
+            className="min-h-[36px] px-2 text-xs font-semibold text-[#3B82F6] hover:text-[#60A5FA]"
           >
-            <span>{t.home.viewAll}</span>
-            <ChevronRight className="w-3.5 h-3.5" />
+            {language === 'bn' ? 'সব দেখুন' : 'See all'}
           </button>
         </div>
 
         {filteredDocs.length === 0 ? (
-          <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 text-center text-sm text-slate-500">
+          <div className="rounded-2xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] p-6 text-center text-sm text-slate-500 dark:text-slate-400">
             {t.home.noDocs}
           </div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+          <div className="flex gap-3 overflow-x-auto no-scrollbar pb-1 md:grid md:grid-cols-4 lg:grid-cols-5">
             {filteredDocs.map((doc) => (
-              <div
+              <button
                 key={doc.id}
-                className="flex items-center gap-3 p-3 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-[#2563EB]/40 transition-colors"
+                onClick={() => onOpenWorkspace({ type: 'viewer', docId: doc.id })}
+                className="w-40 md:w-auto shrink-0 rounded-2xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] hover:border-[#3B82F6]/50 p-2.5 text-left transition-colors active:scale-[0.98]"
               >
-                <button
-                  onClick={() => onOpenWorkspace({ type: 'viewer', docId: doc.id })}
-                  className="flex items-center gap-3 flex-1 min-w-0 text-left min-h-[56px]"
-                >
-                  <div className="w-11 h-14 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 overflow-hidden flex items-center justify-center shrink-0">
-                    {doc.thumbnailDataUrl ? (
-                      <img
-                        src={doc.thumbnailDataUrl}
-                        alt={doc.name}
-                        className="w-full h-full object-cover"
-                      />
-                    ) : (
-                      <FileText className="w-5 h-5 text-slate-400" />
-                    )}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <p className="text-sm font-semibold text-[#142B4A] dark:text-white truncate">
-                      {doc.name}
-                    </p>
-                    <p className="text-xs text-slate-500 font-mono-nums mt-0.5 truncate">
-                      {doc.pageCount}p · {formatBytes(doc.sizeBytes)} ·{' '}
-                      {new Date(doc.updatedAt).toLocaleDateString()}
-                    </p>
-                  </div>
-                </button>
-                <button
-                  onClick={() => onOpenWorkspace({ type: 'editor', docId: doc.id })}
-                  aria-label="Edit PDF"
-                  className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-slate-500 hover:text-[#2563EB] hover:bg-slate-100 dark:hover:bg-slate-800 shrink-0"
-                >
-                  <Edit3 className="w-4 h-4" />
-                </button>
-              </div>
+                <div className="aspect-[3/4] w-full rounded-xl bg-white border border-slate-200 dark:border-slate-700/60 overflow-hidden relative flex items-center justify-center mb-2.5">
+                  {doc.thumbnailDataUrl ? (
+                    <img
+                      src={doc.thumbnailDataUrl}
+                      alt={doc.name}
+                      className="w-full h-full object-cover"
+                    />
+                  ) : (
+                    <FileText className="w-8 h-8 text-slate-300" />
+                  )}
+                  <span className="absolute bottom-2 left-2 px-1.5 py-0.5 rounded-md bg-rose-500 text-white text-[9.5px] font-extrabold tracking-wide shadow-xs">
+                    PDF
+                  </span>
+                </div>
+                <p className="text-xs font-bold text-slate-900 dark:text-white truncate">
+                  {doc.name}
+                </p>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5 truncate">
+                  {formatRelativeTime(doc.updatedAt, language)}
+                </p>
+              </button>
             ))}
           </div>
         )}
       </section>
 
-      {/* Document Collections */}
+      {/* Collections 2x2 Grid */}
       <section className="space-y-3">
-        <h2 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
-          {t.home.collections}
+        <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">
+          {language === 'bn' ? 'সংগ্রহ' : 'Collections'}
         </h2>
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
           {collections.map((col) => (
             <button
               key={col.id}
               onClick={() => onNavigateFiles(col.id)}
-              className="flex items-center justify-between p-3.5 min-h-[60px] rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 hover:border-[#2563EB]/40 text-left transition-colors"
+              className="flex items-center gap-3 p-3.5 min-h-[68px] rounded-2xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] hover:border-[#3B82F6]/40 text-left transition-colors active:scale-[0.98]"
             >
-              <div className="flex items-center gap-2.5 min-w-0">
-                <div className="w-9 h-9 rounded-xl bg-slate-100 dark:bg-slate-800 flex items-center justify-center shrink-0">
-                  {col.icon}
-                </div>
-                <span className="text-xs font-semibold text-slate-800 dark:text-slate-100 truncate">
-                  {col.label}
-                </span>
+              <div
+                className={`w-11 h-11 rounded-xl flex items-center justify-center shrink-0 ${col.iconBg}`}
+              >
+                {col.icon}
               </div>
-              <span className="text-sm font-bold font-mono-nums text-slate-500 ml-2">
-                {col.count}
-              </span>
+              <div className="min-w-0">
+                <p className="text-xs sm:text-sm font-bold text-slate-900 dark:text-white truncate">
+                  {col.label}
+                </p>
+                <p className="text-[11px] text-slate-500 dark:text-slate-400 font-mono-nums mt-0.5">
+                  {col.count} {language === 'bn' ? 'টি ফাইল' : 'files'}
+                </p>
+              </div>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      {/* All PDF Tools Vertical Stacked List */}
+      <section className="space-y-3">
+        <div className="flex items-center justify-between">
+          <h2 className="font-display text-base font-bold text-slate-900 dark:text-white">
+            {language === 'bn' ? 'সকল পিডিএফ টুলস' : 'All PDF tools'}
+          </h2>
+          <button
+            onClick={onNavigateTools}
+            className="min-h-[36px] px-2 text-xs font-semibold text-[#3B82F6] hover:text-[#60A5FA]"
+          >
+            {language === 'bn' ? 'সব দেখুন' : 'See all'}
+          </button>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+          {featuredTools.map((tool) => (
+            <button
+              key={tool.id}
+              onClick={() => onOpenWorkspace({ type: 'toolRunner', toolId: tool.id })}
+              className="w-full flex items-center justify-between gap-3 px-4 py-3.5 min-h-[68px] rounded-2xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] hover:border-[#3B82F6]/40 text-left transition-colors active:scale-[0.99]"
+            >
+              <div className="flex items-center gap-3.5 min-w-0">
+                <div
+                  className={`w-10 h-10 rounded-full flex items-center justify-center shrink-0 ${tool.iconBg}`}
+                >
+                  {tool.icon}
+                </div>
+                <div className="min-w-0">
+                  <p className="text-sm font-bold text-slate-900 dark:text-white truncate">
+                    {tool.name}
+                  </p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 truncate mt-0.5">
+                    {tool.desc}
+                  </p>
+                </div>
+              </div>
+              <ChevronRight className="w-4 h-4 text-slate-400 shrink-0" />
             </button>
           ))}
         </div>

@@ -965,6 +965,40 @@ export async function resizePdfPages(
   return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
 }
 
+export async function createBlankPdf(options: {
+  paperSize: PaperSizeKey;
+  orientation: 'portrait' | 'landscape';
+  pageCount?: number;
+  customWidthMm?: number;
+  customHeightMm?: number;
+}): Promise<ArrayBuffer> {
+  const mmToPt = 2.83464567;
+  const baseDim = PAPER_DIMENSIONS[options.paperSize];
+  let w =
+    options.paperSize === 'Custom'
+      ? Math.max(40, options.customWidthMm || 210) * mmToPt
+      : baseDim.widthPt;
+  let h =
+    options.paperSize === 'Custom'
+      ? Math.max(40, options.customHeightMm || 297) * mmToPt
+      : baseDim.heightPt;
+
+  if (options.orientation === 'landscape' && w < h) {
+    [w, h] = [h, w];
+  } else if (options.orientation === 'portrait' && w > h) {
+    [w, h] = [h, w];
+  }
+
+  const count = Math.max(1, Math.min(200, Math.floor(options.pageCount || 1)));
+  const doc = await PDFDocument.create();
+  for (let i = 0; i < count; i++) {
+    doc.addPage([w, h]);
+  }
+  doc.setProducer('PDF MASTER');
+  const out = await doc.save();
+  return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
+}
+
 export async function addWatermarkToPdf(
   buf: ArrayBuffer,
   options: { text: string; opacity: number; fontSize: number; color: string; angle: number }
