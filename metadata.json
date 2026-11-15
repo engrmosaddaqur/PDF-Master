@@ -1,0 +1,6 @@
+{
+  "name": "PDF MASTER",
+  "description": "Everything PDF. One Powerful App. Mobile-first PDF viewer, genuine PDF editor, smart document scanner, English & Bengali OCR, Word-like document creator, converter, comparison, digital signatures, and AI PDF assistant.",
+  "requestFramePermissions": ["camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
