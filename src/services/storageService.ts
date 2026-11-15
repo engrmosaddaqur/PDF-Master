@@ -9,6 +9,10 @@ import {
   createStarterSamplePdfs,
   renderPageThumbnail,
 } from './pdfEngine';
+import {
+  saveBufferToDeviceStorage,
+  syncFileToNativeDocuments,
+} from './deviceFileActions';
 
 const DB_NAME = 'pdf_master_vault_db';
 const DB_VERSION = 1;
@@ -102,7 +106,18 @@ export async function getAllDocuments(): Promise<DocumentRecord[]> {
 }
 
 export async function saveDocument(doc: DocumentRecord): Promise<void> {
-  await putInStore(STORE_DOCS, doc);
+  const safeDoc: DocumentRecord = {
+    ...doc,
+    pdfBytes: cloneBuffer(doc.pdfBytes),
+    versions: (doc.versions || []).map((v) => ({
+      ...v,
+      pdfBytes: cloneBuffer(v.pdfBytes),
+    })),
+  };
+  await putInStore(STORE_DOCS, safeDoc);
+  if (!safeDoc.isTrashed && !safeDoc.isVaultLocked) {
+    void syncFileToNativeDocuments(safeDoc.pdfBytes, safeDoc.name);
+  }
 }
 
 export async function deleteDocumentForever(id: string): Promise<void> {
@@ -221,16 +236,12 @@ export function formatRelativeTime(timestamp: number, lang: 'en' | 'bn' = 'en'):
   return new Date(timestamp).toLocaleDateString();
 }
 
-export function downloadArrayBuffer(buf: ArrayBuffer, filename: string, mime = 'application/pdf') {
-  const blob = new Blob([buf], { type: mime });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  setTimeout(() => URL.revokeObjectURL(url), 4000);
+export function downloadArrayBuffer(
+  buf: ArrayBuffer,
+  filename: string,
+  mime = 'application/pdf'
+) {
+  void saveBufferToDeviceStorage(buf, filename, mime);
 }
 
 export function arrayBufferToBase64(buf: ArrayBuffer): string {

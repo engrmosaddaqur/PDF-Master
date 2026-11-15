@@ -10,7 +10,6 @@ import {
   Layers,
   Maximize2,
   Minimize2,
-  Printer,
   RotateCw,
   Search,
   Share2,
@@ -28,7 +27,11 @@ import {
   renderPageToCanvas,
   rotateAllPages,
 } from '../services/pdfEngine';
-import { downloadArrayBuffer } from '../services/storageService';
+import {
+  saveBufferToDeviceStorage,
+  shareBufferNativeOrWeb,
+} from '../services/deviceFileActions';
+import { usePdfPinchZoom } from '../hooks/usePdfPinchZoom';
 
 interface PdfViewerViewProps {
   doc: DocumentRecord;
@@ -111,13 +114,20 @@ const LazyPageCanvas: React.FC<{
       };
     }, [eager, pageNumber, scrollRoot, onBecameCurrent]);
 
+    const [renderScale, setRenderScale] = useState(scale);
+
+    useEffect(() => {
+      const id = setTimeout(() => setRenderScale(scale), 110);
+      return () => clearTimeout(id);
+    }, [scale]);
+
     useEffect(() => {
       if (!shouldRender) return;
       let active = true;
       const canvas = canvasRef.current;
       if (!canvas) return;
       setRendering(true);
-      renderPageToCanvas(pdfBytes, pageNumber, canvas, scale, rotation)
+      renderPageToCanvas(pdfBytes, pageNumber, canvas, renderScale, rotation)
         .then((res) => {
           if (active && res.unscaledWidth > 0 && res.unscaledHeight > 0) {
             setDims({ width: res.unscaledWidth, height: res.unscaledHeight });
@@ -130,7 +140,7 @@ const LazyPageCanvas: React.FC<{
       return () => {
         active = false;
       };
-    }, [shouldRender, pdfBytes, pageNumber, scale, rotation]);
+    }, [shouldRender, pdfBytes, pageNumber, renderScale, rotation]);
 
     const boxW = Math.max(120, Math.floor(dims.width * scale));
     const boxH = Math.max(160, Math.floor(dims.height * scale));
@@ -141,7 +151,7 @@ const LazyPageCanvas: React.FC<{
           wrapperRef.current = el;
           registerPageRef(pageNumber, el);
         }}
-        style={{ width: boxW, minHeight: boxH }}
+        style={{ width: boxW, height: boxH }}
         className="relative mx-auto my-3 bg-white shadow-md rounded-lg overflow-hidden border border-slate-200 dark:border-slate-700 shrink-0"
       >
         {(!shouldRender || rendering) && (
@@ -154,7 +164,7 @@ const LazyPageCanvas: React.FC<{
             <Bookmark className="w-3.5 h-3.5 fill-current" />
           </div>
         )}
-        {shouldRender && <canvas ref={canvasRef} className="block" />}
+        {shouldRender && <canvas ref={canvasRef} className="block w-full h-full" />}
       </div>
     );
   }
@@ -194,8 +204,15 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
   const viewerRootRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
-  const pinchStartDist = useRef<number | null>(null);
-  const pinchStartScale = useRef<number>(1);
+
+  usePdfPinchZoom({
+    rootRef: viewerRootRef,
+    scrollRef: containerRef,
+    scale,
+    setScale,
+    minScale: 0.35,
+    maxScale: 3.5,
+  });
 
   const registerPageRef = useCallback((pNum: number, el: HTMLDivElement | null) => {
     if (el) {
@@ -222,22 +239,6 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
       active = false;
     };
   }, [doc.id, doc.pdfBytes, extraRotation]);
-
-  // Intercept Ctrl+Wheel / Cmd+Wheel on the entire viewer so ONLY the PDF zooms, never the browser UI
-  useEffect(() => {
-    const root = viewerRootRef.current;
-    if (!root) return;
-    const handleWheel = (e: WheelEvent) => {
-      if (e.ctrlKey || e.metaKey) {
-        e.preventDefault();
-        e.stopPropagation();
-        const step = e.deltaY < 0 ? 0.1 : -0.1;
-        setScale((s) => Math.max(0.35, Math.min(3.5, Number((s + step).toFixed(2)))));
-      }
-    };
-    root.addEventListener('wheel', handleWheel, { passive: false });
-    return () => root.removeEventListener('wheel', handleWheel);
-  }, []);
 
   // Lazy-extract all page texts only when user opens search
   useEffect(() => {
@@ -407,66 +408,17 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
     setScale(Math.max(0.35, Math.min(3.0, Number(((ch - 32) / defaultPageDims.height).toFixed(2)))));
   };
 
-  const handlePrint = () => {
-    const blob = new Blob([doc.pdfBytes], { type: 'application/pdf' });
-    const url = URL.createObjectURL(blob);
-    const iframe = document.createElement('iframe');
-    iframe.style.position = 'fixed';
-    iframe.style.right = '0';
-    iframe.style.bottom = '0';
-    iframe.style.width = '0';
-    iframe.style.height = '0';
-    iframe.style.border = '0';
-    iframe.src = url;
-    document.body.appendChild(iframe);
-    iframe.onload = () => {
-      iframe.contentWindow?.focus();
-      iframe.contentWindow?.print();
-      setTimeout(() => {
-        iframe.remove();
-        URL.revokeObjectURL(url);
-      }, 60000);
-    };
-  };
-
   const handleShare = async () => {
-    const file = new File([doc.pdfBytes], doc.name, { type: 'application/pdf' });
-    if (navigator.share && navigator.canShare?.({ files: [file] })) {
-      try {
-        await navigator.share({ title: doc.name, files: [file] });
-        return;
-      } catch {
-        // user cancelled or unsupported
-      }
-    }
-    downloadArrayBuffer(doc.pdfBytes, doc.name);
-  };
-
-  const handleTouchStart = (e: React.TouchEvent) => {
-    if (e.touches.length === 2) {
-      const dx = e.touches[0].clientX - e.touches[1].clientX;
-      const dy = e.touches[0].clientY - e.touches[1].clientY;
-      pinchStartDist.current = Math.hypot(dx, dy);
-      pinchStartScale.current = scale;
-    }
-  };
-
-  const handleTouchMove = (e: React.TouchEvent) => {
-    if (e.touches.length === 2 && pinchStartDist.current) {
-      const dx = e.touches[0].clientX - e.touches[1].clientX;
-      const dy = e.touches[0].clientY - e.touches[1].clientY;
-      const dist = Math.hypot(dx, dy);
-      const ratio = dist / pinchStartDist.current;
-      setScale(Math.max(0.35, Math.min(3.5, Number((pinchStartScale.current * ratio).toFixed(2)))));
-    }
-  };
-
-  const handleTouchEnd = () => {
-    pinchStartDist.current = null;
+    await shareBufferNativeOrWeb(doc.pdfBytes, doc.name, 'application/pdf');
+    await onUpdateDoc({ ...doc, isShared: true });
   };
 
   return (
-    <div ref={viewerRootRef} className="fixed inset-0 z-40 flex flex-col bg-[#F1F5F9] dark:bg-[#0B1120]">
+    <div
+      ref={viewerRootRef}
+      style={{ touchAction: 'pan-x pan-y' }}
+      className="fixed inset-0 z-40 flex flex-col bg-[#F1F5F9] dark:bg-[#0B1120]"
+    >
       {/* Top Bar */}
       {!isFullscreen && (
         <header className="flex items-center justify-between gap-2 px-3 py-2 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 shrink-0">
@@ -669,14 +621,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
             {t.viewer.copyText}
           </button>
           <button
-            onClick={handlePrint}
-            className="px-2.5 min-h-[36px] rounded-lg bg-slate-100 dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 flex items-center gap-1 whitespace-nowrap shrink-0"
-          >
-            <Printer className="w-3.5 h-3.5" />
-            {t.viewer.print}
-          </button>
-          <button
-            onClick={() => downloadArrayBuffer(doc.pdfBytes, doc.name)}
+            onClick={() => void saveBufferToDeviceStorage(doc.pdfBytes, doc.name, 'application/pdf')}
             className="px-2.5 min-h-[36px] rounded-lg bg-slate-100 dark:bg-slate-800 text-xs font-medium text-slate-700 dark:text-slate-200 flex items-center gap-1 whitespace-nowrap shrink-0"
           >
             <Download className="w-3.5 h-3.5" />
@@ -725,13 +670,11 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
           containerRef.current = el;
           setScrollRootEl(el);
         }}
-        onTouchStart={handleTouchStart}
-        onTouchMove={handleTouchMove}
-        onTouchEnd={handleTouchEnd}
-        className="flex-1 overflow-auto px-2 sm:px-6 py-4"
+        style={{ touchAction: 'pan-x pan-y' }}
+        className="flex-1 overflow-auto px-2 sm:px-6 py-4 overscroll-contain"
       >
         {viewMode === 'single' ? (
-          <div className="flex flex-col items-center">
+          <div className="min-w-full w-fit flex flex-col items-center">
             <LazyPageCanvas
               pdfBytes={doc.pdfBytes}
               pageNumber={currentPage}
@@ -746,7 +689,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
             />
           </div>
         ) : (
-          <div className="flex flex-col items-center">
+          <div className="min-w-full w-fit flex flex-col items-center">
             {Array.from({ length: doc.pageCount }, (_, i) => i + 1).map((pNum) => (
               <LazyPageCanvas
                 key={pNum}

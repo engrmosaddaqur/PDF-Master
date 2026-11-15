@@ -53,6 +53,7 @@ import {
 } from '../services/pdfEngine';
 import { downloadArrayBuffer } from '../services/storageService';
 import { SignatureModal } from './SignatureModal';
+import { usePdfPinchZoom } from '../hooks/usePdfPinchZoom';
 
 interface PdfEditorViewProps {
   doc: DocumentRecord;
@@ -210,21 +211,14 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     setState(next);
   };
 
-  // Intercept Ctrl+Wheel / Cmd+Wheel so ONLY the PDF canvas zooms, never the whole browser page
-  useEffect(() => {
-    const root = editorRootRef.current;
-    if (!root) return;
-    const onWheel = (e: WheelEvent) => {
-      if (e.ctrlKey || e.metaKey) {
-        e.preventDefault();
-        e.stopPropagation();
-        const delta = e.deltaY < 0 ? 0.1 : -0.1;
-        setScale((s) => Math.max(0.4, Math.min(3.0, Number((s + delta).toFixed(2)))));
-      }
-    };
-    root.addEventListener('wheel', onWheel, { passive: false });
-    return () => root.removeEventListener('wheel', onWheel);
-  }, []);
+  usePdfPinchZoom({
+    rootRef: editorRootRef,
+    scrollRef: canvasScrollRef,
+    scale,
+    setScale,
+    minScale: 0.4,
+    maxScale: 3.0,
+  });
 
   // Keyboard arrow / PageUp / PageDown / Delete navigation
   useEffect(() => {
@@ -299,23 +293,40 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     doc.pageCount,
   ]);
 
+  const [renderScale, setRenderScale] = useState(scale);
+
+  useEffect(() => {
+    const id = setTimeout(() => setRenderScale(scale), 110);
+    return () => clearTimeout(id);
+  }, [scale]);
+
   useEffect(() => {
     let active = true;
-    const loadPage = async () => {
+    const loadPageCanvas = async () => {
       if (canvasRef.current) {
-        const res = await renderPageToCanvas(doc.pdfBytes, pageNumber, canvasRef.current, scale);
+        const res = await renderPageToCanvas(doc.pdfBytes, pageNumber, canvasRef.current, renderScale);
         if (active) {
           setPageSize({ width: res.unscaledWidth, height: res.unscaledHeight });
         }
       }
-      const { runs } = await extractPageTextRuns(doc.pdfBytes, pageNumber);
-      if (active) setTextRuns(runs);
     };
-    loadPage().catch(() => {});
+    loadPageCanvas().catch(() => {});
     return () => {
       active = false;
     };
-  }, [doc.pdfBytes, pageNumber, scale]);
+  }, [doc.pdfBytes, pageNumber, renderScale]);
+
+  useEffect(() => {
+    let active = true;
+    extractPageTextRuns(doc.pdfBytes, pageNumber)
+      .then(({ runs }) => {
+        if (active) setTextRuns(runs);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [doc.pdfBytes, pageNumber]);
 
   const toUnscaledCoords = (clientX: number, clientY: number) => {
     const rect = overlayRef.current!.getBoundingClientRect();
@@ -348,7 +359,16 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     setStickyArrow(ann.stickyArrow || 'left');
   };
 
-  const handleOverlayPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+  const isDragStrokeTool =
+    activeTool === 'draw' ||
+    activeTool === 'highlight' ||
+    activeTool === 'underline' ||
+    activeTool === 'strike' ||
+    activeTool === 'rect' ||
+    activeTool === 'circle' ||
+    activeTool === 'arrow';
+
+  const handleOverlayClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (e.target !== overlayRef.current) return;
     setSelectedImageId(null);
     const pt = toUnscaledCoords(e.clientX, e.clientY);
@@ -421,8 +441,15 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       }));
       setStatusMessage('Signature placed on page');
       setTimeout(() => setStatusMessage(null), 2000);
-      return;
     }
+  };
+
+  const handleOverlayPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!e.isPrimary) return;
+    if (e.target !== overlayRef.current) return;
+    if (!isDragStrokeTool) return;
+    setSelectedImageId(null);
+    const pt = toUnscaledCoords(e.clientX, e.clientY);
 
     if (['draw', 'highlight', 'underline', 'strike', 'rect', 'circle', 'arrow'].includes(activeTool)) {
       e.currentTarget.setPointerCapture(e.pointerId);
@@ -781,7 +808,11 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   ];
 
   return (
-    <div ref={editorRootRef} className="fixed inset-0 z-40 flex flex-col bg-[#E2E8F0] dark:bg-[#0B1120]">
+    <div
+      ref={editorRootRef}
+      style={{ touchAction: 'pan-x pan-y' }}
+      className="fixed inset-0 z-40 flex flex-col bg-[#E2E8F0] dark:bg-[#0B1120]"
+    >
       {/* Header */}
       <header className="flex items-center justify-between gap-2 px-3 py-2 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 shrink-0">
         <div className="flex items-center gap-1 min-w-0">
@@ -941,21 +972,25 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       {/* Main Editable Page Canvas */}
       <div
         ref={canvasScrollRef}
-        className="flex-1 overflow-auto p-3 sm:p-6 flex justify-center items-start"
+        style={{ touchAction: 'pan-x pan-y' }}
+        className="flex-1 overflow-auto p-3 sm:p-6 overscroll-contain"
       >
+        <div className="min-w-full min-h-full w-fit flex items-start justify-center">
         <div
-          className="relative bg-white shadow-xl rounded-md overflow-hidden select-none"
+          className="relative bg-white shadow-xl rounded-md overflow-hidden select-none shrink-0"
           style={{ width: pageSize.width * scale, height: pageSize.height * scale }}
         >
-          <canvas ref={canvasRef} className="block" />
+          <canvas ref={canvasRef} className="block w-full h-full" />
 
           {/* Interactive Vector & Text Overlay Layer */}
           <div
             ref={overlayRef}
+            onClick={handleOverlayClick}
             onPointerDown={handleOverlayPointerDown}
             onPointerMove={handleOverlayPointerMove}
             onPointerUp={handleOverlayPointerUp}
-            className="absolute inset-0 touch-none"
+            style={{ touchAction: isDragStrokeTool ? 'none' : 'pan-x pan-y' }}
+            className="absolute inset-0"
           >
             {/* Detected native PDF text runs (clickable when editText is active) */}
             {activeTool === 'editText' &&
@@ -1434,6 +1469,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 );
               })}
           </div>
+        </div>
         </div>
       </div>
 

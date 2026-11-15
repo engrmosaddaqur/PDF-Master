@@ -484,6 +484,7 @@ Requirements:
     app.get('/@vite/client', (_req, res) => {
       res.type('application/javascript').send(`const sheetsMap = new Map();
 export function updateStyle(id, content) {
+  if (typeof document === 'undefined') return;
   let style = sheetsMap.get(id);
   if (!style) {
     style = document.createElement('style');
@@ -497,6 +498,7 @@ export function updateStyle(id, content) {
   }
 }
 export function removeStyle(id) {
+  if (typeof document === 'undefined') return;
   const style = sheetsMap.get(id);
   if (style && style.parentNode) {
     style.parentNode.removeChild(style);
@@ -518,7 +520,8 @@ export function createHotContext() {
   };
 }
 export function injectQuery(url) { return url; }
-export class ErrorOverlay extends HTMLElement {}
+const BaseHTMLElement = typeof HTMLElement !== 'undefined' ? HTMLElement : class {};
+export class ErrorOverlay extends BaseHTMLElement {}
 `);
     });
     app.use(vite.middlewares);

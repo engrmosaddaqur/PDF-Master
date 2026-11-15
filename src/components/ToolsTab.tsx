@@ -31,6 +31,7 @@ interface ToolsTabProps {
   language: AppLanguage;
   docs: DocumentRecord[];
   onOpenWorkspace: (ws: ActiveWorkspace) => void;
+  onPickDocForWorkspace: (mode: 'editor' | 'organizer') => void;
 }
 
 type ToolGroupId = 'organize' | 'convert' | 'edit' | 'security' | 'smart';
@@ -49,6 +50,7 @@ export const ToolsTab: React.FC<ToolsTabProps> = ({
   language,
   docs,
   onOpenWorkspace,
+  onPickDocForWorkspace,
 }) => {
   const [query, setQuery] = useState('');
 
@@ -90,10 +92,7 @@ export const ToolsTab: React.FC<ToolsTabProps> = ({
       group: 'organize',
       icon: <LayoutGrid className="w-5 h-5 text-[#3B82F6]" />,
       iconBg: 'bg-[#2563EB]/15',
-      onClick: () =>
-        firstDoc
-          ? onOpenWorkspace({ type: 'organizer', docId: firstDoc.id })
-          : onOpenWorkspace({ type: 'toolRunner', toolId: 'split' }),
+      onClick: () => onPickDocForWorkspace('organizer'),
     },
     {
       id: 'pageSetup',
@@ -223,10 +222,7 @@ export const ToolsTab: React.FC<ToolsTabProps> = ({
       group: 'edit',
       icon: <Edit3 className="w-5 h-5 text-[#3B82F6]" />,
       iconBg: 'bg-[#2563EB]/15',
-      onClick: () =>
-        firstDoc
-          ? onOpenWorkspace({ type: 'editor', docId: firstDoc.id })
-          : onOpenWorkspace({ type: 'wordCreator' }),
+      onClick: () => onPickDocForWorkspace('editor'),
     },
     {
       id: 'signature',
@@ -235,10 +231,7 @@ export const ToolsTab: React.FC<ToolsTabProps> = ({
       group: 'edit',
       icon: <PenTool className="w-5 h-5 text-indigo-400" />,
       iconBg: 'bg-indigo-500/15',
-      onClick: () =>
-        firstDoc
-          ? onOpenWorkspace({ type: 'editor', docId: firstDoc.id })
-          : onOpenWorkspace({ type: 'wordCreator' }),
+      onClick: () => onPickDocForWorkspace('editor'),
     },
     {
       id: 'headerFooter',

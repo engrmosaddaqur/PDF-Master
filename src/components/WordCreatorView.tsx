@@ -15,7 +15,6 @@ import {
   List,
   ListOrdered,
   Outdent,
-  Printer,
   Redo2,
   Save,
   Settings2,
@@ -37,7 +36,7 @@ import type {
 import { getT } from '../i18n/translations';
 import { htmlDocumentToPdf } from '../services/conversionService';
 import { cloneBuffer, PAPER_DIMENSIONS, renderPageThumbnail } from '../services/pdfEngine';
-import { downloadArrayBuffer } from '../services/storageService';
+import { saveBufferToDeviceStorage } from '../services/deviceFileActions';
 
 interface WordCreatorViewProps {
   language: AppLanguage;
@@ -83,6 +82,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
       pageNumbering: true,
     }
   );
+  const [savedDoc, setSavedDoc] = useState<DocumentRecord | undefined>(existingDoc);
   const [fontFamily, setFontFamily] = useState("'DM Sans', 'Noto Sans Bengali', sans-serif");
   const [fontSize, setFontSize] = useState('3');
   const [lineSpacing, setLineSpacing] = useState('1.6');
@@ -96,6 +96,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
   const savedRangeRef = useRef<Range | null>(null);
 
   useEffect(() => {
+    setSavedDoc(existingDoc);
     if (editorRef.current) {
       editorRef.current.innerHTML = existingDoc?.editableHtml || initialHtml || DEFAULT_HTML;
       refreshOutline();
@@ -145,7 +146,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
     e.target.value = '';
   };
 
-  const handleSaveAndExport = async (action: 'saveVault' | 'downloadPdf' | 'downloadDocx' | 'print') => {
+  const handleSaveAndExport = async (action: 'saveVault' | 'downloadPdf' | 'downloadDocx') => {
     const html = editorRef.current?.innerHTML || '';
     setSaving(true);
     try {
@@ -162,7 +163,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
         });
         const blob = await Packer.toBlob(docx);
         const buf = await blob.arrayBuffer();
-        downloadArrayBuffer(
+        await saveBufferToDeviceStorage(
           buf,
           `${docTitle.trim() || 'document'}.docx`,
           'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
@@ -171,37 +172,17 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
       }
 
       const pdfBytes = await htmlDocumentToPdf(html, settings);
-      if (action === 'downloadPdf') {
-        downloadArrayBuffer(pdfBytes, `${docTitle.trim() || 'document'}.pdf`);
-        return;
-      }
-
-      if (action === 'print') {
-        const blob = new Blob([pdfBytes], { type: 'application/pdf' });
-        const url = URL.createObjectURL(blob);
-        const iframe = document.createElement('iframe');
-        iframe.style.display = 'none';
-        iframe.src = url;
-        document.body.appendChild(iframe);
-        iframe.onload = () => {
-          iframe.contentWindow?.print();
-          setTimeout(() => {
-            iframe.remove();
-            URL.revokeObjectURL(url);
-          }, 60000);
-        };
-        return;
-      }
+      const fileName = `${docTitle.trim() || 'Untitled Document'}.pdf`;
 
       const thumb = await renderPageThumbnail(pdfBytes, 1, 200).catch(() => undefined);
       const { getPdfDocumentInfo } = await import('../services/pdfEngine');
       const info = await getPdfDocumentInfo(pdfBytes).catch(() => ({ pageCount: 1 }));
       const now = Date.now();
-      const fileName = `${docTitle.trim() || 'Untitled Document'}.pdf`;
+      const baseDoc = savedDoc || existingDoc;
 
-      const record: DocumentRecord = existingDoc
+      const record: DocumentRecord = baseDoc
         ? {
-            ...existingDoc,
+            ...baseDoc,
             name: fileName,
             updatedAt: now,
             sizeBytes: pdfBytes.byteLength,
@@ -214,11 +195,11 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
               {
                 id: `ver_${now}`,
                 timestamp: now,
-                note: 'Updated in Document Creator',
+                note: action === 'downloadPdf' ? 'Exported PDF' : 'Updated in Document Creator',
                 sizeBytes: pdfBytes.byteLength,
                 pdfBytes: cloneBuffer(pdfBytes),
               },
-              ...existingDoc.versions,
+              ...baseDoc.versions,
             ],
           }
         : {
@@ -250,8 +231,14 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
           };
 
       await onSaveDocument(record);
-      setSavedNotice('Saved to Created Documents');
-      setTimeout(() => setSavedNotice(null), 2200);
+      setSavedDoc(record);
+
+      if (action === 'downloadPdf') {
+        await saveBufferToDeviceStorage(pdfBytes, fileName, 'application/pdf');
+      } else {
+        setSavedNotice('Saved to Files & Device Storage');
+        setTimeout(() => setSavedNotice(null), 2400);
+      }
     } finally {
       setSaving(false);
     }
@@ -522,13 +509,6 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            onClick={() => handleSaveAndExport('print')}
-            className="min-h-[40px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center gap-1.5"
-          >
-            <Printer className="w-3.5 h-3.5" />
-            {t.creator.print}
-          </button>
           <button
             onClick={() => handleSaveAndExport('downloadDocx')}
             className="min-h-[40px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center gap-1.5"

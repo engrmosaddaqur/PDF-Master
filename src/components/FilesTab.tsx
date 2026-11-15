@@ -33,6 +33,10 @@ import {
   formatBytes,
   formatRelativeTime,
 } from '../services/storageService';
+import {
+  saveBufferToDeviceStorage,
+  shareBufferNativeOrWeb,
+} from '../services/deviceFileActions';
 
 interface FilesTabProps {
   language: AppLanguage;
@@ -415,13 +419,24 @@ export const FilesTab: React.FC<FilesTabProps> = ({
                 </button>
                 <button
                   onClick={async () => {
-                    downloadArrayBuffer(menuDoc.pdfBytes, menuDoc.name);
-                    await onUpdateDoc({ ...menuDoc, isShared: true });
+                    const target = menuDoc;
                     setMenuDoc(null);
+                    await saveBufferToDeviceStorage(target.pdfBytes, target.name, 'application/pdf');
                   }}
                   className="w-full min-h-[46px] px-3 rounded-xl flex items-center gap-3 text-sm font-medium hover:bg-slate-100 dark:hover:bg-[#1A243B]"
                 >
-                  <Share2 className="w-4 h-4" /> Export &amp; Share
+                  <Download className="w-4 h-4 text-[#3B82F6]" /> Download to Device Storage
+                </button>
+                <button
+                  onClick={async () => {
+                    const target = menuDoc;
+                    setMenuDoc(null);
+                    await shareBufferNativeOrWeb(target.pdfBytes, target.name, 'application/pdf');
+                    await onUpdateDoc({ ...target, isShared: true });
+                  }}
+                  className="w-full min-h-[46px] px-3 rounded-xl flex items-center gap-3 text-sm font-medium hover:bg-slate-100 dark:hover:bg-[#1A243B]"
+                >
+                  <Share2 className="w-4 h-4" /> Share
                 </button>
                 {folders.length > 0 && (
                   <div className="px-3 py-1.5">

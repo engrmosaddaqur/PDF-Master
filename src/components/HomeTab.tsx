@@ -32,6 +32,7 @@ interface HomeTabProps {
   docs: DocumentRecord[];
   onImportPdf: () => void;
   onOpenWorkspace: (ws: ActiveWorkspace) => void;
+  onPickDocForWorkspace: (mode: 'editor' | 'organizer') => void;
   onNavigateFiles: (cat: DocumentCategory) => void;
   onNavigateTools: () => void;
 }
@@ -41,6 +42,7 @@ export const HomeTab: React.FC<HomeTabProps> = ({
   docs,
   onImportPdf,
   onOpenWorkspace,
+  onPickDocForWorkspace,
   onNavigateFiles,
   onNavigateTools,
 }) => {
@@ -66,13 +68,7 @@ export const HomeTab: React.FC<HomeTabProps> = ({
       label: language === 'bn' ? 'এডিট পিডিএফ' : 'Edit PDF',
       icon: <Edit3 className="w-5 h-5" />,
       tint: 'bg-[#172542] text-[#3B82F6] dark:bg-[#172542] dark:text-[#60A5FA]',
-      onClick: () => {
-        if (firstEditableDoc) {
-          onOpenWorkspace({ type: 'editor', docId: firstEditableDoc.id });
-        } else {
-          onImportPdf();
-        }
-      },
+      onClick: () => onPickDocForWorkspace('editor'),
     },
     {
       id: 'scan',

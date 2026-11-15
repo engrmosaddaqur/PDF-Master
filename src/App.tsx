@@ -1,15 +1,23 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
+  AlertCircle,
   Camera,
+  CheckCircle2,
+  Edit3,
   FilePlus2,
+  FileText,
   FileUp,
   Folder,
+  FolderOpen,
   Home,
   Image as ImageIcon,
+  Info,
   LayoutGrid,
   Plus,
   PlusCircle,
+  Search,
   Settings as SettingsIcon,
+  Share2,
   X,
 } from 'lucide-react';
 import type {
@@ -31,6 +39,8 @@ import {
 import {
   deleteAllDocuments,
   deleteDocumentForever,
+  formatBytes,
+  formatRelativeTime,
   getAllDocuments,
   getAllFolders,
   loadSettings,
@@ -39,6 +49,11 @@ import {
   saveSettings,
   seedInitialDocumentsIfNeeded,
 } from './services/storageService';
+import {
+  type AppToastDetail,
+  emitAppToast,
+  shareBufferNativeOrWeb,
+} from './services/deviceFileActions';
 import { PdfMasterLogo } from './components/Logo';
 import { OfflineIndicator, PWAInstallButton } from './components/PWAComponents';
 import { HomeTab } from './components/HomeTab';
@@ -65,8 +80,12 @@ export default function App() {
   const [workspace, setWorkspace] = useState<ActiveWorkspace>({ type: 'none' });
   const [creatorTemplateHtml, setCreatorTemplateHtml] = useState<string | undefined>(undefined);
   const [showFabSheet, setShowFabSheet] = useState(false);
+  const [pendingPickMode, setPendingPickMode] = useState<'editor' | 'organizer' | null>(null);
+  const [pickSearch, setPickSearch] = useState('');
+  const [appToast, setAppToast] = useState<AppToastDetail | null>(null);
   const [loadingVault, setLoadingVault] = useState(true);
   const importInputRef = useRef<HTMLInputElement | null>(null);
+  const pendingImportTargetRef = useRef<'viewer' | 'editor' | 'organizer'>('viewer');
 
   const t = getT(settings.language);
 
@@ -105,6 +124,22 @@ export default function App() {
     init().catch(() => setLoadingVault(false));
   }, []);
 
+  // Global toast notifications for Download, Save, Share, Print feedback
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onToast = (e: Event) => {
+      const custom = e as CustomEvent<AppToastDetail>;
+      setAppToast(custom.detail);
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => setAppToast(null), 4500);
+    };
+    window.addEventListener('pm-app-toast', onToast);
+    return () => {
+      window.removeEventListener('pm-app-toast', onToast);
+      if (timer) clearTimeout(timer);
+    };
+  }, []);
+
   const updateSettings = (patch: Partial<AppSettings>) => {
     setSettings((prev) => {
       const next = { ...prev, ...patch };
@@ -124,6 +159,8 @@ export default function App() {
 
   const handleImportPdfs = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
+    const targetWorkspace = pendingImportTargetRef.current;
+    pendingImportTargetRef.current = 'viewer';
     if (!files.length) return;
     setShowFabSheet(false);
 
@@ -160,10 +197,24 @@ export default function App() {
         };
         await upsertDoc(record);
         if (files.length === 1) {
-          setWorkspace({ type: 'viewer', docId: record.id });
+          setWorkspace({ type: targetWorkspace, docId: record.id });
         }
+        emitAppToast({
+          message:
+            settings.language === 'bn'
+              ? `ইমপোর্ট হয়েছে: ${record.name}`
+              : `Imported ${record.name}`,
+          variant: 'success',
+        });
       } catch (err) {
         console.error('Failed to import PDF:', err);
+        emitAppToast({
+          message:
+            settings.language === 'bn'
+              ? 'পিডিএফ ইমপোর্ট করা যায়নি।'
+              : 'Failed to open selected PDF.',
+          variant: 'error',
+        });
       }
     }
     e.target.value = '';
@@ -210,6 +261,18 @@ export default function App() {
       ],
     };
     await upsertDoc(record);
+    emitAppToast({
+      message:
+        settings.language === 'bn'
+          ? `তৈরি ও সেভ হয়েছে: ${record.name}`
+          : `Saved ${record.name}`,
+      variant: 'success',
+      shareFile: {
+        buf: record.pdfBytes,
+        filename: record.name,
+        mime: 'application/pdf',
+      },
+    });
     setWorkspace({ type: 'viewer', docId: record.id });
   };
 
@@ -292,6 +355,13 @@ export default function App() {
       ? docs.find((d) => d.id === workspace.docId)
       : undefined;
 
+  const recentEditableDocs = docs
+    .filter((d) => !d.isTrashed && !d.isVaultLocked)
+    .sort((a, b) => b.lastOpenedAt - a.lastOpenedAt)
+    .filter((d) =>
+      pickSearch.trim() ? d.name.toLowerCase().includes(pickSearch.toLowerCase()) : true
+    );
+
   return (
     <div className="min-h-screen flex flex-col bg-[#F4F7FB] dark:bg-[#0A0F1A] text-slate-900 dark:text-slate-100">
       <OfflineIndicator />
@@ -319,7 +389,10 @@ export default function App() {
         <div className="flex items-center gap-2 shrink-0">
           <PWAInstallButton compact label="Install" />
           <button
-            onClick={() => importInputRef.current?.click()}
+            onClick={() => {
+              pendingImportTargetRef.current = 'viewer';
+              importInputRef.current?.click();
+            }}
             className="min-h-[40px] px-4 rounded-xl bg-gradient-to-r from-[#3B82F6] to-[#06B6D4] text-white text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0 shadow-md shadow-blue-500/20 active:scale-[0.98] transition-transform"
           >
             <FileUp className="w-4 h-4" />
@@ -344,10 +417,17 @@ export default function App() {
               <HomeTab
                 language={settings.language}
                 docs={docs}
-                onImportPdf={() => importInputRef.current?.click()}
+                onImportPdf={() => {
+                  pendingImportTargetRef.current = 'viewer';
+                  importInputRef.current?.click();
+                }}
                 onOpenWorkspace={(ws) => {
                   setCreatorTemplateHtml(undefined);
                   setWorkspace(ws);
+                }}
+                onPickDocForWorkspace={(mode) => {
+                  setPickSearch('');
+                  setPendingPickMode(mode);
                 }}
                 onNavigateFiles={(cat) => {
                   setFilesInitialCat(cat);
@@ -363,7 +443,10 @@ export default function App() {
                 docs={docs}
                 folders={folders}
                 initialCategory={filesInitialCat}
-                onImportPdf={() => importInputRef.current?.click()}
+                onImportPdf={() => {
+                  pendingImportTargetRef.current = 'viewer';
+                  importInputRef.current?.click();
+                }}
                 onOpenDoc={openDocumentInViewer}
                 onEditDoc={(doc) => setWorkspace({ type: 'editor', docId: doc.id })}
                 onUpdateDoc={upsertDoc}
@@ -378,6 +461,10 @@ export default function App() {
                 language={settings.language}
                 docs={docs}
                 onOpenWorkspace={(ws) => setWorkspace(ws)}
+                onPickDocForWorkspace={(mode) => {
+                  setPickSearch('');
+                  setPendingPickMode(mode);
+                }}
               />
             )}
 
@@ -488,7 +575,10 @@ export default function App() {
               </button>
             </div>
             <button
-              onClick={() => importInputRef.current?.click()}
+              onClick={() => {
+                pendingImportTargetRef.current = 'viewer';
+                importInputRef.current?.click();
+              }}
               className="w-full min-h-[52px] px-4 rounded-2xl bg-slate-100 dark:bg-[#1A243B] flex items-center gap-3 text-sm font-semibold text-slate-900 dark:text-white"
             >
               <FileUp className="w-5 h-5 text-[#3B82F6]" />
@@ -642,6 +732,176 @@ export default function App() {
           onUpdateExistingDoc={upsertDoc}
         />
       )}
+
+      {/* Document Picker Modal for Edit PDF / Sign / Organize Pages */}
+      {pendingPickMode && (
+        <div
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/65 backdrop-blur-sm"
+          onClick={() => setPendingPickMode(null)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-md max-h-[86vh] flex flex-col rounded-t-3xl sm:rounded-3xl bg-white dark:bg-[#121929] border-t sm:border border-slate-200 dark:border-[#1E293B] shadow-2xl overflow-hidden"
+          >
+            <div className="w-10 h-1.5 bg-slate-300 dark:bg-slate-700 rounded-full mx-auto mt-3 sm:hidden" />
+
+            <div className="px-5 pt-4 pb-3 border-b border-slate-200 dark:border-[#1E293B] flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <div className="w-9 h-9 rounded-xl bg-[#2563EB]/15 text-[#3B82F6] flex items-center justify-center shrink-0">
+                  <Edit3 className="w-4 h-4" />
+                </div>
+                <div className="min-w-0">
+                  <h3 className="font-display text-base font-bold text-slate-900 dark:text-white truncate">
+                    {pendingPickMode === 'editor'
+                      ? settings.language === 'bn'
+                        ? 'এডিট করার জন্য ফাইল বাছুন'
+                        : 'Choose PDF to Edit'
+                      : settings.language === 'bn'
+                      ? 'পৃষ্ঠা সাজাতে ফাইল বাছুন'
+                      : 'Choose PDF to Organize'}
+                  </h3>
+                  <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                    {settings.language === 'bn'
+                      ? 'লোকাল স্টোরেজ বা রিসেন্ট ডকুমেন্ট থেকে বেছে নিন'
+                      : 'Pick from device local storage or recent documents'}
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setPendingPickMode(null)}
+                className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-full text-slate-500 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-[#1A243B]"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-4 space-y-3 overflow-y-auto flex-1">
+              {/* Primary Device Local Storage Picker */}
+              <button
+                onClick={() => {
+                  pendingImportTargetRef.current = pendingPickMode;
+                  setPendingPickMode(null);
+                  importInputRef.current?.click();
+                }}
+                className="w-full min-h-[52px] px-4 rounded-2xl bg-gradient-to-r from-[#3B82F6] to-[#06B6D4] text-white font-semibold text-sm flex items-center justify-center gap-2.5 shadow-lg shadow-blue-500/25 active:scale-[0.99] transition-transform"
+              >
+                <FolderOpen className="w-5 h-5 shrink-0" />
+                <span>
+                  {settings.language === 'bn'
+                    ? 'ডিভাইস স্টোরেজ থেকে পিডিএফ ওপেন করুন'
+                    : 'Open PDF from Device Storage'}
+                </span>
+              </button>
+
+              {/* Search recent documents */}
+              <div className="relative">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+                <input
+                  value={pickSearch}
+                  onChange={(e) => setPickSearch(e.target.value)}
+                  placeholder={
+                    settings.language === 'bn'
+                      ? 'রিসেন্ট ডকুমেন্ট খুঁজুন...'
+                      : 'Search recent documents...'
+                  }
+                  className="w-full min-h-[42px] pl-10 pr-3 rounded-xl bg-slate-100 dark:bg-[#0D1322] border border-slate-200 dark:border-[#1E293B] text-xs font-medium text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:border-[#3B82F6]"
+                />
+              </div>
+
+              <div className="flex items-center justify-between pt-1">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400">
+                  {settings.language === 'bn' ? 'সাম্প্রতিক ডকুমেন্ট' : 'Recent Documents'}
+                </span>
+                <span className="text-[11px] font-semibold text-slate-400">
+                  {recentEditableDocs.length}
+                </span>
+              </div>
+
+              {recentEditableDocs.length === 0 ? (
+                <div className="py-8 text-center rounded-2xl border border-dashed border-slate-200 dark:border-[#1E293B] space-y-2">
+                  <FileText className="w-8 h-8 text-slate-400 mx-auto" />
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    {settings.language === 'bn'
+                      ? 'কোনো রিসেন্ট পিডিএফ পাওয়া যায়নি'
+                      : 'No matching recent PDFs found'}
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {recentEditableDocs.map((d) => (
+                    <button
+                      key={d.id}
+                      onClick={() => {
+                        const mode = pendingPickMode;
+                        setPendingPickMode(null);
+                        setWorkspace({ type: mode, docId: d.id });
+                      }}
+                      className="w-full p-2.5 rounded-2xl bg-slate-50 dark:bg-[#161F33] hover:bg-slate-100 dark:hover:bg-[#1B263F] border border-slate-200 dark:border-[#1E293B] flex items-center gap-3 text-left transition-colors active:scale-[0.99]"
+                    >
+                      <div className="w-11 h-14 rounded-xl bg-white dark:bg-[#0D1322] border border-slate-200 dark:border-[#1E293B] overflow-hidden shrink-0 flex items-center justify-center">
+                        {d.thumbnailDataUrl ? (
+                          <img
+                            src={d.thumbnailDataUrl}
+                            alt={d.name}
+                            className="w-full h-full object-cover"
+                          />
+                        ) : (
+                          <FileText className="w-5 h-5 text-[#3B82F6]" />
+                        )}
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm font-bold text-slate-900 dark:text-white truncate">
+                          {d.name}
+                        </div>
+                        <div className="text-[11px] text-slate-500 dark:text-slate-400 mt-0.5">
+                          {d.pageCount}p · {formatBytes(d.sizeBytes)} ·{' '}
+                          {formatRelativeTime(d.lastOpenedAt, settings.language)}
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating Feedback Toast */}
+      {appToast && (
+        <div className="fixed bottom-24 sm:bottom-6 left-1/2 -translate-x-1/2 z-[60] w-[calc(100%-2rem)] max-w-md px-4 py-3 rounded-2xl bg-[#121929]/95 text-white border border-white/15 shadow-2xl backdrop-blur-md flex items-center gap-3">
+          {appToast.variant === 'error' ? (
+            <AlertCircle className="w-5 h-5 text-rose-400 shrink-0" />
+          ) : appToast.variant === 'info' ? (
+            <Info className="w-5 h-5 text-cyan-400 shrink-0" />
+          ) : (
+            <CheckCircle2 className="w-5 h-5 text-emerald-400 shrink-0" />
+          )}
+          <span className="text-xs font-semibold flex-1 leading-snug break-words">
+            {appToast.message}
+          </span>
+          {appToast.shareFile && (
+            <button
+              onClick={() => {
+                const sf = appToast.shareFile!;
+                void shareBufferNativeOrWeb(sf.buf, sf.filename, sf.mime);
+              }}
+              className="px-2.5 py-1.5 rounded-xl bg-white/15 hover:bg-white/25 text-xs font-bold flex items-center gap-1 shrink-0"
+            >
+              <Share2 className="w-3.5 h-3.5" />
+              <span>{settings.language === 'bn' ? 'শেয়ার' : 'Share'}</span>
+            </button>
+          )}
+          <button
+            onClick={() => setAppToast(null)}
+            aria-label="Dismiss notification"
+            className="p-1 rounded-lg hover:bg-white/10 text-slate-300 shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
     </div>
   );
 }
