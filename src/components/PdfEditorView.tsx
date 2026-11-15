@@ -18,6 +18,7 @@ import {
   MessageSquare,
   MousePointer,
   Pen,
+  Pencil,
   PenTool,
   Redo2,
   RotateCw,
@@ -28,6 +29,8 @@ import {
   Type as TypeIcon,
   Underline,
   Undo2,
+  ZoomIn,
+  ZoomOut,
   X,
 } from 'lucide-react';
 import type {
@@ -90,7 +93,10 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
 }) => {
   const t = getT(language);
   const [pageNumber, setPageNumber] = useState(1);
-  const [scale, setScale] = useState(1);
+  const [scale, setScale] = useState<number>(() => {
+    const w = typeof window !== 'undefined' ? window.innerWidth : 1024;
+    return w < 640 ? Math.max(0.55, Math.min(1.0, (w - 28) / 595)) : 1.05;
+  });
   const [pageSize, setPageSize] = useState({ width: 595, height: 842 });
   const [textRuns, setTextRuns] = useState<ExtractedTextRun[]>([]);
   const [activeTool, setActiveTool] = useState<EditorTool>('editText');
@@ -121,6 +127,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   });
 
   const [addingBoxPos, setAddingBoxPos] = useState<{ x: number; y: number } | null>(null);
+  const [editingBoxId, setEditingBoxId] = useState<string | null>(null);
   const [newBoxDraft, setNewBoxDraft] = useState({
     text: '',
     fontSize: 14,
@@ -134,7 +141,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   });
 
   const [stickyPos, setStickyPos] = useState<{ x: number; y: number } | null>(null);
+  const [editingStickyId, setEditingStickyId] = useState<string | null>(null);
   const [stickyText, setStickyText] = useState('');
+  const [stickyArrow, setStickyArrow] = useState<'left' | 'right' | 'top' | 'bottom'>('left');
 
   const [showSigModal, setShowSigModal] = useState(false);
   const [pendingSig, setPendingSig] = useState<{
@@ -155,10 +164,22 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     origX: number;
     origY: number;
   } | null>(null);
+  const [resizingImage, setResizingImage] = useState<{
+    id: string;
+    corner: 'nw' | 'ne' | 'sw' | 'se';
+    startClientX: number;
+    startClientY: number;
+    origX: number;
+    origY: number;
+    origW: number;
+    origH: number;
+  } | null>(null);
+  const pointerMovedRef = useRef(false);
   const [saving, setSaving] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
   // Drawing interaction
+  const editorRootRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
@@ -188,9 +209,20 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     setState(next);
   };
 
+  // Intercept Ctrl+Wheel / Cmd+Wheel so ONLY the PDF canvas zooms, never the whole browser page
   useEffect(() => {
-    const w = window.innerWidth;
-    setScale(w < 640 ? Math.max(0.55, Math.min(1.0, (w - 28) / 595)) : 1.1);
+    const root = editorRootRef.current;
+    if (!root) return;
+    const onWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        const delta = e.deltaY < 0 ? 0.1 : -0.1;
+        setScale((s) => Math.max(0.4, Math.min(3.0, Number((s + delta).toFixed(2)))));
+      }
+    };
+    root.addEventListener('wheel', onWheel, { passive: false });
+    return () => root.removeEventListener('wheel', onWheel);
   }, []);
 
   useEffect(() => {
@@ -219,11 +251,36 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     };
   };
 
+  const openEditAddedTextBox = (tb: AddedTextBox) => {
+    setEditingBoxId(tb.id);
+    setAddingBoxPos({ x: tb.x, y: tb.y });
+    setNewBoxDraft({
+      text: tb.text,
+      fontSize: tb.fontSize,
+      fontFamily: tb.fontFamily,
+      color: tb.color,
+      bold: tb.bold,
+      italic: tb.italic,
+      underline: tb.underline,
+      align: tb.align,
+      letterSpacing: tb.letterSpacing,
+    });
+  };
+
+  const openEditStickyNote = (ann: AnnotationOverlay) => {
+    setEditingStickyId(ann.id);
+    setStickyPos({ x: ann.x, y: ann.y });
+    setStickyText(ann.comment || '');
+    setStickyArrow(ann.stickyArrow || 'left');
+  };
+
   const handleOverlayPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.target !== overlayRef.current) return;
+    setSelectedImageId(null);
     const pt = toUnscaledCoords(e.clientX, e.clientY);
 
     if (activeTool === 'addText') {
+      setEditingBoxId(null);
       setAddingBoxPos(pt);
       setNewBoxDraft({
         text: '',
@@ -240,8 +297,10 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     }
 
     if (activeTool === 'sticky') {
+      setEditingStickyId(null);
       setStickyPos(pt);
       setStickyText('');
+      setStickyArrow('left');
       return;
     }
 
@@ -303,9 +362,51 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   };
 
   const handleOverlayPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (resizingImage) {
+      const dx = (e.clientX - resizingImage.startClientX) / scale;
+      const dy = (e.clientY - resizingImage.startClientY) / scale;
+      const aspect = resizingImage.origW / Math.max(1, resizingImage.origH);
+      let newW = resizingImage.origW;
+      let newX = resizingImage.origX;
+      let newY = resizingImage.origY;
+
+      if (resizingImage.corner === 'se') {
+        newW = Math.max(24, Math.min(pageSize.width - resizingImage.origX, resizingImage.origW + (Math.abs(dx) >= Math.abs(dy) ? dx : dy * aspect)));
+      } else if (resizingImage.corner === 'ne') {
+        newW = Math.max(24, Math.min(pageSize.width - resizingImage.origX, resizingImage.origW + (Math.abs(dx) >= Math.abs(dy) ? dx : -dy * aspect)));
+      } else if (resizingImage.corner === 'sw') {
+        const deltaW = Math.abs(dx) >= Math.abs(dy) ? -dx : dy * aspect;
+        newW = Math.max(24, Math.min(resizingImage.origX + resizingImage.origW, resizingImage.origW + deltaW));
+        newX = resizingImage.origX + (resizingImage.origW - newW);
+      } else if (resizingImage.corner === 'nw') {
+        const deltaW = Math.abs(dx) >= Math.abs(dy) ? -dx : -dy * aspect;
+        newW = Math.max(24, Math.min(resizingImage.origX + resizingImage.origW, resizingImage.origW + deltaW));
+        newX = resizingImage.origX + (resizingImage.origW - newW);
+      }
+      const newH = Math.max(24, newW / aspect);
+      if (resizingImage.corner === 'ne' || resizingImage.corner === 'nw') {
+        newY = Math.max(0, resizingImage.origY + (resizingImage.origH - newH));
+      }
+
+      setState((prev) => ({
+        ...prev,
+        addedImages: prev.addedImages.map((im) =>
+          im.id === resizingImage.id
+            ? { ...im, x: newX, y: newY, width: Math.round(newW), height: Math.round(newH) }
+            : im
+        ),
+      }));
+      return;
+    }
+
     if (draggingItem) {
-      const dx = (e.clientX - draggingItem.startClientX) / scale;
-      const dy = (e.clientY - draggingItem.startClientY) / scale;
+      const rawDx = e.clientX - draggingItem.startClientX;
+      const rawDy = e.clientY - draggingItem.startClientY;
+      if (Math.hypot(rawDx, rawDy) > 5) {
+        pointerMovedRef.current = true;
+      }
+      const dx = rawDx / scale;
+      const dy = rawDy / scale;
       const nx = Math.max(0, Math.min(pageSize.width - 20, draggingItem.origX + dx));
       const ny = Math.max(0, Math.min(pageSize.height - 20, draggingItem.origY + dy));
       setState((prev) => {
@@ -352,8 +453,23 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   };
 
   const handleOverlayPointerUp = () => {
+    if (resizingImage) {
+      setResizingImage(null);
+      return;
+    }
     if (draggingItem) {
+      const wasTap = !pointerMovedRef.current;
+      const item = draggingItem;
       setDraggingItem(null);
+      if (wasTap) {
+        if (item.kind === 'textBox') {
+          const tb = state.addedTexts.find((x) => x.id === item.id);
+          if (tb) openEditAddedTextBox(tb);
+        } else if (item.kind === 'annotation') {
+          const ann = state.annotations.find((x) => x.id === item.id);
+          if (ann?.kind === 'sticky') openEditStickyNote(ann);
+        }
+      }
       return;
     }
     if (!dragStartRef.current) return;
@@ -471,12 +587,13 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       img.onload = () => {
         const w = Math.min(220, img.naturalWidth || 180);
         const h = Math.round((w / (img.naturalWidth || 180)) * (img.naturalHeight || 140));
+        const newId = `img_${Date.now()}`;
         commitState((prev) => ({
           ...prev,
           addedImages: [
             ...prev.addedImages,
             {
-              id: `img_${Date.now()}`,
+              id: newId,
               pageNumber,
               dataUrl,
               x: 80,
@@ -487,6 +604,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             },
           ],
         }));
+        setSelectedImageId(newId);
       };
       img.src = dataUrl;
     };
@@ -589,7 +707,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   ];
 
   return (
-    <div className="fixed inset-0 z-40 flex flex-col bg-[#E2E8F0] dark:bg-[#0B1120]">
+    <div ref={editorRootRef} className="fixed inset-0 z-40 flex flex-col bg-[#E2E8F0] dark:bg-[#0B1120]">
       {/* Header */}
       <header className="flex items-center justify-between gap-2 px-3 py-2 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 shrink-0">
         <div className="flex items-center gap-1 min-w-0">
@@ -646,14 +764,35 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         </div>
       </header>
 
-      {/* Genuine Text Layer Diagnostic Banner */}
+      {/* Genuine Text Layer Diagnostic Banner & Zoom */}
       <div className="px-3 py-1.5 bg-slate-100 dark:bg-slate-900/70 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2 text-[11px] text-slate-600 dark:text-slate-300">
         <span className="truncate">
           {textRuns.length > 0 ? t.editor.nativeTextDetected : t.editor.scannedOnlyNotice}
         </span>
-        {statusMessage && (
-          <span className="font-semibold text-[#2563EB] shrink-0">{statusMessage}</span>
-        )}
+        <div className="flex items-center gap-1.5 shrink-0">
+          {statusMessage && (
+            <span className="font-semibold text-[#2563EB] mr-1">{statusMessage}</span>
+          )}
+          <button
+            type="button"
+            onClick={() => setScale((s) => Math.max(0.4, Number((s - 0.15).toFixed(2))))}
+            aria-label="Zoom out PDF"
+            className="h-7 w-7 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-center"
+          >
+            <ZoomOut className="w-3.5 h-3.5" />
+          </button>
+          <span className="font-mono-nums text-[11px] min-w-[38px] text-center">
+            {Math.round(scale * 100)}%
+          </span>
+          <button
+            type="button"
+            onClick={() => setScale((s) => Math.min(3.0, Number((s + 0.15).toFixed(2))))}
+            aria-label="Zoom in PDF"
+            className="h-7 w-7 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 flex items-center justify-center"
+          >
+            <ZoomIn className="w-3.5 h-3.5" />
+          </button>
+        </div>
       </div>
 
       {/* Selected Image Manipulation Toolbar */}
@@ -784,12 +923,13 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 );
               })}
 
-            {/* Added text boxes (drag to move, tap × to delete) */}
+            {/* Added text boxes (drag to move, tap or pencil to edit, tap × to delete) */}
             {pageAddedTexts.map((tb) => (
               <div
                 key={tb.id}
                 onPointerDown={(e) => {
                   e.stopPropagation();
+                  pointerMovedRef.current = false;
                   overlayRef.current?.setPointerCapture?.(e.pointerId);
                   setDraggingItem({
                     kind: 'textBox',
@@ -812,9 +952,22 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   textAlign: tb.align,
                   letterSpacing: `${tb.letterSpacing * scale}px`,
                 }}
-                className="group absolute px-1.5 py-0.5 rounded border border-dashed border-[#2563EB]/60 bg-white/85 whitespace-pre-wrap cursor-move"
+                title="Drag to move · Tap to edit text"
+                className="group absolute px-1.5 py-0.5 rounded border border-dashed border-[#2563EB]/70 bg-white/90 whitespace-pre-wrap cursor-move"
               >
                 {tb.text}
+                <button
+                  type="button"
+                  onPointerDown={(e) => e.stopPropagation()}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    openEditAddedTextBox(tb);
+                  }}
+                  aria-label="Edit text box"
+                  className="absolute -top-2.5 right-3.5 w-5 h-5 rounded-full bg-[#2563EB] text-white flex items-center justify-center shadow"
+                >
+                  <Pencil className="w-2.5 h-2.5" />
+                </button>
                 <button
                   type="button"
                   onPointerDown={(e) => e.stopPropagation()}
@@ -833,37 +986,99 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               </div>
             ))}
 
-            {/* Added images (drag to move, tap to select) */}
-            {pageAddedImages.map((im) => (
-              <img
-                key={im.id}
-                src={im.dataUrl}
-                alt="Inserted"
-                onPointerDown={(e) => {
-                  e.stopPropagation();
-                  setSelectedImageId(im.id);
-                  overlayRef.current?.setPointerCapture?.(e.pointerId);
-                  setDraggingItem({
-                    kind: 'image',
-                    id: im.id,
-                    startClientX: e.clientX,
-                    startClientY: e.clientY,
-                    origX: im.x,
-                    origY: im.y,
-                  });
-                }}
-                style={{
-                  left: im.x * scale,
-                  top: im.y * scale,
-                  width: im.width * scale,
-                  height: im.height * scale,
-                  transform: `rotate(${im.rotation}deg)`,
-                }}
-                className={`absolute object-contain cursor-move ${
-                  selectedImageId === im.id ? 'ring-2 ring-[#2563EB]' : ''
-                }`}
-              />
-            ))}
+            {/* Added images (drag to move, drag corners to resize, tap × to delete) */}
+            {pageAddedImages.map((im) => {
+              const isSelected = selectedImageId === im.id;
+              return (
+                <div
+                  key={im.id}
+                  onPointerDown={(e) => {
+                    e.stopPropagation();
+                    pointerMovedRef.current = false;
+                    setSelectedImageId(im.id);
+                    overlayRef.current?.setPointerCapture?.(e.pointerId);
+                    setDraggingItem({
+                      kind: 'image',
+                      id: im.id,
+                      startClientX: e.clientX,
+                      startClientY: e.clientY,
+                      origX: im.x,
+                      origY: im.y,
+                    });
+                  }}
+                  style={{
+                    left: im.x * scale,
+                    top: im.y * scale,
+                    width: im.width * scale,
+                    height: im.height * scale,
+                  }}
+                  className={`group absolute cursor-move select-none ${
+                    isSelected ? 'ring-2 ring-[#2563EB]' : 'hover:ring-1 hover:ring-[#2563EB]/60'
+                  }`}
+                >
+                  <img
+                    src={im.dataUrl}
+                    alt="Inserted"
+                    draggable={false}
+                    style={{ transform: `rotate(${im.rotation}deg)` }}
+                    className="w-full h-full object-contain pointer-events-none block"
+                  />
+
+                  {/* Direct on-image Delete button */}
+                  <button
+                    type="button"
+                    onPointerDown={(e) => e.stopPropagation()}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      commitState((prev) => ({
+                        ...prev,
+                        addedImages: prev.addedImages.filter((x) => x.id !== im.id),
+                      }));
+                      if (isSelected) setSelectedImageId(null);
+                    }}
+                    aria-label="Delete image"
+                    className="absolute -top-2.5 -right-2.5 z-20 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+
+                  {/* 4 Corner Drag-Resize Handles (drag inward/outward to resize) */}
+                  {(['nw', 'ne', 'sw', 'se'] as const).map((corner) => {
+                    const posClass =
+                      corner === 'nw'
+                        ? '-top-1.5 -left-1.5 cursor-nwse-resize'
+                        : corner === 'ne'
+                        ? '-top-1.5 -right-1.5 cursor-nesw-resize'
+                        : corner === 'sw'
+                        ? '-bottom-1.5 -left-1.5 cursor-nesw-resize'
+                        : '-bottom-1.5 -right-1.5 cursor-nwse-resize';
+                    if (corner === 'ne') return null; // top-right hosts delete button
+                    return (
+                      <div
+                        key={corner}
+                        onPointerDown={(e) => {
+                          e.stopPropagation();
+                          setSelectedImageId(im.id);
+                          overlayRef.current?.setPointerCapture?.(e.pointerId);
+                          setResizingImage({
+                            id: im.id,
+                            corner,
+                            startClientX: e.clientX,
+                            startClientY: e.clientY,
+                            origX: im.x,
+                            origY: im.y,
+                            origW: im.width,
+                            origH: im.height,
+                          });
+                        }}
+                        title="Drag to resize picture"
+                        className={`absolute ${posClass} z-10 w-4 h-4 rounded-full bg-white border-2 border-[#2563EB] shadow`}
+                      />
+                    );
+                  })}
+                </div>
+              );
+            })}
 
             {/* Annotations SVG & HTML preview */}
             <svg
@@ -1001,6 +1216,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               .map((ann) => {
                 const startDrag = (e: React.PointerEvent) => {
                   e.stopPropagation();
+                  pointerMovedRef.current = false;
                   overlayRef.current?.setPointerCapture?.(e.pointerId);
                   setDraggingItem({
                     kind: 'annotation',
@@ -1030,14 +1246,68 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 );
 
                 if (ann.kind === 'sticky') {
+                  const arrowSide = ann.stickyArrow || 'left';
+                  const cycleOrder: Array<'left' | 'top' | 'right' | 'bottom'> = ['left', 'top', 'right', 'bottom'];
+                  const nextSide = cycleOrder[(cycleOrder.indexOf(arrowSide) + 1) % cycleOrder.length];
                   return (
                     <div
                       key={ann.id}
                       onPointerDown={startDrag}
                       style={{ left: ann.x * scale, top: ann.y * scale, width: 150 * scale }}
-                      className="absolute p-2 rounded-lg bg-amber-100 border border-amber-400 text-[10px] text-slate-900 shadow cursor-move"
+                      title="Drag to move · Tap to edit note"
+                      className="absolute p-2 rounded-lg bg-amber-100 border-2 border-amber-500 text-[10px] text-slate-900 shadow-md cursor-move"
                     >
-                      {ann.comment}
+                      {/* Callout Arrow Indicator */}
+                      {arrowSide === 'left' && (
+                        <div className="pointer-events-none absolute top-1/2 -left-5 -translate-y-1/2 flex items-center">
+                          <svg width="20" height="14" viewBox="0 0 20 14" className="drop-shadow-sm">
+                            <path d="M 20 7 L 2 7 M 8 2 L 2 7 L 8 12" stroke="#D97706" strokeWidth="2.4" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </div>
+                      )}
+                      {arrowSide === 'right' && (
+                        <div className="pointer-events-none absolute top-1/2 -right-5 -translate-y-1/2 flex items-center">
+                          <svg width="20" height="14" viewBox="0 0 20 14" className="drop-shadow-sm">
+                            <path d="M 0 7 L 18 7 M 12 2 L 18 7 L 12 12" stroke="#D97706" strokeWidth="2.4" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </div>
+                      )}
+                      {arrowSide === 'top' && (
+                        <div className="pointer-events-none absolute -top-5 left-1/2 -translate-x-1/2 flex justify-center">
+                          <svg width="14" height="20" viewBox="0 0 14 20" className="drop-shadow-sm">
+                            <path d="M 7 20 L 7 2 M 2 8 L 7 2 L 12 8" stroke="#D97706" strokeWidth="2.4" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </div>
+                      )}
+                      {arrowSide === 'bottom' && (
+                        <div className="pointer-events-none absolute -bottom-5 left-1/2 -translate-x-1/2 flex justify-center">
+                          <svg width="14" height="20" viewBox="0 0 14 20" className="drop-shadow-sm">
+                            <path d="M 7 0 L 7 18 M 2 12 L 7 18 L 12 12" stroke="#D97706" strokeWidth="2.4" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+                          </svg>
+                        </div>
+                      )}
+
+                      <div className="flex items-start justify-between gap-1">
+                        <span className="leading-snug break-words">{ann.comment}</span>
+                      </div>
+
+                      <button
+                        type="button"
+                        onPointerDown={(e) => e.stopPropagation()}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          commitState((prev) => ({
+                            ...prev,
+                            annotations: prev.annotations.map((x) =>
+                              x.id === ann.id ? { ...x, stickyArrow: nextSide } : x
+                            ),
+                          }));
+                        }}
+                        title="Change arrow pointer direction"
+                        className="absolute -top-2.5 right-3.5 w-5 h-5 rounded-full bg-amber-500 text-white text-[9px] font-bold flex items-center justify-center shadow"
+                      >
+                        {arrowSide === 'left' ? '←' : arrowSide === 'right' ? '→' : arrowSide === 'top' ? '↑' : '↓'}
+                      </button>
                       {removeBtn}
                     </div>
                   );
@@ -1310,16 +1580,19 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         </div>
       )}
 
-      {/* Add New Text Box Modal */}
+      {/* Add / Edit Text Box Modal */}
       {addingBoxPos && (
         <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-sm">
           <div className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
-                Add Text Box
+                {editingBoxId ? 'Edit Text Box' : 'Add Text Box'}
               </h3>
               <button
-                onClick={() => setAddingBoxPos(null)}
+                onClick={() => {
+                  setAddingBoxPos(null);
+                  setEditingBoxId(null);
+                }}
                 className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-full"
               >
                 <X className="w-5 h-5" />
@@ -1354,6 +1627,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 className="w-16 h-10 px-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-mono-nums"
               />
               <button
+                type="button"
                 onClick={() => setNewBoxDraft((d) => ({ ...d, bold: !d.bold }))}
                 className={`h-10 w-10 rounded-xl flex items-center justify-center border ${
                   newBoxDraft.bold ? 'bg-[#2563EB] text-white border-[#2563EB]' : 'border-slate-200 dark:border-slate-700'
@@ -1362,12 +1636,22 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 <Bold className="w-4 h-4" />
               </button>
               <button
+                type="button"
                 onClick={() => setNewBoxDraft((d) => ({ ...d, italic: !d.italic }))}
                 className={`h-10 w-10 rounded-xl flex items-center justify-center border ${
                   newBoxDraft.italic ? 'bg-[#2563EB] text-white border-[#2563EB]' : 'border-slate-200 dark:border-slate-700'
                 }`}
               >
                 <Italic className="w-4 h-4" />
+              </button>
+              <button
+                type="button"
+                onClick={() => setNewBoxDraft((d) => ({ ...d, underline: !d.underline }))}
+                className={`h-10 w-10 rounded-xl flex items-center justify-center border ${
+                  newBoxDraft.underline ? 'bg-[#2563EB] text-white border-[#2563EB]' : 'border-slate-200 dark:border-slate-700'
+                }`}
+              >
+                <Underline className="w-4 h-4" />
               </button>
               <input
                 type="color"
@@ -1414,37 +1698,79 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 />
               </label>
             </div>
-            <button
-              onClick={() => {
-                if (!newBoxDraft.text.trim()) return;
-                commitState((prev) => ({
-                  ...prev,
-                  addedTexts: [
-                    ...prev.addedTexts,
-                    {
-                      id: `tb_${Date.now()}`,
-                      pageNumber,
-                      text: newBoxDraft.text,
-                      x: addingBoxPos.x,
-                      y: addingBoxPos.y,
-                      width: 260,
-                      fontSize: newBoxDraft.fontSize,
-                      fontFamily: newBoxDraft.fontFamily,
-                      color: newBoxDraft.color,
-                      bold: newBoxDraft.bold,
-                      italic: newBoxDraft.italic,
-                      underline: newBoxDraft.underline,
-                      align: newBoxDraft.align,
-                      letterSpacing: newBoxDraft.letterSpacing,
-                    },
-                  ],
-                }));
-                setAddingBoxPos(null);
-              }}
-              className="w-full min-h-[46px] rounded-xl bg-[#2563EB] text-white text-sm font-semibold"
-            >
-              Place Text on Page
-            </button>
+            <div className={editingBoxId ? 'grid grid-cols-2 gap-2' : ''}>
+              {editingBoxId && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    commitState((prev) => ({
+                      ...prev,
+                      addedTexts: prev.addedTexts.filter((x) => x.id !== editingBoxId),
+                    }));
+                    setAddingBoxPos(null);
+                    setEditingBoxId(null);
+                  }}
+                  className="min-h-[46px] rounded-xl bg-rose-50 dark:bg-rose-950/50 text-rose-600 dark:text-rose-300 text-sm font-semibold"
+                >
+                  Delete Text
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => {
+                  if (!newBoxDraft.text.trim()) return;
+                  if (editingBoxId) {
+                    commitState((prev) => ({
+                      ...prev,
+                      addedTexts: prev.addedTexts.map((tb) =>
+                        tb.id === editingBoxId
+                          ? {
+                              ...tb,
+                              text: newBoxDraft.text,
+                              fontSize: newBoxDraft.fontSize,
+                              fontFamily: newBoxDraft.fontFamily,
+                              color: newBoxDraft.color,
+                              bold: newBoxDraft.bold,
+                              italic: newBoxDraft.italic,
+                              underline: newBoxDraft.underline,
+                              align: newBoxDraft.align,
+                              letterSpacing: newBoxDraft.letterSpacing,
+                            }
+                          : tb
+                      ),
+                    }));
+                  } else {
+                    commitState((prev) => ({
+                      ...prev,
+                      addedTexts: [
+                        ...prev.addedTexts,
+                        {
+                          id: `tb_${Date.now()}`,
+                          pageNumber,
+                          text: newBoxDraft.text,
+                          x: addingBoxPos.x,
+                          y: addingBoxPos.y,
+                          width: 260,
+                          fontSize: newBoxDraft.fontSize,
+                          fontFamily: newBoxDraft.fontFamily,
+                          color: newBoxDraft.color,
+                          bold: newBoxDraft.bold,
+                          italic: newBoxDraft.italic,
+                          underline: newBoxDraft.underline,
+                          align: newBoxDraft.align,
+                          letterSpacing: newBoxDraft.letterSpacing,
+                        },
+                      ],
+                    }));
+                  }
+                  setAddingBoxPos(null);
+                  setEditingBoxId(null);
+                }}
+                className="w-full min-h-[46px] rounded-xl bg-[#2563EB] text-white text-sm font-semibold"
+              >
+                {editingBoxId ? 'Update Text' : 'Place Text on Page'}
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -1455,9 +1781,15 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           <div className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
-                Add Sticky Note Comment
+                {editingStickyId ? 'Edit Sticky Note' : 'Add Sticky Note Comment'}
               </h3>
-              <button onClick={() => setStickyPos(null)} className="min-h-[40px] min-w-[40px]">
+              <button
+                onClick={() => {
+                  setStickyPos(null);
+                  setEditingStickyId(null);
+                }}
+                className="min-h-[40px] min-w-[40px]"
+              >
                 <X className="w-5 h-5" />
               </button>
             </div>
@@ -1469,31 +1801,68 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               autoFocus
               className="w-full p-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-amber-50 dark:bg-slate-800 text-sm"
             />
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <span className="text-slate-500 font-medium">Arrow Indicator:</span>
+              <div className="flex items-center gap-1">
+                {([
+                  { side: 'left', label: '← Left' },
+                  { side: 'top', label: '↑ Top' },
+                  { side: 'right', label: '→ Right' },
+                  { side: 'bottom', label: '↓ Bottom' },
+                ] as const).map((item) => (
+                  <button
+                    key={item.side}
+                    type="button"
+                    onClick={() => setStickyArrow(item.side)}
+                    className={`px-2.5 py-1.5 rounded-lg font-semibold border ${
+                      stickyArrow === item.side
+                        ? 'bg-amber-500 text-white border-amber-500'
+                        : 'border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                    }`}
+                  >
+                    {item.label}
+                  </button>
+                ))}
+              </div>
+            </div>
             <button
               onClick={() => {
                 if (!stickyText.trim()) return;
-                commitState((prev) => ({
-                  ...prev,
-                  annotations: [
-                    ...prev.annotations,
-                    {
-                      id: `sticky_${Date.now()}`,
-                      pageNumber,
-                      kind: 'sticky',
-                      x: stickyPos.x,
-                      y: stickyPos.y,
-                      width: 150,
-                      height: 54,
-                      color: '#FACC15',
-                      comment: stickyText.trim(),
-                    },
-                  ],
-                }));
+                if (editingStickyId) {
+                  commitState((prev) => ({
+                    ...prev,
+                    annotations: prev.annotations.map((an) =>
+                      an.id === editingStickyId
+                        ? { ...an, comment: stickyText.trim(), stickyArrow }
+                        : an
+                    ),
+                  }));
+                } else {
+                  commitState((prev) => ({
+                    ...prev,
+                    annotations: [
+                      ...prev.annotations,
+                      {
+                        id: `sticky_${Date.now()}`,
+                        pageNumber,
+                        kind: 'sticky',
+                        x: stickyPos.x,
+                        y: stickyPos.y,
+                        width: 150,
+                        height: 54,
+                        color: '#FACC15',
+                        comment: stickyText.trim(),
+                        stickyArrow,
+                      },
+                    ],
+                  }));
+                }
                 setStickyPos(null);
+                setEditingStickyId(null);
               }}
               className="w-full min-h-[46px] rounded-xl bg-[#2563EB] text-white text-sm font-semibold"
             >
-              Add Sticky Note
+              {editingStickyId ? 'Update Sticky Note' : 'Add Sticky Note'}
             </button>
           </div>
         </div>

@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Bookmark,
@@ -23,6 +23,8 @@ import type { AppLanguage, DocumentRecord } from '../types';
 import { getT } from '../i18n/translations';
 import {
   extractDocumentPagesText,
+  extractSinglePageText,
+  getPdfPageDimension,
   renderPageToCanvas,
   rotateAllPages,
 } from '../services/pdfEngine';
@@ -39,47 +41,124 @@ interface PdfViewerViewProps {
   onOpenAI: () => void;
 }
 
-const PageCanvas: React.FC<{
+const LazyPageCanvas: React.FC<{
   pdfBytes: ArrayBuffer;
   pageNumber: number;
   scale: number;
   rotation: number;
   isBookmarked: boolean;
-}> = ({ pdfBytes, pageNumber, scale, rotation, isBookmarked }) => {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const [rendering, setRendering] = useState(true);
+  defaultDims: { width: number; height: number };
+  scrollRoot: HTMLDivElement | null;
+  onBecameCurrent: (pageNumber: number) => void;
+  registerPageRef: (pageNumber: number, el: HTMLDivElement | null) => void;
+  eager?: boolean;
+}> = React.memo(
+  ({
+    pdfBytes,
+    pageNumber,
+    scale,
+    rotation,
+    isBookmarked,
+    defaultDims,
+    scrollRoot,
+    onBecameCurrent,
+    registerPageRef,
+    eager = false,
+  }) => {
+    const wrapperRef = useRef<HTMLDivElement | null>(null);
+    const canvasRef = useRef<HTMLCanvasElement | null>(null);
+    const [shouldRender, setShouldRender] = useState(eager);
+    const [rendering, setRendering] = useState(eager);
+    const [dims, setDims] = useState<{ width: number; height: number }>(defaultDims);
 
-  useEffect(() => {
-    let active = true;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    setRendering(true);
-    renderPageToCanvas(pdfBytes, pageNumber, canvas, scale, rotation)
-      .catch(() => {})
-      .finally(() => {
-        if (active) setRendering(false);
-      });
-    return () => {
-      active = false;
-    };
-  }, [pdfBytes, pageNumber, scale, rotation]);
+    useEffect(() => {
+      setDims(defaultDims);
+    }, [defaultDims.width, defaultDims.height]);
 
-  return (
-    <div className="relative mx-auto my-3 bg-white shadow-md rounded-lg overflow-hidden border border-slate-200 dark:border-slate-700 w-fit">
-      {rendering && (
-        <div className="absolute inset-0 bg-slate-100/60 dark:bg-slate-800/60 animate-pulse flex items-center justify-center z-10">
-          <span className="text-xs font-mono-nums text-slate-500">Page {pageNumber}</span>
-        </div>
-      )}
-      {isBookmarked && (
-        <div className="absolute top-2 right-2 z-20 p-1.5 rounded-lg bg-[#2563EB] text-white shadow">
-          <Bookmark className="w-3.5 h-3.5 fill-current" />
-        </div>
-      )}
-      <canvas ref={canvasRef} className="block max-w-full" />
-    </div>
-  );
-};
+    useEffect(() => {
+      if (eager) {
+        setShouldRender(true);
+        return;
+      }
+      const el = wrapperRef.current;
+      if (!el) return;
+
+      const renderObserver = new IntersectionObserver(
+        (entries) => {
+          const entry = entries[0];
+          if (entry) {
+            setShouldRender(entry.isIntersecting);
+          }
+        },
+        { root: scrollRoot, rootMargin: '950px 0px' }
+      );
+      renderObserver.observe(el);
+
+      const currentObserver = new IntersectionObserver(
+        (entries) => {
+          const entry = entries[0];
+          if (entry && entry.isIntersecting) {
+            onBecameCurrent(pageNumber);
+          }
+        },
+        { root: scrollRoot, threshold: 0.45 }
+      );
+      currentObserver.observe(el);
+
+      return () => {
+        renderObserver.disconnect();
+        currentObserver.disconnect();
+      };
+    }, [eager, pageNumber, scrollRoot, onBecameCurrent]);
+
+    useEffect(() => {
+      if (!shouldRender) return;
+      let active = true;
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+      setRendering(true);
+      renderPageToCanvas(pdfBytes, pageNumber, canvas, scale, rotation)
+        .then((res) => {
+          if (active && res.unscaledWidth > 0 && res.unscaledHeight > 0) {
+            setDims({ width: res.unscaledWidth, height: res.unscaledHeight });
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          if (active) setRendering(false);
+        });
+      return () => {
+        active = false;
+      };
+    }, [shouldRender, pdfBytes, pageNumber, scale, rotation]);
+
+    const boxW = Math.max(120, Math.floor(dims.width * scale));
+    const boxH = Math.max(160, Math.floor(dims.height * scale));
+
+    return (
+      <div
+        ref={(el) => {
+          wrapperRef.current = el;
+          registerPageRef(pageNumber, el);
+        }}
+        style={{ width: boxW, minHeight: boxH }}
+        className="relative mx-auto my-3 bg-white shadow-md rounded-lg overflow-hidden border border-slate-200 dark:border-slate-700 shrink-0"
+      >
+        {(!shouldRender || rendering) && (
+          <div className="absolute inset-0 bg-slate-100/70 dark:bg-slate-800/70 flex items-center justify-center z-10 pointer-events-none">
+            <span className="text-xs font-mono-nums text-slate-500">Page {pageNumber}</span>
+          </div>
+        )}
+        {isBookmarked && (
+          <div className="absolute top-2 right-2 z-20 p-1.5 rounded-lg bg-[#2563EB] text-white shadow">
+            <Bookmark className="w-3.5 h-3.5 fill-current" />
+          </div>
+        )}
+        {shouldRender && <canvas ref={canvasRef} className="block" />}
+      </div>
+    );
+  }
+);
 
 export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
   doc,
@@ -94,29 +173,122 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
   const t = getT(language);
   const [viewMode, setViewMode] = useState<'continuous' | 'single'>(defaultViewMode);
   const [currentPage, setCurrentPage] = useState(1);
-  const [scale, setScale] = useState(1.0);
+  const [pageJumpInput, setPageJumpInput] = useState('1');
+  const [scale, setScale] = useState<number>(() => {
+    const w = typeof window !== 'undefined' ? window.innerWidth : 1024;
+    return w < 640 ? Math.max(0.55, Math.min(1.0, (w - 32) / 595)) : 1.05;
+  });
   const [extraRotation, setExtraRotation] = useState(0);
+  const [defaultPageDims, setDefaultPageDims] = useState({ width: 595, height: 842 });
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [pageTexts, setPageTexts] = useState<Array<{ pageNumber: number; text: string }>>([]);
+  const [indexingSearch, setIndexingSearch] = useState(false);
   const [searchMatches, setSearchMatches] = useState<number[]>([]);
   const [showTextModal, setShowTextModal] = useState(false);
+  const [currentPageText, setCurrentPageText] = useState('');
   const [copiedNotice, setCopiedNotice] = useState(false);
+  const [scrollRootEl, setScrollRootEl] = useState<HTMLDivElement | null>(null);
+
+  const viewerRootRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const pinchStartDist = useRef<number | null>(null);
   const pinchStartScale = useRef<number>(1);
 
-  useEffect(() => {
-    // Fit nicely to mobile viewport width on mount
-    const w = window.innerWidth;
-    if (w < 640) {
-      setScale(Math.max(0.55, Math.min(1.0, (w - 32) / 595)));
+  const registerPageRef = useCallback((pNum: number, el: HTMLDivElement | null) => {
+    if (el) {
+      pageRefs.current.set(pNum, el);
     } else {
-      setScale(1.1);
+      pageRefs.current.delete(pNum);
     }
-    extractDocumentPagesText(doc.pdfBytes).then(setPageTexts).catch(() => {});
-  }, [doc.id, doc.pdfBytes]);
+  }, []);
+
+  useEffect(() => {
+    setPageJumpInput(String(currentPage));
+  }, [currentPage]);
+
+  // Read page 1 dimensions once for accurate placeholder geometry across large PDFs
+  useEffect(() => {
+    let active = true;
+    setPageTexts([]);
+    getPdfPageDimension(doc.pdfBytes, 1, extraRotation)
+      .then((dims) => {
+        if (active) setDefaultPageDims(dims);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [doc.id, doc.pdfBytes, extraRotation]);
+
+  // Intercept Ctrl+Wheel / Cmd+Wheel on the entire viewer so ONLY the PDF zooms, never the browser UI
+  useEffect(() => {
+    const root = viewerRootRef.current;
+    if (!root) return;
+    const handleWheel = (e: WheelEvent) => {
+      if (e.ctrlKey || e.metaKey) {
+        e.preventDefault();
+        e.stopPropagation();
+        const step = e.deltaY < 0 ? 0.1 : -0.1;
+        setScale((s) => Math.max(0.35, Math.min(3.5, Number((s + step).toFixed(2)))));
+      }
+    };
+    root.addEventListener('wheel', handleWheel, { passive: false });
+    return () => root.removeEventListener('wheel', handleWheel);
+  }, []);
+
+  // Lazy-extract all page texts only when user opens search
+  useEffect(() => {
+    if (!showSearch || pageTexts.length > 0) return;
+    let active = true;
+    setIndexingSearch(true);
+    extractDocumentPagesText(doc.pdfBytes)
+      .then((texts) => {
+        if (active) setPageTexts(texts);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (active) setIndexingSearch(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [showSearch, pageTexts.length, doc.pdfBytes]);
+
+  // Extract current page text on demand when Copy Text modal opens
+  useEffect(() => {
+    if (!showTextModal) return;
+    let active = true;
+    const cached = pageTexts.find((p) => p.pageNumber === currentPage)?.text;
+    if (cached !== undefined) {
+      setCurrentPageText(cached);
+      return;
+    }
+    extractSinglePageText(doc.pdfBytes, currentPage)
+      .then((txt) => {
+        if (active) setCurrentPageText(txt);
+      })
+      .catch(() => {
+        if (active) setCurrentPageText('');
+      });
+    return () => {
+      active = false;
+    };
+  }, [showTextModal, currentPage, doc.pdfBytes, pageTexts]);
+
+  const jumpToPage = useCallback(
+    (targetPage: number) => {
+      const safe = Math.max(1, Math.min(doc.pageCount, targetPage));
+      setCurrentPage(safe);
+      if (viewMode === 'continuous') {
+        const el = pageRefs.current.get(safe);
+        el?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    },
+    [doc.pageCount, viewMode]
+  );
 
   useEffect(() => {
     if (!searchQuery.trim()) {
@@ -129,7 +301,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
       .map((p) => p.pageNumber);
     setSearchMatches(hits);
     if (hits.length > 0 && !hits.includes(currentPage)) {
-      setCurrentPage(hits[0]);
+      jumpToPage(hits[0]);
     }
   }, [searchQuery, pageTexts]);
 
@@ -158,12 +330,12 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
 
   const handleFitWidth = () => {
     const cw = containerRef.current?.clientWidth || window.innerWidth;
-    setScale(Math.max(0.5, Math.min(2.2, (cw - 32) / 595)));
+    setScale(Math.max(0.35, Math.min(3.0, Number(((cw - 32) / defaultPageDims.width).toFixed(2)))));
   };
 
   const handleFitPage = () => {
     const ch = containerRef.current?.clientHeight || window.innerHeight - 160;
-    setScale(Math.max(0.45, Math.min(2.0, (ch - 32) / 842)));
+    setScale(Math.max(0.35, Math.min(3.0, Number(((ch - 32) / defaultPageDims.height).toFixed(2)))));
   };
 
   const handlePrint = () => {
@@ -216,7 +388,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
       const dy = e.touches[0].clientY - e.touches[1].clientY;
       const dist = Math.hypot(dx, dy);
       const ratio = dist / pinchStartDist.current;
-      setScale(Math.max(0.45, Math.min(2.8, Number((pinchStartScale.current * ratio).toFixed(2)))));
+      setScale(Math.max(0.35, Math.min(3.5, Number((pinchStartScale.current * ratio).toFixed(2)))));
     }
   };
 
@@ -224,10 +396,8 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
     pinchStartDist.current = null;
   };
 
-  const currentPageText = pageTexts.find((p) => p.pageNumber === currentPage)?.text || '';
-
   return (
-    <div className="fixed inset-0 z-40 flex flex-col bg-[#F1F5F9] dark:bg-[#0B1120]">
+    <div ref={viewerRootRef} className="fixed inset-0 z-40 flex flex-col bg-[#F1F5F9] dark:bg-[#0B1120]">
       {/* Top Bar */}
       {!isFullscreen && (
         <header className="flex items-center justify-between gap-2 px-3 py-2 bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-b border-slate-200 dark:border-slate-800 shrink-0">
@@ -243,9 +413,36 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
               <h1 className="text-sm font-bold text-[#142B4A] dark:text-white truncate max-w-[180px] sm:max-w-xs">
                 {doc.name}
               </h1>
-              <p className="text-[11px] font-mono-nums text-slate-500">
-                {t.viewer.page} {currentPage} {t.viewer.of} {doc.pageCount} · {Math.round(scale * 100)}%
-              </p>
+              <form
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  const parsed = parseInt(pageJumpInput, 10);
+                  if (!Number.isNaN(parsed)) jumpToPage(parsed);
+                }}
+                className="flex items-center gap-1 text-[11px] font-mono-nums text-slate-500"
+              >
+                <span>{t.viewer.page}</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={doc.pageCount}
+                  value={pageJumpInput}
+                  onChange={(e) => setPageJumpInput(e.target.value)}
+                  onBlur={() => {
+                    const parsed = parseInt(pageJumpInput, 10);
+                    if (!Number.isNaN(parsed) && parsed !== currentPage) {
+                      jumpToPage(parsed);
+                    } else {
+                      setPageJumpInput(String(currentPage));
+                    }
+                  }}
+                  aria-label="Jump to page number"
+                  className="w-11 px-1 py-0.5 text-center rounded bg-slate-100 dark:bg-slate-800 text-slate-800 dark:text-slate-200 border border-slate-200 dark:border-slate-700"
+                />
+                <span>
+                  {t.viewer.of} {doc.pageCount} · {Math.round(scale * 100)}%
+                </span>
+              </form>
             </div>
           </div>
 
@@ -298,7 +495,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
             type="text"
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder={t.viewer.searchInPdf}
+            placeholder={indexingSearch ? 'Indexing pages for search...' : t.viewer.searchInPdf}
             autoFocus
             className="flex-1 min-h-[38px] bg-transparent text-sm text-slate-900 dark:text-white focus:outline-none"
           />
@@ -312,7 +509,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
               {searchMatches.slice(0, 5).map((p) => (
                 <button
                   key={p}
-                  onClick={() => setCurrentPage(p)}
+                  onClick={() => jumpToPage(p)}
                   className={`px-2 py-1 rounded-md text-xs font-mono-nums font-semibold ${
                     currentPage === p
                       ? 'bg-[#2563EB] text-white'
@@ -363,14 +560,14 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
           </div>
 
           <button
-            onClick={() => setScale((s) => Math.max(0.45, Number((s - 0.15).toFixed(2))))}
+            onClick={() => setScale((s) => Math.max(0.35, Number((s - 0.15).toFixed(2))))}
             aria-label="Zoom out"
             className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 shrink-0"
           >
             <ZoomOut className="w-4 h-4" />
           </button>
           <button
-            onClick={() => setScale((s) => Math.min(2.8, Number((s + 0.15).toFixed(2))))}
+            onClick={() => setScale((s) => Math.min(3.5, Number((s + 0.15).toFixed(2))))}
             aria-label="Zoom in"
             className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 shrink-0"
           >
@@ -429,10 +626,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
           {bookmarks.map((bp) => (
             <button
               key={bp}
-              onClick={() => {
-                setViewMode('single');
-                setCurrentPage(bp);
-              }}
+              onClick={() => jumpToPage(bp)}
               className={`px-2 py-0.5 rounded-md text-[11px] font-mono-nums font-semibold shrink-0 ${
                 currentPage === bp
                   ? 'bg-[#2563EB] text-white'
@@ -458,7 +652,10 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
 
       {/* PDF Canvas Viewport */}
       <div
-        ref={containerRef}
+        ref={(el) => {
+          containerRef.current = el;
+          setScrollRootEl(el);
+        }}
         onTouchStart={handleTouchStart}
         onTouchMove={handleTouchMove}
         onTouchEnd={handleTouchEnd}
@@ -466,26 +663,35 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
       >
         {viewMode === 'single' ? (
           <div className="flex flex-col items-center">
-            <PageCanvas
+            <LazyPageCanvas
               pdfBytes={doc.pdfBytes}
               pageNumber={currentPage}
               scale={scale}
               rotation={extraRotation}
               isBookmarked={isCurrentBookmarked}
+              defaultDims={defaultPageDims}
+              scrollRoot={scrollRootEl}
+              onBecameCurrent={setCurrentPage}
+              registerPageRef={registerPageRef}
+              eager
             />
           </div>
         ) : (
           <div className="flex flex-col items-center">
             {Array.from({ length: doc.pageCount }, (_, i) => i + 1).map((pNum) => (
-              <div key={pNum} onClick={() => setCurrentPage(pNum)}>
-                <PageCanvas
-                  pdfBytes={doc.pdfBytes}
-                  pageNumber={pNum}
-                  scale={scale}
-                  rotation={extraRotation}
-                  isBookmarked={bookmarks.includes(pNum)}
-                />
-              </div>
+              <LazyPageCanvas
+                key={pNum}
+                pdfBytes={doc.pdfBytes}
+                pageNumber={pNum}
+                scale={scale}
+                rotation={extraRotation}
+                isBookmarked={bookmarks.includes(pNum)}
+                defaultDims={defaultPageDims}
+                scrollRoot={scrollRootEl}
+                onBecameCurrent={setCurrentPage}
+                registerPageRef={registerPageRef}
+                eager={pNum <= 2}
+              />
             ))}
           </div>
         )}
@@ -494,10 +700,10 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
       {/* Bottom Action & Page Navigation Bar */}
       {!isFullscreen && (
         <footer className="bg-white/95 dark:bg-slate-900/95 backdrop-blur-md border-t border-slate-200 dark:border-slate-800 px-3 py-2 pb-safe shrink-0">
-          {viewMode === 'single' && doc.pageCount > 1 && (
+          {doc.pageCount > 1 && (
             <div className="flex items-center justify-between gap-3 pb-2 mb-2 border-b border-slate-100 dark:border-slate-800">
               <button
-                onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                onClick={() => jumpToPage(currentPage - 1)}
                 disabled={currentPage <= 1}
                 className="min-h-[40px] min-w-[44px] flex items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800 disabled:opacity-40"
               >
@@ -508,11 +714,11 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
                 min={1}
                 max={doc.pageCount}
                 value={currentPage}
-                onChange={(e) => setCurrentPage(Number(e.target.value))}
+                onChange={(e) => jumpToPage(Number(e.target.value))}
                 className="flex-1 accent-[#2563EB]"
               />
               <button
-                onClick={() => setCurrentPage((p) => Math.min(doc.pageCount, p + 1))}
+                onClick={() => jumpToPage(currentPage + 1)}
                 disabled={currentPage >= doc.pageCount}
                 className="min-h-[40px] min-w-[44px] flex items-center justify-center rounded-xl bg-slate-100 dark:bg-slate-800 disabled:opacity-40"
               >

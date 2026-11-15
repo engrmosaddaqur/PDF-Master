@@ -196,6 +196,7 @@ export interface AnnotationOverlay {
   strokeWidth?: number;
   points?: Array<{ x: number; y: number }>;
   comment?: string;
+  stickyArrow?: 'left' | 'right' | 'top' | 'bottom';
   author?: string;
   dateStr?: string;
   signatureDataUrl?: string;

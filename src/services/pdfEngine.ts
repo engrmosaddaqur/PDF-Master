@@ -159,16 +159,40 @@ async function renderUnicodeTextPng(opts: {
   return { pngBytes: bytes, widthPt, heightPt };
 }
 
+// Cache a single PDFDocumentProxy per ArrayBuffer so 150+ page PDFs are parsed once instead of per-page
+const pdfDocCache = new WeakMap<ArrayBuffer, Promise<pdfjsLib.PDFDocumentProxy>>();
+const activeCanvasTasks = new WeakMap<HTMLCanvasElement, pdfjsLib.RenderTask>();
+const canvasRenderQueues = new WeakMap<HTMLCanvasElement, Promise<void>>();
+
+export async function getSharedPdfDocument(
+  pdfBytes: ArrayBuffer
+): Promise<pdfjsLib.PDFDocumentProxy> {
+  let cached = pdfDocCache.get(pdfBytes);
+  if (!cached) {
+    const task = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(pdfBytes)) });
+    cached = task.promise.catch((err) => {
+      pdfDocCache.delete(pdfBytes);
+      throw err;
+    });
+    pdfDocCache.set(pdfBytes, cached);
+  }
+  return cached;
+}
+
 export async function getPdfDocumentInfo(
   pdfBytes: ArrayBuffer,
   password?: string
 ): Promise<{ pageCount: number; title?: string; author?: string; subject?: string; keywords?: string }> {
-  const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(pdfBytes)), password });
-  const pdf = await loadingTask.promise;
+  let loadingTask: pdfjsLib.PDFDocumentLoadingTask | null = null;
+  const pdf = password
+    ? await (loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(pdfBytes)), password })).promise
+    : await getSharedPdfDocument(pdfBytes);
   const meta = await pdf.getMetadata().catch(() => null);
   const info = (meta?.info ?? {}) as Record<string, unknown>;
   const pageCount = pdf.numPages;
-  await loadingTask.destroy();
+  if (loadingTask) {
+    await loadingTask.destroy();
+  }
   return {
     pageCount,
     title: typeof info.Title === 'string' ? info.Title : undefined,
@@ -178,6 +202,19 @@ export async function getPdfDocumentInfo(
   };
 }
 
+export async function getPdfPageDimension(
+  pdfBytes: ArrayBuffer,
+  pageNumber = 1,
+  extraRotation = 0
+): Promise<{ width: number; height: number }> {
+  const pdf = await getSharedPdfDocument(pdfBytes);
+  const safePage = Math.max(1, Math.min(pageNumber, pdf.numPages));
+  const page = await pdf.getPage(safePage);
+  const rot = (((page.rotate || 0) + extraRotation) % 360 + 360) % 360;
+  const vp = page.getViewport({ scale: 1, rotation: rot });
+  return { width: vp.width, height: vp.height };
+}
+
 export async function renderPageToCanvas(
   pdfBytes: ArrayBuffer,
   pageNumber: number,
@@ -185,32 +222,68 @@ export async function renderPageToCanvas(
   scale = 1.5,
   extraRotation = 0
 ): Promise<{ width: number; height: number; unscaledWidth: number; unscaledHeight: number }> {
-  const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(pdfBytes)) });
-  const pdf = await loadingTask.promise;
-  const safePage = Math.max(1, Math.min(pageNumber, pdf.numPages));
-  const page = await pdf.getPage(safePage);
-  const baseViewport = page.getViewport({ scale: 1, rotation: (page.rotate + extraRotation) % 360 });
-  const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
-  const viewport = page.getViewport({ scale: scale * dpr, rotation: (page.rotate + extraRotation) % 360 });
+  // Cancel any in-flight PDF.js render on this exact canvas so transforms never stack/flip
+  const prevTask = activeCanvasTasks.get(canvas);
+  if (prevTask) {
+    try {
+      prevTask.cancel();
+    } catch {
+      // ignore cancellation error
+    }
+  }
 
-  canvas.width = Math.floor(viewport.width);
-  canvas.height = Math.floor(viewport.height);
-  canvas.style.width = `${Math.floor(baseViewport.width * scale)}px`;
-  canvas.style.height = `${Math.floor(baseViewport.height * scale)}px`;
+  const prevQueue = canvasRenderQueues.get(canvas) || Promise.resolve();
+  let resultDims = { width: 0, height: 0, unscaledWidth: 595, unscaledHeight: 842 };
 
-  const ctx = canvas.getContext('2d')!;
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const currentRun = prevQueue
+    .catch(() => {})
+    .then(async () => {
+      const pdf = await getSharedPdfDocument(pdfBytes);
+      const safePage = Math.max(1, Math.min(pageNumber, pdf.numPages));
+      const page = await pdf.getPage(safePage);
+      const rot = (((page.rotate || 0) + extraRotation) % 360 + 360) % 360;
+      const baseViewport = page.getViewport({ scale: 1, rotation: rot });
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const viewport = page.getViewport({ scale: scale * dpr, rotation: rot });
 
-  await page.render({ canvasContext: ctx, viewport, canvas }).promise;
-  await loadingTask.destroy();
+      const displayW = Math.max(1, Math.floor(baseViewport.width * scale));
+      const displayH = Math.max(1, Math.floor(baseViewport.height * scale));
+      canvas.width = Math.max(1, Math.floor(viewport.width));
+      canvas.height = Math.max(1, Math.floor(viewport.height));
+      canvas.style.width = `${displayW}px`;
+      canvas.style.height = `${displayH}px`;
 
-  return {
-    width: Math.floor(baseViewport.width * scale),
-    height: Math.floor(baseViewport.height * scale),
-    unscaledWidth: baseViewport.width,
-    unscaledHeight: baseViewport.height,
-  };
+      const ctx = canvas.getContext('2d')!;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      const renderTask = page.render({ canvasContext: ctx, viewport, canvas });
+      activeCanvasTasks.set(canvas, renderTask);
+      try {
+        await renderTask.promise;
+      } catch (err: unknown) {
+        const name = (err as { name?: string })?.name;
+        if (name !== 'RenderingCancelledException') {
+          throw err;
+        }
+      } finally {
+        if (activeCanvasTasks.get(canvas) === renderTask) {
+          activeCanvasTasks.delete(canvas);
+        }
+      }
+
+      resultDims = {
+        width: displayW,
+        height: displayH,
+        unscaledWidth: baseViewport.width,
+        unscaledHeight: baseViewport.height,
+      };
+    });
+
+  canvasRenderQueues.set(canvas, currentRun);
+  await currentRun;
+  return resultDims;
 }
 
 export async function renderPageThumbnail(
@@ -218,8 +291,7 @@ export async function renderPageThumbnail(
   pageNumber = 1,
   targetWidth = 220
 ): Promise<string> {
-  const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(pdfBytes)) });
-  const pdf = await loadingTask.promise;
+  const pdf = await getSharedPdfDocument(pdfBytes);
   const page = await pdf.getPage(Math.min(pageNumber, pdf.numPages));
   const vp1 = page.getViewport({ scale: 1 });
   const scale = targetWidth / vp1.width;
@@ -232,7 +304,6 @@ export async function renderPageThumbnail(
   ctx.fillStyle = '#FFFFFF';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   await page.render({ canvasContext: ctx, viewport, canvas }).promise;
-  await loadingTask.destroy();
   return canvas.toDataURL('image/jpeg', 0.8);
 }
 
@@ -242,8 +313,7 @@ export async function renderPageToDataUrl(
   scale = 2,
   format: 'image/png' | 'image/jpeg' = 'image/png'
 ): Promise<string> {
-  const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(pdfBytes)) });
-  const pdf = await loadingTask.promise;
+  const pdf = await getSharedPdfDocument(pdfBytes);
   const page = await pdf.getPage(Math.max(1, Math.min(pageNumber, pdf.numPages)));
   const viewport = page.getViewport({ scale });
   const canvas = document.createElement('canvas');
@@ -253,15 +323,38 @@ export async function renderPageToDataUrl(
   ctx.fillStyle = '#FFFFFF';
   ctx.fillRect(0, 0, canvas.width, canvas.height);
   await page.render({ canvasContext: ctx, viewport, canvas }).promise;
-  await loadingTask.destroy();
   return canvas.toDataURL(format, 0.92);
+}
+
+export async function extractSinglePageText(
+  pdfBytes: ArrayBuffer,
+  pageNumber: number
+): Promise<string> {
+  const pdf = await getSharedPdfDocument(pdfBytes);
+  const safePage = Math.max(1, Math.min(pageNumber, pdf.numPages));
+  const page = await pdf.getPage(safePage);
+  const tc = await page.getTextContent();
+  let lastY: number | null = null;
+  let pageStr = '';
+  for (const item of tc.items) {
+    if ('str' in item) {
+      const y = item.transform?.[5] ?? 0;
+      if (lastY !== null && Math.abs(y - lastY) > 4) {
+        pageStr += '\n';
+      } else if (pageStr && !pageStr.endsWith(' ') && !pageStr.endsWith('\n')) {
+        pageStr += ' ';
+      }
+      pageStr += item.str;
+      lastY = y;
+    }
+  }
+  return pageStr.trim();
 }
 
 export async function extractDocumentPagesText(
   pdfBytes: ArrayBuffer
 ): Promise<Array<{ pageNumber: number; text: string }>> {
-  const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(pdfBytes)) });
-  const pdf = await loadingTask.promise;
+  const pdf = await getSharedPdfDocument(pdfBytes);
   const results: Array<{ pageNumber: number; text: string }> = [];
 
   for (let p = 1; p <= pdf.numPages; p++) {
@@ -282,8 +375,10 @@ export async function extractDocumentPagesText(
       }
     }
     results.push({ pageNumber: p, text: pageStr.trim() });
+    if (p % 15 === 0) {
+      await new Promise((r) => setTimeout(r, 0));
+    }
   }
-  await loadingTask.destroy();
   return results;
 }
 
@@ -291,8 +386,7 @@ export async function extractPageTextRuns(
   pdfBytes: ArrayBuffer,
   pageNumber: number
 ): Promise<{ runs: ExtractedTextRun[]; pageWidth: number; pageHeight: number }> {
-  const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(pdfBytes)) });
-  const pdf = await loadingTask.promise;
+  const pdf = await getSharedPdfDocument(pdfBytes);
   const page = await pdf.getPage(Math.max(1, Math.min(pageNumber, pdf.numPages)));
   const viewport = page.getViewport({ scale: 1 });
   const tc = await page.getTextContent();
@@ -320,7 +414,6 @@ export async function extractPageTextRuns(
     });
   });
 
-  await loadingTask.destroy();
   return { runs, pageWidth: viewport.width, pageHeight: viewport.height };
 }
 
@@ -559,15 +652,49 @@ export async function applyPdfEditsToBytes(
         });
       }
     } else if (ann.kind === 'sticky') {
+      const boxW = 150;
+      const boxH = 54;
+      const boxY = pageH - ann.y - boxH;
+      const borderAmber = rgb(0.92, 0.62, 0.08);
       page.drawRectangle({
         x: ann.x,
-        y: pageH - ann.y - 54,
-        width: 150,
-        height: 54,
+        y: boxY,
+        width: boxW,
+        height: boxH,
         color: rgb(1, 0.96, 0.72),
-        borderColor: rgb(0.92, 0.72, 0.12),
-        borderWidth: 1,
+        borderColor: borderAmber,
+        borderWidth: 1.2,
       });
+
+      // Draw callout pointer arrow indicator
+      const arrowSide = ann.stickyArrow || 'left';
+      let stemStart = { x: ann.x, y: boxY + boxH / 2 };
+      let stemEnd = { x: ann.x - 16, y: boxY + boxH / 2 };
+      if (arrowSide === 'right') {
+        stemStart = { x: ann.x + boxW, y: boxY + boxH / 2 };
+        stemEnd = { x: ann.x + boxW + 16, y: boxY + boxH / 2 };
+      } else if (arrowSide === 'top') {
+        stemStart = { x: ann.x + boxW / 2, y: boxY + boxH };
+        stemEnd = { x: ann.x + boxW / 2, y: boxY + boxH + 16 };
+      } else if (arrowSide === 'bottom') {
+        stemStart = { x: ann.x + boxW / 2, y: boxY };
+        stemEnd = { x: ann.x + boxW / 2, y: boxY - 16 };
+      }
+      page.drawLine({ start: stemStart, end: stemEnd, thickness: 2, color: borderAmber });
+      const ang = Math.atan2(stemEnd.y - stemStart.y, stemEnd.x - stemStart.x);
+      page.drawLine({
+        start: stemEnd,
+        end: { x: stemEnd.x - 6 * Math.cos(ang - Math.PI / 5), y: stemEnd.y - 6 * Math.sin(ang - Math.PI / 5) },
+        thickness: 2,
+        color: borderAmber,
+      });
+      page.drawLine({
+        start: stemEnd,
+        end: { x: stemEnd.x - 6 * Math.cos(ang + Math.PI / 5), y: stemEnd.y - 6 * Math.sin(ang + Math.PI / 5) },
+        thickness: 2,
+        color: borderAmber,
+      });
+
       const noteText = (ann.comment || 'Note').slice(0, 80);
       if (hasNonWinAnsiChars(noteText)) {
         const rendered = await renderUnicodeTextPng({

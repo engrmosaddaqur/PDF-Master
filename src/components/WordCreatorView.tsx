@@ -257,11 +257,25 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
     }
   };
 
-  const paperDim = PAPER_DIMENSIONS[settings.paperSize];
-  const aspectRatio =
+  const basePaperDim = PAPER_DIMENSIONS[settings.paperSize];
+  const rawWidthMm =
+    settings.paperSize === 'Custom'
+      ? Math.max(40, settings.customWidthMm || 210)
+      : basePaperDim.widthMm;
+  const rawHeightMm =
+    settings.paperSize === 'Custom'
+      ? Math.max(40, settings.customHeightMm || 297)
+      : basePaperDim.heightMm;
+  const pageWidthMm =
     settings.orientation === 'portrait'
-      ? `${paperDim.widthMm} / ${paperDim.heightMm}`
-      : `${paperDim.heightMm} / ${paperDim.widthMm}`;
+      ? Math.min(rawWidthMm, rawHeightMm)
+      : Math.max(rawWidthMm, rawHeightMm);
+  const pageHeightMm =
+    settings.orientation === 'portrait'
+      ? Math.max(rawWidthMm, rawHeightMm)
+      : Math.min(rawWidthMm, rawHeightMm);
+  const aspectRatio = `${pageWidthMm} / ${pageHeightMm}`;
+  const maxPagePx = settings.orientation === 'portrait' ? 595 : 842;
 
   return (
     <div className="fixed inset-0 z-40 flex flex-col bg-[#E2E8F0] dark:bg-[#0B1120]">
@@ -406,7 +420,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
       </div>
 
       {/* Paper Canvas & Optional Outline */}
-      <div className="flex-1 overflow-auto p-3 sm:p-6 flex justify-center gap-6">
+      <div className="flex-1 overflow-auto p-3 sm:p-6 flex justify-center items-start gap-6">
         {showOutline && (
           <aside className="hidden md:block w-56 shrink-0 bg-white dark:bg-slate-900 rounded-2xl p-4 h-fit border border-slate-200 dark:border-slate-800">
             <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">
@@ -426,7 +440,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
           </aside>
         )}
 
-        <div className="w-full max-w-[720px] flex flex-col items-center">
+        <div className="w-full flex flex-col items-center shrink-0" style={{ maxWidth: `${maxPagePx}px` }}>
           {savedNotice && (
             <div className="mb-3 px-4 py-2 rounded-xl bg-emerald-600 text-white text-xs font-semibold shadow">
               {savedNotice}
@@ -434,15 +448,14 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
           )}
 
           <div
-            className="w-full rounded-md shadow-xl transition-colors flex flex-col justify-between"
+            className="w-full rounded-md shadow-xl transition-colors flex flex-col justify-between box-border"
             style={{
               backgroundColor: settings.backgroundColor,
-              minHeight: '78vh',
               aspectRatio,
-              paddingTop: `${settings.marginTopMm}px`,
-              paddingBottom: `${settings.marginBottomMm}px`,
-              paddingLeft: `${settings.marginLeftMm}px`,
-              paddingRight: `${settings.marginRightMm}px`,
+              paddingTop: `${(settings.marginTopMm / pageWidthMm) * 100}%`,
+              paddingBottom: `${(settings.marginBottomMm / pageWidthMm) * 100}%`,
+              paddingLeft: `${(settings.marginLeftMm / pageWidthMm) * 100}%`,
+              paddingRight: `${(settings.marginRightMm / pageWidthMm) * 100}%`,
               border: settings.borderEnabled ? `2px solid ${settings.borderColor}` : '1px solid #cbd5e1',
             }}
           >
