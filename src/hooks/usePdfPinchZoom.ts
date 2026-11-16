@@ -4,12 +4,27 @@ import type React from 'react';
 interface UsePdfPinchZoomOptions {
   rootRef: React.RefObject<HTMLElement | null>;
   scrollRef?: React.RefObject<HTMLElement | null>;
+  /** Inner scrollable content wrapper scaled smoothly via GPU CSS transforms during active pinch/wheel */
+  contentRef?: React.RefObject<HTMLElement | null>;
   scale: number;
   setScale: React.Dispatch<React.SetStateAction<number>>;
   minScale?: number;
   maxScale?: number;
   /** 'mouse' = desktop grab-pan; true/'all' = mouse + 1-finger touch drag pan */
   dragPan?: boolean | 'mouse' | 'all';
+  /** Allow double-tap / double-click on viewer canvas to toggle 1x <-> 2x zoom centered at cursor */
+  doubleTapZoom?: boolean;
+}
+
+interface VisualZoomSession {
+  active: boolean;
+  baseScale: number;
+  targetScale: number;
+  localX: number;
+  localY: number;
+  oldScrollWidth: number;
+  endViewX: number;
+  endViewY: number;
 }
 
 interface PinchState {
@@ -49,20 +64,23 @@ function isInteractiveElement(target: EventTarget | null): boolean {
 
 /**
  * Provides desktop + mobile PDF zoom & unrestricted omnidirectional pan scrolling:
- * - Two-finger pinch zoom anchored tightly around finger midpoint (via useLayoutEffect).
+ * - 60/120fps GPU CSS transform preview during active 2-finger pinch & Ctrl/Cmd+Wheel/trackpad zoom
+ *   (zero layout thrash across 100+ pages mid-gesture), atomically committed on settle/touchend.
+ * - Multiplicative exponential wheel zoom with DOM_DELTA_LINE/PAGE normalization (smooth on every mouse/trackpad).
  * - Seamless 2-finger -> 1-finger pan handoff without losing the active touch gesture.
  * - Sub-pixel floating-point scroll accumulators + smooth kinetic inertia coasting.
- * - Mouse drag-to-pan (when dragPan is true, Spacebar is held, or middle mouse button).
- * - Ctrl/Cmd+Wheel zooms only the PDF around cursor; Shift+Wheel scrolls horizontally.
+ * - Optional double-tap / double-click focal zoom toggle.
  */
 export function usePdfPinchZoom({
   rootRef,
   scrollRef,
+  contentRef,
   scale,
   setScale,
   minScale = 0.35,
   maxScale = 3.5,
   dragPan = false,
+  doubleTapZoom = false,
 }: UsePdfPinchZoomOptions) {
   const scaleRef = useRef(scale);
   scaleRef.current = scale;
@@ -70,11 +88,26 @@ export function usePdfPinchZoom({
   const dragPanRef = useRef(dragPan);
   dragPanRef.current = dragPan;
 
+  const doubleTapRef = useRef(doubleTapZoom);
+  doubleTapRef.current = doubleTapZoom;
+
   const pinchRef = useRef<PinchState | null>(null);
   const pendingAnchorRef = useRef<PendingZoomAnchor | null>(null);
   const virtualScrollRef = useRef<{ left: number; top: number }>({ left: 0, top: 0 });
   const spaceHeldRef = useRef(false);
   const momentumRafRef = useRef<number | null>(null);
+  const wheelSettleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const visualZoomRef = useRef<VisualZoomSession>({
+    active: false,
+    baseScale: scale,
+    targetScale: scale,
+    localX: 0,
+    localY: 0,
+    oldScrollWidth: 0,
+    endViewX: 0,
+    endViewY: 0,
+  });
 
   const panSessionRef = useRef<PanSession>({
     active: false,
@@ -137,8 +170,15 @@ export function usePdfPinchZoom({
     };
   }, []);
 
-  // Synchronously preserve focal point right after React updates wrapper dimensions
+  // Synchronously clear GPU transform and preserve focal point right after React updates wrapper dimensions
   useLayoutEffect(() => {
+    const contentEl = contentRef?.current;
+    if (contentEl && !visualZoomRef.current.active) {
+      contentEl.style.transform = '';
+      contentEl.style.transformOrigin = '';
+      contentEl.style.willChange = '';
+    }
+
     const anchor = pendingAnchorRef.current;
     const scroller = scrollRef?.current;
     if (!anchor || !scroller) return;
@@ -148,13 +188,16 @@ export function usePdfPinchZoom({
     const newCenter = scroller.scrollWidth / 2;
     const maxLeft = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
     const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
-    const targetLeft = Math.max(0, Math.min(maxLeft, newCenter + anchor.dxFromCenter * ratio - anchor.viewX));
+    const targetLeft = Math.max(
+      0,
+      Math.min(maxLeft, newCenter + anchor.dxFromCenter * ratio - anchor.viewX)
+    );
     const targetTop = Math.max(0, Math.min(maxTop, anchor.docY * ratio - anchor.viewY));
 
     virtualScrollRef.current = { left: targetLeft, top: targetTop };
     scroller.scrollLeft = targetLeft;
     scroller.scrollTop = targetTop;
-  }, [scale, scrollRef]);
+  }, [scale, scrollRef, contentRef]);
 
   useEffect(() => {
     const root = rootRef.current;
@@ -176,6 +219,15 @@ export function usePdfPinchZoom({
       };
     };
 
+    const clearVisualTransform = () => {
+      const contentEl = contentRef?.current;
+      if (contentEl) {
+        contentEl.style.transform = '';
+        contentEl.style.transformOrigin = '';
+        contentEl.style.willChange = '';
+      }
+    };
+
     const applyPanDelta = (dx: number, dy: number) => {
       const scroller = scrollRef?.current;
       if (!scroller) return;
@@ -194,7 +246,7 @@ export function usePdfPinchZoom({
       if (!scroller) return;
       if (Math.hypot(vx, vy) < 0.08) return;
 
-      let curVx = vx; // px per ms
+      let curVx = vx;
       let curVy = vy;
       let lastTs = performance.now();
 
@@ -251,6 +303,87 @@ export function usePdfPinchZoom({
       };
     };
 
+    const beginVisualZoom = (clientX: number, clientY: number) => {
+      const scroller = scrollRef?.current;
+      const contentEl = contentRef?.current;
+      if (!scroller || !contentEl) return false;
+      const rect = scroller.getBoundingClientRect();
+      const viewX = clientX - rect.left;
+      const viewY = clientY - rect.top;
+      visualZoomRef.current = {
+        active: true,
+        baseScale: scaleRef.current,
+        targetScale: scaleRef.current,
+        localX: scroller.scrollLeft + viewX,
+        localY: scroller.scrollTop + viewY,
+        oldScrollWidth: scroller.scrollWidth,
+        endViewX: viewX,
+        endViewY: viewY,
+      };
+      contentEl.style.willChange = 'transform';
+      contentEl.style.transformOrigin = '0 0';
+      return true;
+    };
+
+    const updateVisualZoom = (nextScale: number, clientX: number, clientY: number) => {
+      const scroller = scrollRef?.current;
+      const contentEl = contentRef?.current;
+      const vz = visualZoomRef.current;
+      if (!scroller || !contentEl || !vz.active) return;
+
+      const rect = scroller.getBoundingClientRect();
+      const curViewX = clientX - rect.left;
+      const curViewY = clientY - rect.top;
+
+      // Re-anchor local point smoothly when cursor moves across viewport between wheel ticks
+      const ratio = nextScale / Math.max(0.01, vz.baseScale);
+      const desiredScrolledX = scroller.scrollLeft + curViewX;
+      const desiredScrolledY = scroller.scrollTop + curViewY;
+      const tx = desiredScrolledX - vz.localX * ratio;
+      const ty = desiredScrolledY - vz.localY * ratio;
+
+      vz.targetScale = nextScale;
+      vz.endViewX = curViewX;
+      vz.endViewY = curViewY;
+      contentEl.style.transform = `translate3d(${tx.toFixed(2)}px, ${ty.toFixed(2)}px, 0) scale(${ratio.toFixed(4)})`;
+    };
+
+    const commitVisualZoom = () => {
+      if (wheelSettleTimerRef.current) {
+        clearTimeout(wheelSettleTimerRef.current);
+        wheelSettleTimerRef.current = null;
+      }
+      const vz = visualZoomRef.current;
+      if (!vz.active) return;
+      vz.active = false;
+
+      const scroller = scrollRef?.current;
+      const finalScale = vz.targetScale;
+
+      if (!scroller || Math.abs(finalScale - scaleRef.current) < 0.002) {
+        clearVisualTransform();
+        if (scroller) {
+          const maxLeft = Math.max(0, scroller.scrollWidth - scroller.clientWidth);
+          const maxTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+          const targetLeft = Math.max(0, Math.min(maxLeft, vz.localX - vz.endViewX));
+          const targetTop = Math.max(0, Math.min(maxTop, vz.localY - vz.endViewY));
+          scroller.scrollLeft = targetLeft;
+          scroller.scrollTop = targetTop;
+          virtualScrollRef.current = { left: targetLeft, top: targetTop };
+        }
+        return;
+      }
+
+      pendingAnchorRef.current = {
+        prevScale: vz.baseScale,
+        dxFromCenter: vz.localX - vz.oldScrollWidth / 2,
+        docY: vz.localY,
+        viewX: vz.endViewX,
+        viewY: vz.endViewY,
+      };
+      setScale(finalScale);
+    };
+
     const getDist = (t: TouchList) => {
       const dx = t[0].clientX - t[1].clientX;
       const dy = t[0].clientY - t[1].clientY;
@@ -264,6 +397,13 @@ export function usePdfPinchZoom({
 
     const startPinch = (t: TouchList) => {
       cancelMomentum();
+      if (wheelSettleTimerRef.current) {
+        clearTimeout(wheelSettleTimerRef.current);
+        wheelSettleTimerRef.current = null;
+      }
+      if (visualZoomRef.current.active) {
+        commitVisualZoom();
+      }
       syncVirtualFromDom();
       const dist = getDist(t);
       const mid = getMid(t);
@@ -286,42 +426,130 @@ export function usePdfPinchZoom({
       if (scrollRef?.current) {
         scrollRef.current.style.touchAction = 'none';
       }
+      beginVisualZoom(mid.x, mid.y);
     };
 
     const onWheel = (e: WheelEvent) => {
       cancelMomentum();
-      syncVirtualFromDom();
       if (e.ctrlKey || e.metaKey) {
         if (e.cancelable) e.preventDefault();
         e.stopPropagation();
-        const prev = scaleRef.current;
-        const delta = Math.abs(e.deltaY) > 30 ? (e.deltaY < 0 ? 0.12 : -0.12) : -e.deltaY * 0.004;
-        const next = clampScale(prev + delta);
-        if (next !== prev) {
-          recordAnchor(e.clientX, e.clientY, prev);
-          setScale(next);
+
+        // Normalize DOM_DELTA_LINE (1) & DOM_DELTA_PAGE (2) -> pixels so standard & Firefox wheels both scale predictably
+        const rawDeltaY =
+          e.deltaMode === 1 ? e.deltaY * 32 : e.deltaMode === 2 ? e.deltaY * 400 : e.deltaY;
+        const clampedDelta = Math.max(-180, Math.min(180, rawDeltaY));
+        const factor = Math.exp(-clampedDelta * 0.0026);
+
+        if (contentRef?.current && scrollRef?.current) {
+          if (!visualZoomRef.current.active) {
+            beginVisualZoom(e.clientX, e.clientY);
+          } else {
+            // If cursor moved significantly to a new spot on the page, rebase anchor cleanly onto current transformed view
+            const scroller = scrollRef.current;
+            const rect = scroller.getBoundingClientRect();
+            const curViewX = e.clientX - rect.left;
+            const curViewY = e.clientY - rect.top;
+            if (
+              Math.hypot(
+                curViewX - visualZoomRef.current.endViewX,
+                curViewY - visualZoomRef.current.endViewY
+              ) > 18
+            ) {
+              const vz = visualZoomRef.current;
+              const prevRatio = vz.targetScale / Math.max(0.01, vz.baseScale);
+              const dX = curViewX - vz.endViewX;
+              const dY = curViewY - vz.endViewY;
+              vz.localX += dX / prevRatio;
+              vz.localY += dY / prevRatio;
+              vz.endViewX = curViewX;
+              vz.endViewY = curViewY;
+            }
+          }
+          const next = clampScale(visualZoomRef.current.targetScale * factor);
+          updateVisualZoom(next, e.clientX, e.clientY);
+
+          if (wheelSettleTimerRef.current) clearTimeout(wheelSettleTimerRef.current);
+          wheelSettleTimerRef.current = setTimeout(() => {
+            commitVisualZoom();
+          }, 95);
+        } else {
+          syncVirtualFromDom();
+          const prev = scaleRef.current;
+          const next = clampScale(prev * factor);
+          if (next !== prev) {
+            recordAnchor(e.clientX, e.clientY, prev);
+            setScale(next);
+          }
         }
         return;
       }
+
+      if (visualZoomRef.current.active) {
+        commitVisualZoom();
+      }
+      syncVirtualFromDom();
+
       if (e.shiftKey && e.deltaY !== 0 && Math.abs(e.deltaX) < 1) {
         const scroller = scrollRef?.current;
         if (scroller && scroller.scrollWidth > scroller.clientWidth) {
           if (e.cancelable) e.preventDefault();
-          applyPanDelta(e.deltaY, 0);
+          const deltaPx = e.deltaMode === 1 ? e.deltaY * 32 : e.deltaY;
+          applyPanDelta(deltaPx, 0);
         }
+      }
+    };
+
+    let lastTapTime = 0;
+    let lastTapX = 0;
+    let lastTapY = 0;
+
+    const triggerDoubleTapAt = (clientX: number, clientY: number) => {
+      syncVirtualFromDom();
+      const prev = scaleRef.current;
+      const mobileBase =
+        typeof window !== 'undefined' && window.innerWidth < 640
+          ? Math.max(0.55, Math.min(1.0, (window.innerWidth - 32) / 595))
+          : 1.05;
+      const next = prev > 1.4 ? clampScale(mobileBase) : clampScale(Math.max(1.85, prev * 1.75));
+      if (Math.abs(next - prev) >= 0.02) {
+        recordAnchor(clientX, clientY, prev);
+        setScale(next);
       }
     };
 
     const onTouchStart = (e: TouchEvent) => {
       cancelMomentum();
-      syncVirtualFromDom();
       if (e.touches.length === 2) {
         if (e.cancelable) e.preventDefault();
         e.stopPropagation();
         startPinch(e.touches);
         return;
       }
-      // Single-finger drag pan inside custom Hand/Pan mode
+
+      if (e.touches.length === 1 && doubleTapRef.current && !isInteractiveElement(e.target)) {
+        const now = performance.now();
+        const tx = e.touches[0].clientX;
+        const ty = e.touches[0].clientY;
+        const scroller = scrollRef?.current;
+        if (
+          scroller &&
+          e.target instanceof Node &&
+          scroller.contains(e.target) &&
+          now - lastTapTime < 280 &&
+          Math.hypot(tx - lastTapX, ty - lastTapY) < 26
+        ) {
+          lastTapTime = 0;
+          if (e.cancelable) e.preventDefault();
+          triggerDoubleTapAt(tx, ty);
+          return;
+        }
+        lastTapTime = now;
+        lastTapX = tx;
+        lastTapY = ty;
+      }
+
+      syncVirtualFromDom();
       const touchDragEnabled = dragPanRef.current === true || dragPanRef.current === 'all';
       if (e.touches.length === 1 && touchDragEnabled) {
         const scroller = scrollRef?.current;
@@ -355,7 +583,6 @@ export function usePdfPinchZoom({
           const dist = getDist(e.touches);
           const mid = getMid(e.touches);
           const ratio = dist / snap.startDist;
-          const prev = scaleRef.current;
           const next = clampScale(snap.startScale * ratio);
 
           const panDx = snap.lastMidX - mid.x;
@@ -368,24 +595,33 @@ export function usePdfPinchZoom({
           snap.lastMidX = mid.x;
           snap.lastMidY = mid.y;
 
-          if (panDx !== 0 || panDy !== 0) {
-            applyPanDelta(panDx, panDy);
-          }
-
-          if (Math.abs(next - prev) >= 0.004) {
-            recordAnchor(mid.x, mid.y, prev);
-            setScale(next);
+          if (contentRef?.current && visualZoomRef.current.active) {
+            updateVisualZoom(next, mid.x, mid.y);
+          } else {
+            const prev = scaleRef.current;
+            if (panDx !== 0 || panDy !== 0) {
+              applyPanDelta(panDx, panDy);
+            }
+            if (Math.abs(next - prev) >= 0.004) {
+              recordAnchor(mid.x, mid.y, prev);
+              setScale(next);
+            }
           }
         }
         return;
       }
 
-      // Single-finger continued pan (either seamless post-pinch handoff OR dragPan touch mode)
-      if (e.touches.length === 1 && panSessionRef.current.active && panSessionRef.current.mode === 'touch') {
+      if (
+        e.touches.length === 1 &&
+        panSessionRef.current.active &&
+        panSessionRef.current.mode === 'touch'
+      ) {
         const scroller = scrollRef?.current;
         if (!scroller) return;
-        // Only intercept when content actually overflows or we're handing off from a pinch
-        if (scroller.scrollWidth > scroller.clientWidth || scroller.scrollHeight > scroller.clientHeight) {
+        if (
+          scroller.scrollWidth > scroller.clientWidth ||
+          scroller.scrollHeight > scroller.clientHeight
+        ) {
           if (e.cancelable) e.preventDefault();
           const tx = e.touches[0].clientX;
           const ty = e.touches[0].clientY;
@@ -404,7 +640,7 @@ export function usePdfPinchZoom({
 
     const onTouchEnd = (e: TouchEvent) => {
       if (e.touches.length === 1 && pinchRef.current) {
-        // Seamless handoff from 2-finger pinch to 1-finger pan so panning never stalls mid-gesture
+        commitVisualZoom();
         pinchRef.current = null;
         syncVirtualFromDom();
         panSessionRef.current = {
@@ -421,8 +657,12 @@ export function usePdfPinchZoom({
       }
 
       if (e.touches.length === 0) {
-        const wasCustomPanning = Boolean(pinchRef.current || panSessionRef.current.active);
+        const wasPinching = Boolean(pinchRef.current);
+        const wasCustomPanning = Boolean(wasPinching || panSessionRef.current.active);
         const { vx, vy, lastTime } = panSessionRef.current;
+        if (wasPinching) {
+          commitVisualZoom();
+        }
         pinchRef.current = null;
         panSessionRef.current.active = false;
         if (scrollRef?.current) {
@@ -434,7 +674,13 @@ export function usePdfPinchZoom({
       }
     };
 
-    // Mouse drag-to-pan (middle mouse button anywhere, Space+drag, or primary drag when dragPan=true)
+    const onDblClick = (e: MouseEvent) => {
+      if (!doubleTapRef.current || isInteractiveElement(e.target)) return;
+      const scroller = scrollRef?.current;
+      if (!scroller || !(e.target instanceof Node) || !scroller.contains(e.target)) return;
+      triggerDoubleTapAt(e.clientX, e.clientY);
+    };
+
     const onMouseDown = (e: MouseEvent) => {
       const scroller = scrollRef?.current;
       if (!scroller) return;
@@ -451,6 +697,9 @@ export function usePdfPinchZoom({
       if (!canScroll) return;
 
       cancelMomentum();
+      if (visualZoomRef.current.active) {
+        commitVisualZoom();
+      }
       syncVirtualFromDom();
       e.preventDefault();
       panSessionRef.current = {
@@ -501,6 +750,7 @@ export function usePdfPinchZoom({
     };
 
     root.addEventListener('wheel', onWheel, { passive: false });
+    root.addEventListener('dblclick', onDblClick);
     root.addEventListener('touchstart', onTouchStart, { passive: false, capture: true });
     root.addEventListener('touchmove', onTouchMove, { passive: false, capture: true });
     root.addEventListener('touchend', onTouchEnd, { passive: true, capture: true });
@@ -514,7 +764,10 @@ export function usePdfPinchZoom({
 
     return () => {
       cancelMomentum();
+      if (wheelSettleTimerRef.current) clearTimeout(wheelSettleTimerRef.current);
+      clearVisualTransform();
       root.removeEventListener('wheel', onWheel);
+      root.removeEventListener('dblclick', onDblClick);
       root.removeEventListener('touchstart', onTouchStart, { capture: true });
       root.removeEventListener('touchmove', onTouchMove, { capture: true });
       root.removeEventListener('touchend', onTouchEnd, { capture: true });
@@ -526,5 +779,5 @@ export function usePdfPinchZoom({
       root.removeEventListener('gesturechange', onGesture);
       root.removeEventListener('gestureend', onGesture);
     };
-  }, [rootRef, scrollRef, setScale, minScale, maxScale]);
+  }, [rootRef, scrollRef, contentRef, setScale, minScale, maxScale]);
 }

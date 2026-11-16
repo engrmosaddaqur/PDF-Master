@@ -4,7 +4,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import JSZip from 'jszip';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 
 dotenv.config();
 
@@ -34,9 +34,53 @@ interface PageTextPayload {
   text: string;
 }
 
+interface PageImagePayload {
+  pageNumber: number;
+  base64: string;
+  mimeType?: string;
+}
+
 interface ChatHistoryMessage {
   role: 'user' | 'assistant';
   content: string;
+}
+
+async function generateWithRetry(
+  ai: GoogleGenAI,
+  params: Parameters<GoogleGenAI['models']['generateContent']>[0]
+) {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      return await ai.models.generateContent(params);
+    } catch (err) {
+      lastErr = err;
+      const msg = err instanceof Error ? err.message : String(err);
+      const isTransient = /\b(429|500|502|503|504|overloaded|timeout|network|ECONNRESET)\b/i.test(msg);
+      if (!isTransient || attempt === 1) {
+        throw err;
+      }
+      await new Promise((r) => setTimeout(r, 700));
+    }
+  }
+  throw lastErr;
+}
+
+function classifyAiError(err: unknown): { status: number; message: string } {
+  const raw = err instanceof Error ? err.message : 'Failed to process AI request.';
+  if (/API key|permission|PERMISSION_DENIED|\b403\b|\b401\b/i.test(raw)) {
+    return {
+      status: 403,
+      message: 'Gemini API authentication failed. Please check GEMINI_API_KEY configuration.',
+    };
+  }
+  if (/RESOURCE_EXHAUSTED|\b429\b|quota/i.test(raw)) {
+    return {
+      status: 429,
+      message: 'AI rate limit reached. Please wait a moment and try again.',
+    };
+  }
+  return { status: 500, message: raw };
 }
 
 async function startServer() {
@@ -320,6 +364,7 @@ pause
       const {
         documentTitle = 'Document',
         pages = [],
+        pageImages = [],
         prompt = '',
         mode = 'qa',
         language = 'en',
@@ -327,6 +372,7 @@ pause
       } = req.body as {
         documentTitle?: string;
         pages?: PageTextPayload[];
+        pageImages?: PageImagePayload[];
         prompt?: string;
         mode?: string;
         language?: 'en' | 'bn';
@@ -338,10 +384,18 @@ pause
         return;
       }
 
-      const contextText = pages
-        .slice(0, 40)
-        .map((p) => `--- [Page ${p.pageNumber}] ---\n${p.text.slice(0, 3500)}`)
-        .join('\n\n');
+      const safePages = Array.isArray(pages) ? pages : [];
+      const safeImages = Array.isArray(pageImages) ? pageImages.slice(0, 4) : [];
+
+      let charBudget = 110000;
+      const pageChunks: string[] = [];
+      for (const p of safePages.slice(0, 45)) {
+        const chunk = `--- [Page ${p.pageNumber}] ---\n${String(p.text || '').slice(0, 3200)}`;
+        if (charBudget - chunk.length < 0 && pageChunks.length > 0) break;
+        pageChunks.push(chunk);
+        charBudget -= chunk.length;
+      }
+      const contextText = pageChunks.join('\n\n');
 
       const langInstruction =
         language === 'bn'
@@ -372,30 +426,56 @@ pause
 ${langInstruction}
 Task guidance: ${modeInstructions[mode] || modeInstructions.qa}
 Rules:
-1. Ground every answer strictly in the supplied document text.
+1. Ground every answer strictly in the supplied document text or attached page images.
 2. Always include page references like [Page 1] or [Page 3] whenever citing facts.
 3. Format cleanly with short paragraphs, bullet points, or Markdown tables suitable for mobile screen reading.
 4. Never fabricate facts not present in the document.`;
 
-      const conversationHistory = history
+      const conversationHistory = (Array.isArray(history) ? history : [])
         .slice(-6)
         .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
         .join('\n');
 
       const userPrompt = `Document Title: ${documentTitle}
-Total Pages Provided: ${pages.length}
+Total Pages Provided: ${safePages.length || safeImages.length}
 
 DOCUMENT CONTENT:
-${contextText || '(No embedded text extracted from this document. Suggest running OCR if it is a scanned PDF.)'}
+${
+  contextText ||
+  (safeImages.length > 0
+    ? '(This PDF has no embedded text layer. Read the attached page images carefully to answer with [Page X] citations.)'
+    : '(No embedded text or images extracted from this document.)')
+}
 
 ${conversationHistory ? `RECENT CONVERSATION:\n${conversationHistory}\n\n` : ''}USER REQUEST (${mode}):
 ${prompt || 'Please perform the requested analysis on this document.'}`;
 
-      const response = await ai.models.generateContent({
+      const hasText = safePages.some((p) => (p.text || '').trim().length > 0);
+      const contents =
+        !hasText && safeImages.length > 0
+          ? {
+              parts: [
+                ...safeImages.map((img) => ({
+                  inlineData: {
+                    mimeType: img.mimeType || 'image/jpeg',
+                    data: String(img.base64 || '').replace(/^data:[^;]+;base64,/, ''),
+                  },
+                })),
+                {
+                  text: `[Attached scanned pages: ${safeImages
+                    .map((i) => `Page ${i.pageNumber}`)
+                    .join(', ')}]\n\n${userPrompt}`,
+                },
+              ],
+            }
+          : userPrompt;
+
+      const response = await generateWithRetry(ai, {
         model: 'gemini-4-hydrogen',
-        contents: userPrompt,
+        contents,
         config: {
           systemInstruction,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
         },
       });
 
@@ -404,10 +484,9 @@ ${prompt || 'Please perform the requested analysis on this document.'}`;
         model: 'gemini-4-hydrogen',
       });
     } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : 'Failed to process AI document request.';
-      console.error('AI Assistant error:', message);
-      res.status(500).json({ error: message });
+      const classified = classifyAiError(err);
+      console.error('AI Assistant error:', classified.message);
+      res.status(classified.status).json({ error: classified.message });
     }
   });
 
@@ -445,7 +524,7 @@ Requirements:
 - Preserve tabular structure using clean Markdown or aligned columns if tables are present.
 - Do not add commentary or preambles; output ONLY the transcribed document text.`;
 
-      const response = await ai.models.generateContent({
+      const response = await generateWithRetry(ai, {
         model: 'gemini-4-hydrogen',
         contents: {
           parts: [
@@ -458,16 +537,18 @@ Requirements:
             { text: prompt },
           ],
         },
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+        },
       });
 
       res.json({
         text: response.text ?? '',
       });
     } catch (err: unknown) {
-      const message =
-        err instanceof Error ? err.message : 'AI Vision OCR request failed.';
-      console.error('AI Vision OCR error:', message);
-      res.status(500).json({ error: message });
+      const classified = classifyAiError(err);
+      console.error('AI Vision OCR error:', classified.message);
+      res.status(classified.status).json({ error: classified.message });
     }
   });
 

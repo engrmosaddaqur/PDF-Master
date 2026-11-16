@@ -721,6 +721,7 @@ export default function App() {
           localOnlyMode={settings.localOnlyMode}
           onImportDoc={upsertDoc}
           onGrantConsent={() => updateSettings({ aiConsentGranted: true })}
+          onDisableLocalOnly={() => updateSettings({ localOnlyMode: false })}
           onClose={() => setWorkspace({ type: 'none' })}
         />
       )}

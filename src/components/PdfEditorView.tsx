@@ -197,6 +197,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   // Drawing interaction
   const editorRootRef = useRef<HTMLDivElement | null>(null);
   const canvasScrollRef = useRef<HTMLDivElement | null>(null);
+  const scrollContentRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
@@ -229,6 +230,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   usePdfPinchZoom({
     rootRef: editorRootRef,
     scrollRef: canvasScrollRef,
+    contentRef: scrollContentRef,
     scale,
     setScale,
     minScale: 0.4,
@@ -1235,7 +1237,10 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         }}
         className={`flex-1 overflow-auto ${activeTool === 'pan' ? 'cursor-grab' : ''}`}
       >
-        <div className="min-w-full min-h-full w-fit p-3 sm:p-6 flex items-start justify-center">
+        <div
+          ref={scrollContentRef}
+          className="min-w-full min-h-full w-fit p-3 sm:p-6 flex items-start justify-center"
+        >
         <div
           className="relative bg-white shadow-xl rounded-md overflow-hidden select-none shrink-0"
           style={{ width: pageSize.width * scale, height: pageSize.height * scale }}

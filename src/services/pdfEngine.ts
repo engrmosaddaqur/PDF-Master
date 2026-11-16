@@ -226,6 +226,18 @@ export async function getPdfPageDimension(
   return { width: vp.width, height: vp.height };
 }
 
+export function cancelCanvasRender(canvas: HTMLCanvasElement): void {
+  const prevTask = activeCanvasTasks.get(canvas);
+  if (prevTask) {
+    try {
+      prevTask.cancel();
+    } catch {
+      // ignore cancellation error
+    }
+    activeCanvasTasks.delete(canvas);
+  }
+}
+
 export async function renderPageToCanvas(
   pdfBytes: ArrayBuffer,
   pageNumber: number,
@@ -234,14 +246,7 @@ export async function renderPageToCanvas(
   extraRotation = 0
 ): Promise<{ width: number; height: number; unscaledWidth: number; unscaledHeight: number }> {
   // Cancel any in-flight PDF.js render on this exact canvas so transforms never stack/flip
-  const prevTask = activeCanvasTasks.get(canvas);
-  if (prevTask) {
-    try {
-      prevTask.cancel();
-    } catch {
-      // ignore cancellation error
-    }
-  }
+  cancelCanvasRender(canvas);
 
   const prevQueue = canvasRenderQueues.get(canvas) || Promise.resolve();
   let resultDims = { width: 0, height: 0, unscaledWidth: 595, unscaledHeight: 842 };
@@ -254,8 +259,12 @@ export async function renderPageToCanvas(
       const page = await pdf.getPage(safePage);
       const rot = (((page.rotate || 0) + extraRotation) % 360 + 360) % 360;
       const baseViewport = page.getViewport({ scale: 1, rotation: rot });
-      const dpr = Math.min(window.devicePixelRatio || 1, 2);
-      const viewport = page.getViewport({ scale: scale * dpr, rotation: rot });
+      const rawDpr = Math.min(window.devicePixelRatio || 1, 2);
+      // Cap backing store to ~2400px longest side so zooming to 3x on high-DPR phones stays smooth
+      const maxDim = Math.max(baseViewport.width, baseViewport.height, 1);
+      const maxRenderScale = Math.min(scale * rawDpr, 2400 / maxDim);
+      const effectiveRenderScale = Math.max(scale, maxRenderScale);
+      const viewport = page.getViewport({ scale: effectiveRenderScale, rotation: rot });
 
       const displayW = Math.max(1, Math.floor(baseViewport.width * scale));
       const displayH = Math.max(1, Math.floor(baseViewport.height * scale));

@@ -21,6 +21,7 @@ import {
 import type { AppLanguage, DocumentRecord } from '../types';
 import { getT } from '../i18n/translations';
 import {
+  cancelCanvasRender,
   extractDocumentPagesText,
   extractSinglePageText,
   getPdfPageDimension,
@@ -48,30 +49,26 @@ const LazyPageCanvas: React.FC<{
   pdfBytes: ArrayBuffer;
   pageNumber: number;
   scale: number;
+  renderScale: number;
   rotation: number;
   isBookmarked: boolean;
   defaultDims: { width: number; height: number };
-  scrollRoot: HTMLDivElement | null;
-  onBecameCurrent: (pageNumber: number) => void;
+  shouldRender: boolean;
   registerPageRef: (pageNumber: number, el: HTMLDivElement | null) => void;
-  eager?: boolean;
 }> = React.memo(
   ({
     pdfBytes,
     pageNumber,
     scale,
+    renderScale,
     rotation,
     isBookmarked,
     defaultDims,
-    scrollRoot,
-    onBecameCurrent,
+    shouldRender,
     registerPageRef,
-    eager = false,
   }) => {
-    const wrapperRef = useRef<HTMLDivElement | null>(null);
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
-    const [shouldRender, setShouldRender] = useState(eager);
-    const [rendering, setRendering] = useState(eager);
+    const [rendering, setRendering] = useState(shouldRender);
     const [hasRendered, setHasRendered] = useState(false);
     const [dims, setDims] = useState<{ width: number; height: number }>(defaultDims);
 
@@ -84,58 +81,32 @@ const LazyPageCanvas: React.FC<{
     }, [pdfBytes, pageNumber]);
 
     useEffect(() => {
-      if (eager) {
-        setShouldRender(true);
+      const canvas = canvasRef.current;
+      if (!shouldRender) {
+        if (canvas) {
+          cancelCanvasRender(canvas);
+          if (canvas.width > 0) {
+            canvas.width = 0;
+            canvas.height = 0;
+          }
+        }
+        setHasRendered(false);
+        setRendering(false);
         return;
       }
-      const el = wrapperRef.current;
-      if (!el) return;
 
-      const renderObserver = new IntersectionObserver(
-        (entries) => {
-          const entry = entries[0];
-          if (entry) {
-            setShouldRender(entry.isIntersecting);
-          }
-        },
-        { root: scrollRoot, rootMargin: '950px 0px' }
-      );
-      renderObserver.observe(el);
-
-      const currentObserver = new IntersectionObserver(
-        (entries) => {
-          const entry = entries[0];
-          if (entry && entry.isIntersecting) {
-            onBecameCurrent(pageNumber);
-          }
-        },
-        { root: scrollRoot, threshold: 0.45 }
-      );
-      currentObserver.observe(el);
-
-      return () => {
-        renderObserver.disconnect();
-        currentObserver.disconnect();
-      };
-    }, [eager, pageNumber, scrollRoot, onBecameCurrent]);
-
-    const [renderScale, setRenderScale] = useState(scale);
-
-    useEffect(() => {
-      const id = setTimeout(() => setRenderScale(scale), 180);
-      return () => clearTimeout(id);
-    }, [scale]);
-
-    useEffect(() => {
-      if (!shouldRender) return;
-      let active = true;
-      const canvas = canvasRef.current;
       if (!canvas) return;
+      let active = true;
       setRendering(true);
       renderPageToCanvas(pdfBytes, pageNumber, canvas, renderScale, rotation)
         .then((res) => {
           if (active && res.unscaledWidth > 0 && res.unscaledHeight > 0) {
-            setDims({ width: res.unscaledWidth, height: res.unscaledHeight });
+            setDims((prev) =>
+              Math.abs(prev.width - res.unscaledWidth) < 0.5 &&
+              Math.abs(prev.height - res.unscaledHeight) < 0.5
+                ? prev
+                : { width: res.unscaledWidth, height: res.unscaledHeight }
+            );
             setHasRendered(true);
           }
         })
@@ -153,11 +124,9 @@ const LazyPageCanvas: React.FC<{
 
     return (
       <div
-        ref={(el) => {
-          wrapperRef.current = el;
-          registerPageRef(pageNumber, el);
-        }}
-        style={{ width: boxW, height: boxH }}
+        data-page={pageNumber}
+        ref={(el) => registerPageRef(pageNumber, el)}
+        style={{ width: boxW, height: boxH, contain: 'layout style paint' }}
         className="relative mx-auto my-3 bg-white shadow-md rounded-lg overflow-hidden border border-slate-200 dark:border-slate-700 shrink-0"
       >
         {(!shouldRender || (rendering && !hasRendered)) && (
@@ -194,6 +163,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
     const w = typeof window !== 'undefined' ? window.innerWidth : 1024;
     return w < 640 ? Math.max(0.55, Math.min(1.0, (w - 32) / 595)) : 1.05;
   });
+  const [renderScale, setRenderScale] = useState(scale);
   const [extraRotation, setExtraRotation] = useState(0);
   const [defaultPageDims, setDefaultPageDims] = useState({ width: 595, height: 842 });
   const [isFullscreen, setIsFullscreen] = useState(false);
@@ -206,19 +176,29 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
   const [currentPageText, setCurrentPageText] = useState('');
   const [copiedNotice, setCopiedNotice] = useState(false);
   const [scrollRootEl, setScrollRootEl] = useState<HTMLDivElement | null>(null);
+  const [visiblePages, setVisiblePages] = useState<Set<number>>(() => new Set([1, 2, 3]));
 
   const viewerRootRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const scrollContentRef = useRef<HTMLDivElement | null>(null);
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
+
+  // Single debounced renderScale at parent level instead of N per-page timers
+  useEffect(() => {
+    const id = setTimeout(() => setRenderScale(scale), 100);
+    return () => clearTimeout(id);
+  }, [scale]);
 
   usePdfPinchZoom({
     rootRef: viewerRootRef,
     scrollRef: containerRef,
+    contentRef: scrollContentRef,
     scale,
     setScale,
     minScale: 0.35,
     maxScale: 3.5,
     dragPan: 'mouse',
+    doubleTapZoom: true,
   });
 
   const registerPageRef = useCallback((pNum: number, el: HTMLDivElement | null) => {
@@ -228,6 +208,65 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
       pageRefs.current.delete(pNum);
     }
   }, []);
+
+  // Two shared IntersectionObservers instead of 2*N observers for fast 150+ page scrolling
+  useEffect(() => {
+    if (viewMode !== 'continuous' || !scrollRootEl) return;
+
+    const renderObserver = new IntersectionObserver(
+      (entries) => {
+        setVisiblePages((prev) => {
+          let changed = false;
+          const next = new Set(prev);
+          for (const entry of entries) {
+            const p = Number((entry.target as HTMLElement).dataset.page);
+            if (!p) continue;
+            if (entry.isIntersecting) {
+              if (!next.has(p)) {
+                next.add(p);
+                changed = true;
+              }
+            } else if (next.has(p) && p > 2) {
+              next.delete(p);
+              changed = true;
+            }
+          }
+          return changed ? next : prev;
+        });
+      },
+      { root: scrollRootEl, rootMargin: '850px 0px' }
+    );
+
+    const currentObserver = new IntersectionObserver(
+      (entries) => {
+        let bestPage: number | null = null;
+        let bestRatio = 0;
+        for (const entry of entries) {
+          if (entry.isIntersecting && entry.intersectionRatio >= bestRatio) {
+            const p = Number((entry.target as HTMLElement).dataset.page);
+            if (p) {
+              bestRatio = entry.intersectionRatio;
+              bestPage = p;
+            }
+          }
+        }
+        if (bestPage !== null) {
+          setCurrentPage(bestPage);
+        }
+      },
+      { root: scrollRootEl, threshold: [0.25, 0.55] }
+    );
+
+    pageRefs.current.forEach((el) => {
+      renderObserver.observe(el);
+      currentObserver.observe(el);
+    });
+
+    return () => {
+      renderObserver.disconnect();
+      currentObserver.disconnect();
+    };
+  }, [viewMode, scrollRootEl, doc.id, doc.pageCount]);
 
   useEffect(() => {
     setPageJumpInput(String(currentPage));
@@ -686,35 +725,39 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
         className="flex-1 overflow-auto cursor-grab"
       >
         {viewMode === 'single' ? (
-          <div className="min-w-full min-h-full w-fit px-3 sm:px-6 py-4 flex flex-col items-center">
+          <div
+            ref={scrollContentRef}
+            className="min-w-full min-h-full w-fit px-3 sm:px-6 py-4 flex flex-col items-center"
+          >
             <LazyPageCanvas
               pdfBytes={doc.pdfBytes}
               pageNumber={currentPage}
               scale={scale}
+              renderScale={renderScale}
               rotation={extraRotation}
               isBookmarked={isCurrentBookmarked}
               defaultDims={defaultPageDims}
-              scrollRoot={scrollRootEl}
-              onBecameCurrent={setCurrentPage}
+              shouldRender
               registerPageRef={registerPageRef}
-              eager
             />
           </div>
         ) : (
-          <div className="min-w-full min-h-full w-fit px-3 sm:px-6 py-4 flex flex-col items-center">
+          <div
+            ref={scrollContentRef}
+            className="min-w-full min-h-full w-fit px-3 sm:px-6 py-4 flex flex-col items-center"
+          >
             {Array.from({ length: doc.pageCount }, (_, i) => i + 1).map((pNum) => (
               <LazyPageCanvas
                 key={pNum}
                 pdfBytes={doc.pdfBytes}
                 pageNumber={pNum}
                 scale={scale}
+                renderScale={renderScale}
                 rotation={extraRotation}
                 isBookmarked={bookmarks.includes(pNum)}
                 defaultDims={defaultPageDims}
-                scrollRoot={scrollRootEl}
-                onBecameCurrent={setCurrentPage}
+                shouldRender={pNum <= 2 || visiblePages.has(pNum) || Math.abs(pNum - currentPage) <= 1}
                 registerPageRef={registerPageRef}
-                eager={pNum <= 2}
               />
             ))}
           </div>

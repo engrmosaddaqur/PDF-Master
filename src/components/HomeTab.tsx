@@ -286,6 +286,8 @@ export const HomeTab: React.FC<HomeTabProps> = ({
                     <img
                       src={doc.thumbnailDataUrl}
                       alt={doc.name}
+                      loading="lazy"
+                      decoding="async"
                       className="w-full h-full object-cover"
                     />
                   ) : (

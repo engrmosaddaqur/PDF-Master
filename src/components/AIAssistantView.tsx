@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Check,
@@ -13,7 +13,7 @@ import {
 } from 'lucide-react';
 import type { AppLanguage, DocumentRecord } from '../types';
 import { getT } from '../i18n/translations';
-import { extractDocumentPagesText } from '../services/pdfEngine';
+import { extractDocumentPagesText, renderPageToDataUrl } from '../services/pdfEngine';
 import { getApiUrl } from '../services/apiConfig';
 import { PdfSourcePicker } from './PdfSourcePicker';
 
@@ -25,6 +25,7 @@ interface AIAssistantViewProps {
   localOnlyMode: boolean;
   onImportDoc?: (doc: DocumentRecord) => Promise<void>;
   onGrantConsent: () => void;
+  onDisableLocalOnly?: () => void;
   onClose: () => void;
 }
 
@@ -42,6 +43,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   localOnlyMode,
   onImportDoc,
   onGrantConsent,
+  onDisableLocalOnly,
   onClose,
 }) => {
   const t = getT(language);
@@ -61,20 +63,42 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   const selectedDoc = available.find((d) => d.id === selectedDocId);
+  const activeDocIdRef = useRef(selectedDocId);
+  activeDocIdRef.current = selectedDocId;
+  const extractPromiseRef = useRef<Promise<Array<{ pageNumber: number; text: string }>> | null>(null);
 
   useEffect(() => {
     if (!selectedDoc) {
       setPages([]);
+      extractPromiseRef.current = null;
       return;
     }
+    const targetId = selectedDoc.id;
+    let cancelled = false;
     setExtracting(true);
-    extractDocumentPagesText(selectedDoc.pdfBytes)
+    const p = extractDocumentPagesText(selectedDoc.pdfBytes)
       .then((res) => {
-        setPages(res);
+        if (!cancelled && activeDocIdRef.current === targetId) {
+          setPages(res);
+        }
+        return res;
       })
-      .catch(() => setPages([]))
-      .finally(() => setExtracting(false));
-  }, [selectedDocId]);
+      .catch(() => {
+        if (!cancelled && activeDocIdRef.current === targetId) {
+          setPages([]);
+        }
+        return [] as Array<{ pageNumber: number; text: string }>;
+      })
+      .finally(() => {
+        if (!cancelled && activeDocIdRef.current === targetId) {
+          setExtracting(false);
+        }
+      });
+    extractPromiseRef.current = p;
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedDocId, selectedDoc?.pdfBytes]);
 
   const sendRequest = async (mode: string, customPrompt?: string) => {
     if (!selectedDoc || loading || !aiConsentGranted || localOnlyMode) return;
@@ -95,13 +119,46 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
     if (!customPrompt) setInput('');
     setLoading(true);
 
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 45000);
+
     try {
+      let currentPages = pages;
+      if (extractPromiseRef.current && (extracting || currentPages.length === 0)) {
+        currentPages = await extractPromiseRef.current;
+      }
+
+      const extractedChars = currentPages.reduce((acc, p) => acc + p.text.trim().length, 0);
+      const pageImages: Array<{ pageNumber: number; base64: string; mimeType: string }> = [];
+
+      // If scanned / image-only PDF with little or no embedded text, render pages visually for Gemini Vision
+      if (extractedChars < 25) {
+        const previewCount = Math.min(4, Math.max(1, selectedDoc.pageCount || 1));
+        for (let pageIdx = 1; pageIdx <= previewCount; pageIdx++) {
+          const dataUrl = await renderPageToDataUrl(
+            selectedDoc.pdfBytes,
+            pageIdx,
+            1.25,
+            'image/jpeg'
+          ).catch(() => '');
+          if (dataUrl) {
+            pageImages.push({
+              pageNumber: pageIdx,
+              base64: dataUrl,
+              mimeType: 'image/jpeg',
+            });
+          }
+        }
+      }
+
       const res = await fetch(getApiUrl('/api/ai/assistant'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           documentTitle: selectedDoc.name,
-          pages,
+          pages: currentPages,
+          pageImages,
           prompt: promptText,
           mode,
           language,
@@ -110,24 +167,41 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
             .map((m) => ({ role: m.role, content: m.content })),
         }),
       });
-      const data = await res.json();
+
+      const rawText = await res.text();
+      let data: { text?: string; error?: string } = {};
+      try {
+        data = rawText ? (JSON.parse(rawText) as { text?: string; error?: string }) : {};
+      } catch {
+        if (!res.ok) {
+          throw new Error(`AI service error (HTTP ${res.status})`);
+        }
+      }
+
       if (!res.ok) {
-        throw new Error(data.error || 'AI Assistant request failed');
+        throw new Error(data.error || `AI Assistant request failed (${res.status})`);
       }
       setMessages((prev) => [
         ...prev,
         { id: `a_${Date.now()}`, role: 'assistant', content: data.text || '(Empty response)' },
       ]);
     } catch (err) {
+      const msg =
+        err instanceof DOMException && err.name === 'AbortError'
+          ? 'Request timed out. Please try again.'
+          : err instanceof Error
+          ? err.message
+          : 'Unable to reach AI Assistant';
       setMessages((prev) => [
         ...prev,
         {
           id: `e_${Date.now()}`,
           role: 'error',
-          content: err instanceof Error ? err.message : 'Unable to reach AI Assistant',
+          content: msg,
         },
       ]);
     } finally {
+      clearTimeout(timeoutId);
       setLoading(false);
     }
   };
@@ -177,12 +251,20 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
 
       {localOnlyMode ? (
         <div className="flex-1 flex items-center justify-center p-6">
-          <div className="max-w-sm rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 text-center space-y-3">
+          <div className="max-w-sm rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 text-center space-y-3 shadow-lg">
             <ShieldCheck className="w-10 h-10 text-[#2563EB] mx-auto" />
             <h2 className="font-display text-base font-bold">Strict Local-Only Mode Active</h2>
-            <p className="text-xs text-slate-500">
-              Disable Strict Local-Only Mode in Settings to send extracted PDF text to the server AI assistant.
+            <p className="text-xs text-slate-500 leading-relaxed">
+              Strict Local-Only Mode blocks external AI requests. Disable it below or in Settings to use AI Assistant.
             </p>
+            {onDisableLocalOnly && (
+              <button
+                onClick={onDisableLocalOnly}
+                className="w-full min-h-[44px] rounded-xl bg-[#2563EB] text-white font-semibold text-xs"
+              >
+                Enable AI Requests (Turn Off Local-Only)
+              </button>
+            )}
           </div>
         </div>
       ) : !aiConsentGranted ? (
@@ -256,7 +338,7 @@ export const AIAssistantView: React.FC<AIAssistantViewProps> = ({
 
             {!extracting && selectedDoc && totalExtractedChars === 0 && (
               <p className="text-[11px] text-amber-600 dark:text-amber-400">
-                This PDF appears to be scanned images with no text layer. Run OCR first for best AI answers.
+                Scanned PDF detected — AI Assistant will read page images directly (up to 4 pages). Run OCR for full multi-page indexing.
               </p>
             )}
 
