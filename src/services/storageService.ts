@@ -104,11 +104,13 @@ export async function getAllDocuments(): Promise<DocumentRecord[]> {
   return docs.sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
+export const MAX_DOC_VERSIONS = 5;
+
 export async function saveDocument(doc: DocumentRecord): Promise<void> {
   const safeDoc: DocumentRecord = {
     ...doc,
     pdfBytes: cloneBuffer(doc.pdfBytes),
-    versions: (doc.versions || []).map((v) => ({
+    versions: (doc.versions || []).slice(0, MAX_DOC_VERSIONS).map((v) => ({
       ...v,
       pdfBytes: cloneBuffer(v.pdfBytes),
     })),

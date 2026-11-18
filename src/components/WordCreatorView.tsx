@@ -245,7 +245,9 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
       if (action === 'downloadPdf') {
         await saveBufferToDeviceStorage(pdfBytes, fileName, 'application/pdf');
       } else {
-        setSavedNotice('Saved to Files & Device Storage');
+        setSavedNotice(
+          language === 'bn' ? 'ফাইলস ও ডিভাইস স্টোরেজে সেভ হয়েছে' : 'Saved to Files & Device Storage'
+        );
         setTimeout(() => setSavedNotice(null), 2400);
       }
     } catch (err) {
@@ -299,7 +301,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
             onClick={() => setShowOutline((v) => !v)}
             className="min-h-[40px] px-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold hidden sm:block"
           >
-            Outline ({headings.length})
+            {language === 'bn' ? `সূচিপত্র (${headings.length})` : `Outline (${headings.length})`}
           </button>
           <button
             onClick={() => setShowPageSettings(true)}
@@ -307,7 +309,9 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
             className="min-h-[42px] px-2.5 flex items-center justify-center gap-1.5 rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-xs font-semibold"
           >
             <Settings2 className="w-4 h-4 shrink-0" />
-            <span className="hidden sm:inline">Page Setup</span>
+            <span className="hidden sm:inline">
+              {language === 'bn' ? 'পেজ সেটআপ' : 'Page Setup'}
+            </span>
           </button>
           <button
             onClick={() => handleSaveAndExport('downloadPdf')}
@@ -324,7 +328,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
             className="min-h-[42px] px-3.5 rounded-xl bg-[#2563EB] text-white text-xs font-semibold flex items-center gap-1.5"
           >
             <Save className="w-4 h-4" />
-            <span>{saving ? '...' : 'Save'}</span>
+            <span>{saving ? '...' : t.editor.save}</span>
           </button>
         </div>
       </header>
@@ -423,10 +427,14 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
         {showOutline && (
           <aside className="hidden md:block w-56 shrink-0 bg-white dark:bg-slate-900 rounded-2xl p-4 h-fit border border-slate-200 dark:border-slate-800">
             <h3 className="text-xs font-bold text-slate-500 uppercase tracking-wider mb-2">
-              Document Outline
+              {language === 'bn' ? 'ডকুমেন্ট সূচিপত্র' : 'Document Outline'}
             </h3>
             {headings.length === 0 ? (
-              <p className="text-xs text-slate-400">Add H1 or H2 headings to build an outline.</p>
+              <p className="text-xs text-slate-400">
+                {language === 'bn'
+                  ? 'সূচিপত্র তৈরি করতে H1 বা H2 শিরোনাম দিন।'
+                  : 'Add H1 or H2 headings to build an outline.'}
+              </p>
             ) : (
               <ul className="space-y-1.5 text-xs text-slate-700 dark:text-slate-300">
                 {headings.map((h, i) => (
@@ -556,7 +564,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
           <div className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl max-h-[85vh] overflow-y-auto space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
-                Page Setup (A0–A6, Letter, Legal)
+                {language === 'bn' ? 'পেজ সেটআপ (A0–A6, Letter, Legal)' : 'Page Setup (A0–A6, Letter, Legal)'}
               </h3>
               <button onClick={() => setShowPageSettings(false)} className="min-h-[40px] min-w-[40px]">
                 <X className="w-5 h-5" />
@@ -584,7 +592,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
               {settings.paperSize === 'Custom' && (
                 <div className="grid grid-cols-2 gap-2">
                   <div>
-                    <label className="block font-semibold mb-1">Width (mm)</label>
+                    <label className="block font-semibold mb-1">{language === 'bn' ? 'প্রস্থ (mm)' : 'Width (mm)'}</label>
                     <input
                       type="number"
                       value={settings.customWidthMm}
@@ -595,7 +603,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
                     />
                   </div>
                   <div>
-                    <label className="block font-semibold mb-1">Height (mm)</label>
+                    <label className="block font-semibold mb-1">{language === 'bn' ? 'উচ্চতা (mm)' : 'Height (mm)'}</label>
                     <input
                       type="number"
                       value={settings.customHeightMm}
@@ -621,7 +629,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
                           : 'border-slate-200 dark:border-slate-700'
                       }`}
                     >
-                      {ori}
+                      {ori === 'portrait' ? t.creator.portrait : t.creator.landscape}
                     </button>
                   ))}
                 </div>
@@ -629,19 +637,21 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
 
               <div className="grid grid-cols-2 gap-2">
                 <div>
-                  <label className="block font-semibold mb-1">Line Spacing</label>
+                  <label className="block font-semibold mb-1">
+                    {language === 'bn' ? 'লাইনের দূরত্ব' : 'Line Spacing'}
+                  </label>
                   <select
                     value={lineSpacing}
                     onChange={(e) => setLineSpacing(e.target.value)}
                     className="w-full min-h-[40px] px-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
                   >
-                    <option value="1.2">Compact (1.2)</option>
-                    <option value="1.6">Standard (1.6)</option>
-                    <option value="2.0">Double (2.0)</option>
+                    <option value="1.2">1.2</option>
+                    <option value="1.6">1.6</option>
+                    <option value="2.0">2.0</option>
                   </select>
                 </div>
                 <div>
-                  <label className="block font-semibold mb-1">Page Margin (mm)</label>
+                  <label className="block font-semibold mb-1">{t.creator.margins}</label>
                   <input
                     type="number"
                     min={5}
@@ -664,7 +674,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
 
               <div className="grid grid-cols-2 gap-2">
                 <label className="flex items-center gap-2">
-                  <span>Page Bg:</span>
+                  <span>{language === 'bn' ? 'পৃষ্ঠার রঙ:' : 'Page Bg:'}</span>
                   <input
                     type="color"
                     value={settings.backgroundColor}
@@ -678,20 +688,20 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
                     onChange={(e) => setSettings((s) => ({ ...s, borderEnabled: e.target.checked }))}
                     className="accent-[#2563EB]"
                   />
-                  <span>Page Border</span>
+                  <span>{language === 'bn' ? 'পৃষ্ঠার বর্ডার' : 'Page Border'}</span>
                 </label>
               </div>
 
               <input
                 type="text"
-                placeholder="Header text..."
+                placeholder={language === 'bn' ? 'হেডার টেক্সট...' : 'Header text...'}
                 value={settings.headerText}
                 onChange={(e) => setSettings((s) => ({ ...s, headerText: e.target.value }))}
                 className="w-full min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
               />
               <input
                 type="text"
-                placeholder="Footer text..."
+                placeholder={language === 'bn' ? 'ফুটার টেক্সট...' : 'Footer text...'}
                 value={settings.footerText}
                 onChange={(e) => setSettings((s) => ({ ...s, footerText: e.target.value }))}
                 className="w-full min-h-[40px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800"
@@ -703,7 +713,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
                   onChange={(e) => setSettings((s) => ({ ...s, pageNumbering: e.target.checked }))}
                   className="accent-[#2563EB]"
                 />
-                <span>Automatic Page Numbering</span>
+                <span>{language === 'bn' ? 'স্বয়ংক্রিয় পৃষ্ঠা নম্বর' : 'Automatic Page Numbering'}</span>
               </label>
             </div>
 
@@ -711,7 +721,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
               onClick={() => setShowPageSettings(false)}
               className="w-full min-h-[46px] rounded-xl bg-[#2563EB] text-white text-sm font-semibold"
             >
-              Apply Page Settings
+              {language === 'bn' ? 'সেটিংস প্রয়োগ করুন' : 'Apply Page Settings'}
             </button>
           </div>
         </div>
@@ -722,7 +732,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 backdrop-blur-sm p-4">
           <div className="w-full max-w-sm rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-3">
             <h3 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
-              Insert Hyperlink
+              {language === 'bn' ? 'লিংক যোগ করুন' : 'Insert Hyperlink'}
             </h3>
             <input
               type="url"
@@ -737,7 +747,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
                 onClick={() => setShowLinkModal(false)}
                 className="min-h-[44px] rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold"
               >
-                Cancel
+                {t.files.cancel}
               </button>
               <button
                 onClick={() => {
@@ -756,7 +766,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
                 disabled={!linkUrl.trim()}
                 className="min-h-[44px] rounded-xl bg-[#2563EB] disabled:opacity-40 text-white text-xs font-semibold"
               >
-                Insert Link
+                {language === 'bn' ? 'লিংক যোগ করুন' : 'Insert Link'}
               </button>
             </div>
           </div>

@@ -21,7 +21,7 @@ import {
   addPageNumbersToPdf,
   addWatermarkToPdf,
   cloneBuffer,
-  compressPdfBytes,
+  compressPdfWithReport,
   encryptVaultBytes,
   extractDocumentPagesText,
   getPdfDocumentInfo,
@@ -60,29 +60,35 @@ interface ToolRunnerModalProps {
   onUpdateExistingDoc: (updated: DocumentRecord) => Promise<void>;
 }
 
-const TOOL_TITLES: Record<string, string> = {
-  merge: 'Merge PDFs',
-  split: 'Split PDF',
-  compress: 'Compress PDF',
-  rotate: 'Rotate PDF',
-  pageSetup: 'Page Size & Orientation',
-  watermark: 'Add Watermark',
-  pageNumbers: 'Add Page Numbers',
-  headerFooter: 'Add Header & Footer',
-  protectVault: 'Protect PDF (AES-256 Vault)',
-  unlockPdf: 'Remove PDF Password',
-  extractImages: 'PDF to Images / Extract Images',
-  extractText: 'Extract PDF Text (.TXT)',
-  editMetadata: 'Edit PDF Metadata',
-  repairPdf: 'Repair Damaged PDF',
-  imagesToPdf: 'Images to PDF',
-  pdfToDocx: 'PDF to Word (.DOCX)',
-  pdfToXlsx: 'PDF to Excel (.XLSX)',
-  pdfToPptx: 'PDF to PowerPoint (.PPTX)',
-  wordToPdf: 'Word (.DOCX) to PDF',
-  excelToPdf: 'Excel (.XLSX) to PDF',
-  pptToPdf: 'PowerPoint (.PPTX) to PDF',
+const TOOL_TITLES: Record<string, { en: string; bn: string }> = {
+  merge: { en: 'Merge PDFs', bn: 'পিডিএফ মার্জ' },
+  split: { en: 'Split PDF', bn: 'পিডিএফ স্প্লিট' },
+  compress: { en: 'Compress PDF', bn: 'পিডিএফ কমপ্রেস' },
+  rotate: { en: 'Rotate PDF', bn: 'পিডিএফ ঘোরান' },
+  pageSetup: { en: 'Page Size & Orientation', bn: 'পেজ সাইজ ও দিক' },
+  watermark: { en: 'Add Watermark', bn: 'ওয়াটারমার্ক যোগ' },
+  pageNumbers: { en: 'Add Page Numbers', bn: 'পেজ নম্বর যোগ' },
+  headerFooter: { en: 'Add Header & Footer', bn: 'হেডার ও ফুটার যোগ' },
+  protectVault: { en: 'Protect PDF (AES-256 Vault)', bn: 'ভল্ট পাসওয়ার্ড সুরক্ষা (AES-256)' },
+  unlockPdf: { en: 'Remove PDF Password', bn: 'পাসওয়ার্ড সরান' },
+  extractImages: { en: 'PDF to Images', bn: 'পিডিএফ থেকে ছবি' },
+  extractText: { en: 'Extract PDF Text (.TXT)', bn: 'টেক্সট এক্সট্র্যাক্ট (.TXT)' },
+  editMetadata: { en: 'Edit PDF Metadata', bn: 'মেটাডাটা সম্পাদনা' },
+  repairPdf: { en: 'Repair Damaged PDF', bn: 'ক্ষতিগ্রস্ত পিডিএফ মেরামত' },
+  imagesToPdf: { en: 'Images to PDF', bn: 'ছবি থেকে পিডিএফ' },
+  pdfToDocx: { en: 'PDF to Word (.DOCX)', bn: 'পিডিএফ থেকে ওয়ার্ড (.DOCX)' },
+  pdfToXlsx: { en: 'PDF to Excel (.XLSX)', bn: 'পিডিএফ থেকে এক্সেল (.XLSX)' },
+  pdfToPptx: { en: 'PDF to PowerPoint (.PPTX)', bn: 'পিডিএফ থেকে পাওয়ারপয়েন্ট (.PPTX)' },
+  wordToPdf: { en: 'Word (.DOCX) to PDF', bn: 'ওয়ার্ড থেকে পিডিএফ' },
+  excelToPdf: { en: 'Excel (.XLSX) to PDF', bn: 'এক্সেল থেকে পিডিএফ' },
+  pptToPdf: { en: 'PowerPoint (.PPTX) to PDF', bn: 'পাওয়ারপয়েন্ট থেকে পিডিএফ' },
 };
+
+function getToolTitle(toolId: string, lang: AppLanguage): string {
+  const entry = TOOL_TITLES[toolId];
+  if (!entry) return lang === 'bn' ? 'পিডিএফ টুল' : 'PDF Tool';
+  return entry[lang];
+}
 
 interface MergeSourceItem {
   id: string;
@@ -139,7 +145,10 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
 
   // Tool parameters
   const [splitRange, setSplitRange] = useState('1');
-  const [compressMode, setCompressMode] = useState<'object-streams' | 'raster-medium' | 'raster-compact'>('raster-medium');
+  const [compressMode, setCompressMode] = useState<'object-streams' | 'raster-medium' | 'raster-compact' | 'target-size'>('raster-medium');
+  const [targetKb, setTargetKb] = useState(500);
+  const [exportImgFormat, setExportImgFormat] = useState<'image/png' | 'image/jpeg'>('image/png');
+  const [exportDpi, setExportDpi] = useState<150 | 300>(150);
   const [rotateAngle, setRotateAngle] = useState(90);
   const [targetPaperSize, setTargetPaperSize] = useState<PaperSizeKey>('A4');
   const [targetOrientation, setTargetOrientation] = useState<'portrait' | 'landscape'>('portrait');
@@ -339,21 +348,38 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         );
         setResultMsg(`Created split PDF with ${pagesToKeep.length} page(s).`);
       } else if (toolId === 'compress') {
-        if (!primaryDoc) throw new Error('Select a PDF to compress.');
-        const compressed = await compressPdfBytes(primaryDoc.pdfBytes, compressMode);
+        if (!primaryDoc) {
+          throw new Error(language === 'bn' ? 'কমপ্রেস করতে একটি পিডিএফ বাছুন।' : 'Select a PDF to compress.');
+        }
+        const safeTargetKb = Math.max(40, Math.min(25000, Number(targetKb) || 500));
+        const { bytes: compressed, achievedTarget } = await compressPdfWithReport(
+          primaryDoc.pdfBytes,
+          compressMode,
+          compressMode === 'target-size' ? safeTargetKb * 1024 : undefined
+        );
         await saveNewPdf(
           compressed,
           primaryDoc.name.replace(/\.pdf$/i, '_compressed.pdf'),
           'edited',
-          `Compressed (${compressMode})`
+          compressMode === 'target-size' ? `Target <= ${safeTargetKb} KB` : `Compressed (${compressMode})`
         );
         const pct = Math.max(
           0,
           Math.round(((primaryDoc.sizeBytes - compressed.byteLength) / primaryDoc.sizeBytes) * 100)
         );
-        setResultMsg(
-          `Compressed from ${formatBytes(primaryDoc.sizeBytes)} to ${formatBytes(compressed.byteLength)} (${pct}% smaller).`
-        );
+        if (compressMode === 'target-size' && !achievedTarget) {
+          setResultMsg(
+            language === 'bn'
+              ? `সর্বোচ্চ কমপ্রেস করে ${formatBytes(primaryDoc.sizeBytes)} থেকে ${formatBytes(compressed.byteLength)} করা হয়েছে (টার্গেট ${safeTargetKb} KB-এর চেয়ে কিছু বড়)।`
+              : `Compressed from ${formatBytes(primaryDoc.sizeBytes)} to ${formatBytes(compressed.byteLength)} (closest achievable above ${safeTargetKb} KB target).`
+          );
+        } else {
+          setResultMsg(
+            language === 'bn'
+              ? `${formatBytes(primaryDoc.sizeBytes)} থেকে ${formatBytes(compressed.byteLength)} হয়েছে (${pct}% কমেছে)।`
+              : `Compressed from ${formatBytes(primaryDoc.sizeBytes)} to ${formatBytes(compressed.byteLength)} (${pct}% smaller).`
+          );
+        }
       } else if (toolId === 'rotate') {
         if (!primaryDoc) throw new Error('Select a PDF to rotate.');
         const out = await rotateAllPages(primaryDoc.pdfBytes, rotateAngle);
@@ -435,15 +461,27 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         );
         setResultMsg('Unlocked PDF saved to your Document Vault.');
       } else if (toolId === 'extractImages') {
-        if (!primaryDoc) throw new Error('Select a PDF.');
-        const { zipBuffer, previewImages } = await pdfToImagesZip(primaryDoc.pdfBytes, 'image/png');
+        if (!primaryDoc) {
+          throw new Error(language === 'bn' ? 'একটি পিডিএফ নির্বাচন করুন।' : 'Select a PDF.');
+        }
+        const renderScale = exportDpi === 300 ? 3.2 : 2;
+        const { zipBuffer, previewImages } = await pdfToImagesZip(
+          primaryDoc.pdfBytes,
+          exportImgFormat,
+          renderScale
+        );
         setPreviewUrls(previewImages);
         await saveBufferToDeviceStorage(
           zipBuffer,
           primaryDoc.name.replace(/\.pdf$/i, '_pages.zip'),
           'application/zip'
         );
-        setResultMsg(`Exported ${previewImages.length} PNG page image(s) as ZIP.`);
+        const fmtLabel = exportImgFormat === 'image/jpeg' ? 'JPG' : 'PNG';
+        setResultMsg(
+          language === 'bn'
+            ? `${previewImages.length}টি ${fmtLabel} ছবি (${exportDpi} DPI) ZIP হিসেবে এক্সপোর্ট হয়েছে।`
+            : `Exported ${previewImages.length} ${fmtLabel} page image(s) at ${exportDpi} DPI as ZIP.`
+        );
       } else if (toolId === 'extractText') {
         if (!primaryDoc) throw new Error('Select a PDF.');
         const pages = await extractDocumentPagesText(primaryDoc.pdfBytes);
@@ -677,7 +715,7 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           <ArrowLeft className="w-5 h-5" />
         </button>
         <h1 className="font-display text-sm font-bold text-[#142B4A] dark:text-white">
-          {TOOL_TITLES[toolId] || 'PDF Tool'}
+          {getToolTitle(toolId, language)}
         </h1>
       </header>
 
@@ -959,11 +997,11 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                           >
                             {inQueue ? (
                               <>
-                                <Check className="w-3 h-3" /> Added
+                                <Check className="w-3 h-3" /> {language === 'bn' ? 'যোগ হয়েছে' : 'Added'}
                               </>
                             ) : (
                               <>
-                                <Plus className="w-3 h-3" /> Add
+                                <Plus className="w-3 h-3" /> {language === 'bn' ? 'যোগ' : 'Add'}
                               </>
                             )}
                           </span>
@@ -1030,7 +1068,9 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           {toolId === 'split' && (
             <div>
               <label className="block text-xs font-semibold text-slate-500 mb-1">
-                Pages to Extract (e.g. 1-2, 4{primaryDoc ? ` · max ${primaryDoc.pageCount}` : ''})
+                {language === 'bn'
+                  ? `আলাদা করার পৃষ্ঠা নম্বর (যেমন 1-2, 4${primaryDoc ? ` · সর্বোচ্চ ${primaryDoc.pageCount}` : ''})`
+                  : `Pages to Extract (e.g. 1-2, 4${primaryDoc ? ` · max ${primaryDoc.pageCount}` : ''})`}
               </label>
               <input
                 type="text"
@@ -1042,26 +1082,116 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           )}
 
           {toolId === 'compress' && (
-            <div className="grid grid-cols-3 gap-1.5">
-              {(
-                [
-                  { id: 'object-streams', label: 'Lossless' },
-                  { id: 'raster-medium', label: 'Balanced' },
-                  { id: 'raster-compact', label: 'Maximum' },
-                ] as const
-              ).map((m) => (
-                <button
-                  key={m.id}
-                  onClick={() => setCompressMode(m.id)}
-                  className={`min-h-[42px] rounded-xl text-xs font-semibold border ${
-                    compressMode === m.id
-                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
-                      : 'border-slate-200 dark:border-slate-700'
-                  }`}
-                >
-                  {m.label}
-                </button>
-              ))}
+            <div className="space-y-3">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                {(
+                  [
+                    { id: 'object-streams', label: language === 'bn' ? 'লসলেস' : 'Lossless' },
+                    { id: 'raster-medium', label: language === 'bn' ? 'ব্যালান্সড' : 'Balanced' },
+                    { id: 'raster-compact', label: language === 'bn' ? 'সর্বোচ্চ' : 'Maximum' },
+                    { id: 'target-size', label: language === 'bn' ? 'টার্গেট সাইজ' : 'Target Size' },
+                  ] as const
+                ).map((m) => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    onClick={() => setCompressMode(m.id)}
+                    className={`min-h-[42px] px-2 rounded-xl text-xs font-semibold border ${
+                      compressMode === m.id
+                        ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                        : 'border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+
+              {compressMode === 'target-size' && (
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 space-y-2.5 text-xs">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    {[100, 200, 500, 1024].map((kb) => (
+                      <button
+                        key={kb}
+                        type="button"
+                        onClick={() => setTargetKb(kb)}
+                        className={`px-2.5 py-1.5 rounded-lg font-mono-nums font-semibold border ${
+                          targetKb === kb
+                            ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                            : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                        }`}
+                      >
+                        {kb >= 1024 ? '1 MB' : `${kb} KB`}
+                      </button>
+                    ))}
+                  </div>
+                  <label className="flex items-center justify-between gap-2">
+                    <span className="font-semibold text-slate-600 dark:text-slate-300">
+                      {language === 'bn' ? 'টার্গেট সাইজ (KB):' : 'Target Max Size (KB):'}
+                    </span>
+                    <input
+                      type="number"
+                      min={40}
+                      max={25000}
+                      value={targetKb}
+                      onChange={(e) => setTargetKb(Number(e.target.value) || 200)}
+                      className="w-28 min-h-[38px] px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-nums text-right"
+                    />
+                  </label>
+                </div>
+              )}
+            </div>
+          )}
+
+          {toolId === 'extractImages' && (
+            <div className="grid grid-cols-2 gap-2.5 text-xs">
+              <div>
+                <label className="block font-semibold text-slate-500 mb-1">
+                  {language === 'bn' ? 'ছবির ফরম্যাট' : 'Image Format'}
+                </label>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {(
+                    [
+                      { id: 'image/png', label: 'PNG' },
+                      { id: 'image/jpeg', label: 'JPG' },
+                    ] as const
+                  ).map((f) => (
+                    <button
+                      key={f.id}
+                      type="button"
+                      onClick={() => setExportImgFormat(f.id)}
+                      className={`min-h-[40px] rounded-xl font-bold border ${
+                        exportImgFormat === f.id
+                          ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                          : 'border-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <label className="block font-semibold text-slate-500 mb-1">
+                  {language === 'bn' ? 'রেজোলিউশন (DPI)' : 'Resolution (DPI)'}
+                </label>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {([150, 300] as const).map((dpi) => (
+                    <button
+                      key={dpi}
+                      type="button"
+                      onClick={() => setExportDpi(dpi)}
+                      className={`min-h-[40px] rounded-xl font-mono-nums font-bold border ${
+                        exportDpi === dpi
+                          ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                          : 'border-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      {dpi} DPI
+                    </button>
+                  ))}
+                </div>
+              </div>
             </div>
           )}
 
@@ -1224,10 +1354,12 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                 className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
               />
               {toolId === 'protectVault' && (
-                <p className="text-[11px] text-slate-500 flex items-start gap-1.5">
+                <p className="text-[11px] text-slate-500 flex items-start gap-1.5 leading-relaxed">
                   <Lock className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#2563EB]" />
                   <span>
-                    Uses Web Crypto AES-256-GCM with PBKDF2 (100,000 iterations) to lock the document inside your device Vault.
+                    {language === 'bn'
+                      ? 'এটি PDF MASTER-এর নিজস্ব লোকাল AES-256-GCM ভল্ট এনক্রিপশন (PBKDF2)। বাইরের রিডারে শেয়ার বা খোলার আগে ফাইলস ট্যাব থেকে ডিক্রিপ্ট করুন।'
+                      : 'Locks the document inside PDF MASTER local Vault using Web Crypto AES-256-GCM (PBKDF2). Unlock it from Files before sharing to external PDF readers.'}
                   </span>
                 </p>
               )}
@@ -1235,7 +1367,9 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                 <p className="text-[11px] text-slate-500 flex items-start gap-1.5">
                   <Unlock className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#2563EB]" />
                   <span>
-                    Only unlock documents you are legally authorized to access.
+                    {language === 'bn'
+                      ? 'শুধুমাত্র আপনার বৈধ অ্যাক্সেস থাকা ডকুমেন্টই আনলক করুন।'
+                      : 'Only unlock documents you are legally authorized to access.'}
                   </span>
                 </p>
               )}
@@ -1248,28 +1382,28 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                 type="text"
                 value={metaTitle}
                 onChange={(e) => setMetaTitle(e.target.value)}
-                placeholder="Document Title"
+                placeholder={language === 'bn' ? 'ডকুমেন্ট শিরোনাম' : 'Document Title'}
                 className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
               />
               <input
                 type="text"
                 value={metaAuthor}
                 onChange={(e) => setMetaAuthor(e.target.value)}
-                placeholder="Author"
+                placeholder={language === 'bn' ? 'লেখক' : 'Author'}
                 className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
               />
               <input
                 type="text"
                 value={metaSubject}
                 onChange={(e) => setMetaSubject(e.target.value)}
-                placeholder="Subject"
+                placeholder={language === 'bn' ? 'বিষয়' : 'Subject'}
                 className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
               />
               <input
                 type="text"
                 value={metaKeywords}
                 onChange={(e) => setMetaKeywords(e.target.value)}
-                placeholder="Keywords (comma separated)"
+                placeholder={language === 'bn' ? 'কীওয়ার্ড (কমা দিয়ে)' : 'Keywords (comma separated)'}
                 className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
               />
             </div>
@@ -1281,7 +1415,13 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
             className="w-full min-h-[48px] rounded-xl bg-[#2563EB] disabled:opacity-40 text-white text-sm font-semibold flex items-center justify-center gap-2"
           >
             <Download className="w-4 h-4" />
-            <span>{running ? 'Processing...' : `Run ${TOOL_TITLES[toolId] || 'Tool'}`}</span>
+            <span>
+              {running
+                ? language === 'bn'
+                  ? 'কাজ চলছে...'
+                  : 'Processing...'
+                : `${language === 'bn' ? 'চালান:' : 'Run'} ${getToolTitle(toolId, language)}`}
+            </span>
           </button>
 
           {resultMsg && (

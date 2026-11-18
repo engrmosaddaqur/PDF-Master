@@ -77,6 +77,7 @@ export interface DocumentRecord {
   editableHtml?: string;
   wordSettings?: WordPageSettings;
   bookmarks?: number[];
+  lastReadPage?: number;
   versions: DocumentVersion[];
   sha256Seal?: string;
   isVaultLocked?: boolean;
@@ -143,6 +144,21 @@ export interface TextReplacementEdit {
   underline: boolean;
   align: 'left' | 'center' | 'right';
   letterSpacing: number;
+  backgroundColor?: string;
+}
+
+export interface PdfFormFieldDescriptor {
+  name: string;
+  pageNumber: number;
+  kind: 'text' | 'checkbox' | 'dropdown' | 'radio';
+  value: string;
+  checked: boolean;
+  options?: string[];
+  /** Unrotated top-left viewport coordinates at scale 1 */
+  x: number;
+  y: number;
+  width: number;
+  height: number;
 }
 
 export interface AddedTextBox {

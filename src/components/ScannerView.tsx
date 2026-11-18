@@ -92,6 +92,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   const [step, setStep] = useState<'capture' | 'crop' | 'review'>('capture');
   const [dragTarget, setDragTarget] = useState<DragTarget | null>(null);
   const [saving, setSaving] = useState(false);
+  const [applyBatchNotice, setApplyBatchNotice] = useState<string | null>(null);
   const smoothedBoundsRef = useRef<DocumentBoundsResult | null>(null);
   const stableLockTicksRef = useRef<number>(0);
   const lastAutoSnapRef = useRef<number>(0);
@@ -386,6 +387,32 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     setPages((prev) => prev.map((p, i) => (i === activeIdx ? updated : p)));
   };
 
+  const applyEnhancementsToAll = () => {
+    if (!activePage || pages.length <= 1) return;
+    const { filter, brightness, contrast, sharpen } = activePage;
+    setPages((prev) =>
+      prev.map((p) => {
+        const nextUrl = applyScanEnhancement(p.warpedCanvas, {
+          filter,
+          brightness,
+          contrast,
+          sharpen,
+          rotation: p.rotation,
+        });
+        return {
+          ...p,
+          filter,
+          brightness,
+          contrast,
+          sharpen,
+          processedUrl: nextUrl,
+        };
+      })
+    );
+    setApplyBatchNotice(t.scanner.applyToAllDone);
+    setTimeout(() => setApplyBatchNotice(null), 2400);
+  };
+
   const handleCropPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!dragTarget || !cropBoxRef.current || !activePage) return;
     const rect = cropBoxRef.current.getBoundingClientRect();
@@ -543,7 +570,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
               className="min-h-[40px] px-3.5 rounded-xl bg-[#2563EB] text-xs font-semibold flex items-center gap-1.5"
             >
               <Check className="w-4 h-4" />
-              <span>{saving ? 'Saving...' : t.scanner.saveAsPdf}</span>
+              <span>{saving ? (language === 'bn' ? 'সেভ হচ্ছে...' : 'Saving...') : t.scanner.saveAsPdf}</span>
             </button>
           </div>
         )}
@@ -1108,7 +1135,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                 className="flex-1 min-h-[46px] rounded-xl bg-[#2563EB] text-xs font-semibold flex items-center justify-center gap-1.5"
               >
                 <Check className="w-4 h-4" />
-                Apply Warp
+                {t.scanner.applyWarp}
               </button>
             </div>
           </div>
@@ -1170,7 +1197,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                 <label className="space-y-1">
                   <span className="flex items-center justify-between text-slate-400">
                     <span className="flex items-center gap-1">
-                      <SlidersHorizontal className="w-3.5 h-3.5" /> Brightness
+                      <SlidersHorizontal className="w-3.5 h-3.5" /> {t.scanner.brightness}
                     </span>
                     <span className="font-mono-nums">{activePage.brightness}</span>
                   </span>
@@ -1185,7 +1212,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                 </label>
                 <label className="space-y-1">
                   <span className="flex items-center justify-between text-slate-400">
-                    <span>Contrast</span>
+                    <span>{t.scanner.contrast}</span>
                     <span className="font-mono-nums">{activePage.contrast}</span>
                   </span>
                   <input
@@ -1199,6 +1226,24 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                 </label>
               </div>
 
+              {pages.length > 1 && (
+                <div className="flex items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={applyEnhancementsToAll}
+                    className="min-h-[38px] px-3 rounded-xl bg-cyan-500/15 border border-cyan-500/35 text-cyan-300 text-xs font-semibold flex items-center gap-1.5"
+                  >
+                    <Layers className="w-3.5 h-3.5" />
+                    <span>{t.scanner.applyToAll}</span>
+                  </button>
+                  {applyBatchNotice && (
+                    <span className="text-[11px] font-semibold text-emerald-400 truncate">
+                      {applyBatchNotice}
+                    </span>
+                  )}
+                </div>
+              )}
+
               <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar pt-1">
                 <button
                   onClick={() =>
@@ -1206,13 +1251,13 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                   }
                   className="min-h-[40px] px-3 rounded-xl bg-slate-800 text-xs font-semibold flex items-center gap-1.5 shrink-0"
                 >
-                  <RotateCw className="w-3.5 h-3.5" /> Rotate
+                  <RotateCw className="w-3.5 h-3.5" /> {t.scanner.rotate}
                 </button>
                 <button
                   onClick={() => setStep('crop')}
                   className="min-h-[40px] px-3 rounded-xl bg-slate-800 text-xs font-semibold flex items-center gap-1.5 shrink-0"
                 >
-                  <Crop className="w-3.5 h-3.5" /> Adjust Crop
+                  <Crop className="w-3.5 h-3.5" /> {t.scanner.adjustCrop}
                 </button>
                 <button
                   onClick={() => reprocessActivePage({ sharpen: !activePage.sharpen })}
@@ -1222,7 +1267,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                       : 'bg-slate-800 text-slate-300'
                   }`}
                 >
-                  Sharpen: {activePage.sharpen ? 'On' : 'Off'}
+                  {t.scanner.sharpen}: {activePage.sharpen ? (language === 'bn' ? 'চালু' : 'On') : (language === 'bn' ? 'বন্ধ' : 'Off')}
                 </button>
                 {pages.length > 1 && (
                   <>
@@ -1269,7 +1314,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
                   }}
                   className="min-h-[40px] px-3 rounded-xl bg-rose-950/60 text-rose-300 text-xs font-semibold flex items-center gap-1 shrink-0"
                 >
-                  <Trash2 className="w-3.5 h-3.5" /> Delete
+                  <Trash2 className="w-3.5 h-3.5" /> {t.scanner.deletePage}
                 </button>
                 <button
                   onClick={() => {

@@ -1,20 +1,26 @@
 import React, { useEffect, useMemo, useState } from 'react';
+import JSZip from 'jszip';
 import {
+  Archive,
   ArrowUpDown,
+  CheckSquare,
   Copy,
   Download,
   Edit3,
   FileText,
   FileUp,
   Folder,
+  FolderInput,
   FolderPlus,
   History,
   Info,
+  Layers,
   Lock,
   MoreVertical,
   RotateCcw,
   Search,
   Share2,
+  Square,
   Star,
   Trash2,
   Unlock,
@@ -27,13 +33,20 @@ import type {
   FolderRecord,
 } from '../types';
 import { getT } from '../i18n/translations';
-import { decryptVaultBytes } from '../services/pdfEngine';
+import {
+  cloneBuffer,
+  decryptVaultBytes,
+  getPdfDocumentInfo,
+  mergePdfs,
+  renderPageThumbnail,
+} from '../services/pdfEngine';
 import {
   downloadArrayBuffer,
   formatBytes,
   formatRelativeTime,
 } from '../services/storageService';
 import {
+  emitAppToast,
   saveBufferToDeviceStorage,
   shareBufferNativeOrWeb,
 } from '../services/deviceFileActions';
@@ -47,6 +60,7 @@ interface FilesTabProps {
   onOpenDoc: (doc: DocumentRecord) => void;
   onEditDoc: (doc: DocumentRecord) => void;
   onUpdateDoc: (doc: DocumentRecord) => Promise<void>;
+  onSaveNewDoc?: (newDoc: DocumentRecord) => Promise<void>;
   onDuplicateDoc: (doc: DocumentRecord) => Promise<void>;
   onDeleteForever: (id: string) => Promise<void>;
   onCreateFolder: (name: string) => Promise<void>;
@@ -61,6 +75,7 @@ export const FilesTab: React.FC<FilesTabProps> = ({
   onOpenDoc,
   onEditDoc,
   onUpdateDoc,
+  onSaveNewDoc,
   onDuplicateDoc,
   onDeleteForever,
   onCreateFolder,
@@ -79,10 +94,17 @@ export const FilesTab: React.FC<FilesTabProps> = ({
   const [renameValue, setRenameValue] = useState('');
   const [showNewFolderModal, setShowNewFolderModal] = useState(false);
   const [newFolderName, setNewFolderName] = useState('');
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+  const [batchBusy, setBatchBusy] = useState(false);
+  const [showBatchMoveModal, setShowBatchMoveModal] = useState(false);
+  const [batchTargetFolderId, setBatchTargetFolderId] = useState('');
 
   useEffect(() => {
     setCategory(initialCategory);
     setActiveFolderId(null);
+    setSelectionMode(false);
+    setSelectedIds(new Set());
   }, [initialCategory]);
 
   const categories: Array<{ id: DocumentCategory; label: string }> = [
@@ -187,7 +209,137 @@ export const FilesTab: React.FC<FilesTabProps> = ({
       setUnlockPass('');
       setUnlockError(null);
     } catch {
-      setUnlockError('Incorrect password');
+      setUnlockError(language === 'bn' ? 'পাসওয়ার্ড ভুল হয়েছে' : 'Incorrect password');
+    }
+  };
+
+  const selectedDocs = useMemo(
+    () => docs.filter((d) => selectedIds.has(d.id)),
+    [docs, selectedIds]
+  );
+
+  const toggleSelectDoc = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const exitSelectionMode = () => {
+    setSelectionMode(false);
+    setSelectedIds(new Set());
+  };
+
+  const handleBatchMerge = async () => {
+    const mergeable = selectedDocs.filter((d) => !d.isVaultLocked && !d.isTrashed);
+    if (mergeable.length < 2 || !onSaveNewDoc) return;
+    setBatchBusy(true);
+    try {
+      const merged = await mergePdfs(mergeable.map((d) => d.pdfBytes));
+      const info = await getPdfDocumentInfo(merged).catch(() => ({ pageCount: 1 }));
+      const thumb = await renderPageThumbnail(merged, 1, 200).catch(() => undefined);
+      const now = Date.now();
+      const outName = `Merged_${new Date(now).toISOString().slice(0, 10)}.pdf`;
+      await onSaveNewDoc({
+        id: `doc_merge_${now}`,
+        name: outName,
+        origin: 'edited',
+        createdAt: now,
+        updatedAt: now,
+        lastOpenedAt: now,
+        sizeBytes: merged.byteLength,
+        pageCount: info.pageCount,
+        isStarred: false,
+        isShared: false,
+        isTrashed: false,
+        folderId: null,
+        thumbnailDataUrl: thumb,
+        pdfBytes: cloneBuffer(merged),
+        versions: [
+          {
+            id: `ver_${now}`,
+            timestamp: now,
+            note: `Merged ${mergeable.length} PDFs`,
+            sizeBytes: merged.byteLength,
+            pdfBytes: cloneBuffer(merged),
+          },
+        ],
+      });
+      emitAppToast({
+        message:
+          language === 'bn'
+            ? `${mergeable.length}টি পিডিএফ একসাথে মার্জ হয়েছে`
+            : `Merged ${mergeable.length} PDFs into ${outName}`,
+        variant: 'success',
+      });
+      exitSelectionMode();
+    } catch {
+      emitAppToast({
+        message: language === 'bn' ? 'পিডিএফ মার্জ করা যায়নি' : 'Failed to merge selected PDFs',
+        variant: 'error',
+      });
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const handleBatchZip = async () => {
+    const exportable = selectedDocs.filter((d) => !d.isVaultLocked);
+    if (exportable.length === 0) return;
+    setBatchBusy(true);
+    try {
+      const zip = new JSZip();
+      const usedNames = new Set<string>();
+      for (const d of exportable) {
+        let fname = d.name;
+        let idx = 2;
+        while (usedNames.has(fname)) {
+          fname = d.name.replace(/\.pdf$/i, `_${idx}.pdf`);
+          idx += 1;
+        }
+        usedNames.add(fname);
+        zip.file(fname, d.pdfBytes.slice(0));
+      }
+      const zipBuf = await zip.generateAsync({ type: 'arraybuffer' });
+      await saveBufferToDeviceStorage(
+        zipBuf,
+        `PDF-Master-Selected-${new Date().toISOString().slice(0, 10)}.zip`,
+        'application/zip'
+      );
+      exitSelectionMode();
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const handleBatchTrashOrRestore = async () => {
+    if (selectedDocs.length === 0) return;
+    setBatchBusy(true);
+    try {
+      const targetTrashed = category !== 'trash';
+      for (const d of selectedDocs) {
+        await onUpdateDoc({ ...d, isTrashed: targetTrashed, updatedAt: Date.now() });
+      }
+      exitSelectionMode();
+    } finally {
+      setBatchBusy(false);
+    }
+  };
+
+  const handleBatchMoveSubmit = async () => {
+    if (selectedDocs.length === 0) return;
+    setBatchBusy(true);
+    try {
+      const folderVal = batchTargetFolderId || null;
+      for (const d of selectedDocs) {
+        await onUpdateDoc({ ...d, folderId: folderVal, updatedAt: Date.now() });
+      }
+      setShowBatchMoveModal(false);
+      exitSelectionMode();
+    } finally {
+      setBatchBusy(false);
     }
   };
 
@@ -282,19 +434,108 @@ export const FilesTab: React.FC<FilesTabProps> = ({
         </div>
       )}
 
-      {/* Sort Control Row */}
-      <div className="flex items-center justify-between">
+      {/* Sort & Multi-Select Control Row */}
+      <div className="flex items-center justify-between gap-2">
         <span className="text-xs text-slate-500 dark:text-slate-400">
           {filteredDocs.length} {language === 'bn' ? 'টি ডকুমেন্ট' : 'shown'}
         </span>
-        <button
-          onClick={cycleSort}
-          className="min-h-[36px] px-2.5 rounded-xl text-xs font-semibold text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white flex items-center gap-1.5"
-        >
-          <ArrowUpDown className="w-3.5 h-3.5" />
-          <span>{sortLabel}</span>
-        </button>
+        <div className="flex items-center gap-1.5">
+          {filteredDocs.length > 0 && (
+            <button
+              type="button"
+              onClick={() => {
+                if (selectionMode) {
+                  exitSelectionMode();
+                } else {
+                  setSelectionMode(true);
+                }
+              }}
+              className={`min-h-[36px] px-3 rounded-xl text-xs font-bold flex items-center gap-1.5 border transition-colors ${
+                selectionMode
+                  ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                  : 'bg-white dark:bg-[#121929] border-slate-200 dark:border-[#1E293B] text-slate-600 dark:text-slate-300'
+              }`}
+            >
+              <CheckSquare className="w-3.5 h-3.5" />
+              <span>{selectionMode ? t.files.doneSelecting : t.files.selectMode}</span>
+            </button>
+          )}
+          <button
+            onClick={cycleSort}
+            className="min-h-[36px] px-2.5 rounded-xl text-xs font-semibold text-slate-500 dark:text-slate-400 hover:text-slate-900 dark:hover:text-white flex items-center gap-1.5"
+          >
+            <ArrowUpDown className="w-3.5 h-3.5" />
+            <span>{sortLabel}</span>
+          </button>
+        </div>
       </div>
+
+      {/* Batch Actions Bar when items are selected */}
+      {selectionMode && selectedIds.size > 0 && (
+        <div className="sticky top-2 z-20 rounded-2xl bg-[#142B4A] text-white p-2.5 shadow-xl border border-white/15 flex flex-wrap items-center justify-between gap-2">
+          <span className="text-xs font-bold px-2 font-mono-nums">
+            {selectedIds.size} {t.files.selectedCount}
+          </span>
+          <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar">
+            {category !== 'trash' &&
+              onSaveNewDoc &&
+              selectedDocs.filter((d) => !d.isVaultLocked && !d.isTrashed).length >= 2 && (
+                <button
+                  type="button"
+                  disabled={batchBusy}
+                  onClick={handleBatchMerge}
+                  className="min-h-[36px] px-2.5 rounded-xl bg-[#2563EB] text-xs font-bold flex items-center gap-1 whitespace-nowrap"
+                >
+                  <Layers className="w-3.5 h-3.5" />
+                  <span>{t.files.batchMerge}</span>
+                </button>
+              )}
+            {category !== 'trash' && folders.length > 0 && (
+              <button
+                type="button"
+                disabled={batchBusy}
+                onClick={() => {
+                  setBatchTargetFolderId('');
+                  setShowBatchMoveModal(true);
+                }}
+                className="min-h-[36px] px-2.5 rounded-xl bg-white/15 text-xs font-semibold flex items-center gap-1 whitespace-nowrap"
+              >
+                <FolderInput className="w-3.5 h-3.5" />
+                <span>{t.files.batchMove}</span>
+              </button>
+            )}
+            <button
+              type="button"
+              disabled={batchBusy || selectedDocs.every((d) => d.isVaultLocked)}
+              onClick={handleBatchZip}
+              className="min-h-[36px] px-2.5 rounded-xl bg-white/15 disabled:opacity-40 text-xs font-semibold flex items-center gap-1 whitespace-nowrap"
+            >
+              <Archive className="w-3.5 h-3.5" />
+              <span>{t.files.batchZip}</span>
+            </button>
+            <button
+              type="button"
+              disabled={batchBusy}
+              onClick={handleBatchTrashOrRestore}
+              className={`min-h-[36px] px-2.5 rounded-xl text-xs font-semibold flex items-center gap-1 whitespace-nowrap ${
+                category === 'trash' ? 'bg-emerald-600' : 'bg-rose-600'
+              }`}
+            >
+              {category === 'trash' ? (
+                <>
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  <span>{t.files.batchRestore}</span>
+                </>
+              ) : (
+                <>
+                  <Trash2 className="w-3.5 h-3.5" />
+                  <span>{t.files.batchTrash}</span>
+                </>
+              )}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Documents List */}
       {filteredDocs.length === 0 ? (
@@ -306,72 +547,100 @@ export const FilesTab: React.FC<FilesTabProps> = ({
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          {filteredDocs.map((doc) => (
-            <div
-              key={doc.id}
-              className="flex items-center gap-3.5 p-3.5 rounded-2xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] hover:border-[#3B82F6]/40 transition-colors"
-            >
-              <button
-                onClick={() => {
-                  if (doc.isVaultLocked) {
-                    setUnlockTarget(doc);
-                    return;
-                  }
-                  onOpenDoc(doc);
-                }}
-                className="flex items-center gap-3.5 flex-1 min-w-0 text-left min-h-[68px]"
+          {filteredDocs.map((doc) => {
+            const isSelected = selectedIds.has(doc.id);
+            return (
+              <div
+                key={doc.id}
+                className={`flex items-center gap-3.5 p-3.5 rounded-2xl bg-white dark:bg-[#121929] border transition-colors ${
+                  isSelected
+                    ? 'border-[#2563EB] bg-[#2563EB]/5'
+                    : 'border-slate-200 dark:border-[#1E293B] hover:border-[#3B82F6]/40'
+                }`}
               >
-                <div className="w-14 h-[72px] rounded-xl bg-white border border-slate-200 dark:border-slate-700/70 overflow-hidden relative flex items-center justify-center shrink-0">
-                  {doc.isVaultLocked ? (
-                    <Lock className="w-5 h-5 text-[#3B82F6]" />
-                  ) : doc.thumbnailDataUrl ? (
-                    <img
-                      src={doc.thumbnailDataUrl}
-                      alt={doc.name}
-                      loading="lazy"
-                      decoding="async"
-                      className="w-full h-full object-cover"
-                    />
-                  ) : (
-                    <FileText className="w-5 h-5 text-slate-400" />
-                  )}
-                  <span className="absolute bottom-1 left-1 px-1.5 py-[1px] rounded bg-rose-500 text-white text-[8.5px] font-extrabold tracking-wide">
-                    PDF
-                  </span>
-                </div>
+                {selectionMode && (
+                  <button
+                    type="button"
+                    onClick={() => toggleSelectDoc(doc.id)}
+                    aria-label={isSelected ? 'Deselect file' : 'Select file'}
+                    className="min-h-[44px] min-w-[36px] flex items-center justify-center text-[#2563EB] shrink-0"
+                  >
+                    {isSelected ? (
+                      <CheckSquare className="w-5 h-5" />
+                    ) : (
+                      <Square className="w-5 h-5 text-slate-400" />
+                    )}
+                  </button>
+                )}
 
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-bold text-slate-900 dark:text-white truncate">
-                    {doc.name}
-                  </p>
-                  <p className="text-xs text-slate-500 dark:text-slate-400 font-mono-nums mt-1 truncate">
-                    {formatBytes(doc.sizeBytes)} · {doc.pageCount}{' '}
-                    {language === 'bn' ? 'পৃষ্ঠা' : 'pages'} ·{' '}
-                    {formatRelativeTime(doc.updatedAt, language)}
-                  </p>
-                </div>
-              </button>
+                <button
+                  onClick={() => {
+                    if (selectionMode) {
+                      toggleSelectDoc(doc.id);
+                      return;
+                    }
+                    if (doc.isVaultLocked) {
+                      setUnlockTarget(doc);
+                      return;
+                    }
+                    onOpenDoc(doc);
+                  }}
+                  className="flex items-center gap-3.5 flex-1 min-w-0 text-left min-h-[68px]"
+                >
+                  <div className="w-14 h-[72px] rounded-xl bg-white border border-slate-200 dark:border-slate-700/70 overflow-hidden relative flex items-center justify-center shrink-0">
+                    {doc.isVaultLocked ? (
+                      <Lock className="w-5 h-5 text-[#3B82F6]" />
+                    ) : doc.thumbnailDataUrl ? (
+                      <img
+                        src={doc.thumbnailDataUrl}
+                        alt={doc.name}
+                        loading="lazy"
+                        decoding="async"
+                        className="w-full h-full object-cover"
+                      />
+                    ) : (
+                      <FileText className="w-5 h-5 text-slate-400" />
+                    )}
+                    <span className="absolute bottom-1 left-1 px-1.5 py-[1px] rounded bg-rose-500 text-white text-[8.5px] font-extrabold tracking-wide">
+                      PDF
+                    </span>
+                  </div>
 
-              <div className="flex items-center shrink-0">
-                <button
-                  onClick={() => onUpdateDoc({ ...doc, isStarred: !doc.isStarred })}
-                  aria-label={doc.isStarred ? t.files.unstar : t.files.star}
-                  className="min-h-[44px] min-w-[40px] flex items-center justify-center rounded-xl text-slate-400 hover:text-amber-500"
-                >
-                  <Star
-                    className={`w-4 h-4 ${doc.isStarred ? 'fill-amber-400 text-amber-400' : ''}`}
-                  />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-bold text-slate-900 dark:text-white truncate">
+                      {doc.name}
+                    </p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400 font-mono-nums mt-1 truncate">
+                      {formatBytes(doc.sizeBytes)} · {doc.pageCount}{' '}
+                      {language === 'bn' ? 'পৃষ্ঠা' : 'pages'} ·{' '}
+                      {formatRelativeTime(doc.updatedAt, language)}
+                    </p>
+                  </div>
                 </button>
-                <button
-                  onClick={() => setMenuDoc(doc)}
-                  aria-label="More actions"
-                  className="min-h-[44px] min-w-[40px] flex items-center justify-center rounded-xl text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-[#1A243B]"
-                >
-                  <MoreVertical className="w-4 h-4" />
-                </button>
+
+                {!selectionMode && (
+                  <div className="flex items-center shrink-0">
+                    <button
+                      onClick={() => onUpdateDoc({ ...doc, isStarred: !doc.isStarred })}
+                      aria-label={doc.isStarred ? t.files.unstar : t.files.star}
+                      className="min-h-[44px] min-w-[40px] flex items-center justify-center rounded-xl text-slate-400 hover:text-amber-500"
+                    >
+                      <Star
+                        className={`w-4 h-4 ${doc.isStarred ? 'fill-amber-400 text-amber-400' : ''}`}
+                      />
+                    </button>
+                    <button
+                      onClick={() => setMenuDoc(doc)}
+                      aria-label="More actions"
+                      className="min-h-[44px] min-w-[40px] flex items-center justify-center rounded-xl text-slate-400 hover:text-slate-900 dark:hover:text-white hover:bg-slate-100 dark:hover:bg-[#1A243B]"
+                    >
+                      <MoreVertical className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
@@ -401,7 +670,7 @@ export const FilesTab: React.FC<FilesTabProps> = ({
                     }}
                     className="w-full min-h-[46px] px-3 rounded-xl flex items-center gap-3 text-sm font-medium hover:bg-slate-100 dark:hover:bg-[#1A243B]"
                   >
-                    <Edit3 className="w-4 h-4 text-[#3B82F6]" /> Edit PDF
+                    <Edit3 className="w-4 h-4 text-[#3B82F6]" /> {t.files.editPdf}
                   </button>
                 )}
                 <button
@@ -427,7 +696,7 @@ export const FilesTab: React.FC<FilesTabProps> = ({
                   }}
                   className="w-full min-h-[46px] px-3 rounded-xl flex items-center gap-3 text-sm font-medium hover:bg-slate-100 dark:hover:bg-[#1A243B]"
                 >
-                  <Download className="w-4 h-4 text-[#3B82F6]" /> Download to Device Storage
+                  <Download className="w-4 h-4 text-[#3B82F6]" /> {t.files.downloadToDevice}
                 </button>
                 <button
                   onClick={async () => {
@@ -438,7 +707,7 @@ export const FilesTab: React.FC<FilesTabProps> = ({
                   }}
                   className="w-full min-h-[46px] px-3 rounded-xl flex items-center gap-3 text-sm font-medium hover:bg-slate-100 dark:hover:bg-[#1A243B]"
                 >
-                  <Share2 className="w-4 h-4" /> Share
+                  <Share2 className="w-4 h-4" /> {t.files.share}
                 </button>
                 {folders.length > 0 && (
                   <div className="px-3 py-1.5">
@@ -456,7 +725,7 @@ export const FilesTab: React.FC<FilesTabProps> = ({
                       }}
                       className="w-full min-h-[40px] px-2.5 rounded-xl border border-slate-200 dark:border-[#1E293B] bg-slate-50 dark:bg-[#0D1322] text-xs"
                     >
-                      <option value="">Root Vault</option>
+                      <option value="">{t.files.rootVault}</option>
                       {folders.map((f) => (
                         <option key={f.id} value={f.id}>
                           {f.name}
@@ -521,11 +790,11 @@ export const FilesTab: React.FC<FilesTabProps> = ({
               </button>
             </div>
             <div className="space-y-1.5 text-xs text-slate-600 dark:text-slate-300 font-mono-nums">
-              <p>Name: {infoDoc.name}</p>
-              <p>Origin: {infoDoc.origin}</p>
-              <p>Pages: {infoDoc.pageCount}</p>
-              <p>Size: {formatBytes(infoDoc.sizeBytes)}</p>
-              <p>Updated: {new Date(infoDoc.updatedAt).toLocaleString()}</p>
+              <p>{language === 'bn' ? 'নাম' : 'Name'}: {infoDoc.name}</p>
+              <p>{language === 'bn' ? 'উৎস' : 'Origin'}: {infoDoc.origin}</p>
+              <p>{language === 'bn' ? 'পৃষ্ঠা' : 'Pages'}: {infoDoc.pageCount}</p>
+              <p>{language === 'bn' ? 'আকার' : 'Size'}: {formatBytes(infoDoc.sizeBytes)}</p>
+              <p>{language === 'bn' ? 'আপডেট' : 'Updated'}: {new Date(infoDoc.updatedAt).toLocaleString()}</p>
               {infoDoc.sha256Seal && (
                 <p className="break-all text-emerald-500">
                   SHA-256 Seal: {infoDoc.sha256Seal}
@@ -580,7 +849,7 @@ export const FilesTab: React.FC<FilesTabProps> = ({
               type="password"
               value={unlockPass}
               onChange={(e) => setUnlockPass(e.target.value)}
-              placeholder="Enter Vault password"
+              placeholder={language === 'bn' ? 'ভল্ট পাসওয়ার্ড দিন' : 'Enter Vault password'}
               autoFocus
               className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-[#1E293B] bg-slate-50 dark:bg-[#0D1322] text-sm"
             />
@@ -594,13 +863,13 @@ export const FilesTab: React.FC<FilesTabProps> = ({
                 }}
                 className="min-h-[44px] rounded-xl bg-slate-100 dark:bg-[#1A243B] text-xs font-semibold"
               >
-                Cancel
+                {t.files.cancel}
               </button>
               <button
                 onClick={handleUnlockSubmit}
                 className="min-h-[44px] rounded-xl bg-[#3B82F6] text-white text-xs font-semibold"
               >
-                Decrypt &amp; Open
+                {t.files.decryptOpen}
               </button>
             </div>
           </div>
@@ -627,14 +896,14 @@ export const FilesTab: React.FC<FilesTabProps> = ({
                 onClick={() => setRenameTarget(null)}
                 className="min-h-[44px] rounded-xl bg-slate-100 dark:bg-[#1A243B] text-xs font-semibold"
               >
-                Cancel
+                {t.files.cancel}
               </button>
               <button
                 onClick={handleRenameSubmit}
                 disabled={!renameValue.trim()}
                 className="min-h-[44px] rounded-xl bg-[#3B82F6] disabled:opacity-40 text-white text-xs font-semibold"
               >
-                Save Name
+                {t.files.saveName}
               </button>
             </div>
           </div>
@@ -653,7 +922,7 @@ export const FilesTab: React.FC<FilesTabProps> = ({
               value={newFolderName}
               onChange={(e) => setNewFolderName(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && handleNewFolderSubmit()}
-              placeholder="e.g. Invoices, Tax, Study"
+              placeholder={language === 'bn' ? 'যেমন: বিল, ট্যাক্স, পড়াশোনা' : 'e.g. Invoices, Tax, Study'}
               autoFocus
               className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-[#1E293B] bg-slate-50 dark:bg-[#0D1322] text-sm"
             />
@@ -662,14 +931,52 @@ export const FilesTab: React.FC<FilesTabProps> = ({
                 onClick={() => setShowNewFolderModal(false)}
                 className="min-h-[44px] rounded-xl bg-slate-100 dark:bg-[#1A243B] text-xs font-semibold"
               >
-                Cancel
+                {t.files.cancel}
               </button>
               <button
                 onClick={handleNewFolderSubmit}
                 disabled={!newFolderName.trim()}
                 className="min-h-[44px] rounded-xl bg-[#3B82F6] disabled:opacity-40 text-white text-xs font-semibold"
               >
-                Create Folder
+                {t.files.createFolder}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Batch Move to Folder Modal */}
+      {showBatchMoveModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="w-full max-w-sm rounded-3xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] p-5 shadow-2xl space-y-3">
+            <h3 className="font-display text-base font-bold text-slate-900 dark:text-white">
+              {t.files.moveToFolder}
+            </h3>
+            <select
+              value={batchTargetFolderId}
+              onChange={(e) => setBatchTargetFolderId(e.target.value)}
+              className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-[#1E293B] bg-slate-50 dark:bg-[#0D1322] text-sm"
+            >
+              <option value="">{t.files.rootVault}</option>
+              {folders.map((f) => (
+                <option key={f.id} value={f.id}>
+                  {f.name}
+                </option>
+              ))}
+            </select>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                onClick={() => setShowBatchMoveModal(false)}
+                className="min-h-[44px] rounded-xl bg-slate-100 dark:bg-[#1A243B] text-xs font-semibold"
+              >
+                {t.files.cancel}
+              </button>
+              <button
+                onClick={handleBatchMoveSubmit}
+                disabled={batchBusy}
+                className="min-h-[44px] rounded-xl bg-[#3B82F6] text-white text-xs font-semibold"
+              >
+                {t.files.batchMove}
               </button>
             </div>
           </div>

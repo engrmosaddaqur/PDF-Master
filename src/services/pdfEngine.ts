@@ -6,6 +6,11 @@ import {
   rgb,
   degrees,
   PageSizes,
+  PDFTextField,
+  PDFCheckBox,
+  PDFDropdown,
+  PDFOptionList,
+  PDFRadioGroup,
 } from 'pdf-lib';
 import type {
   AddedImageOverlay,
@@ -14,6 +19,7 @@ import type {
   ExtractedTextRun,
   PaperDimension,
   PaperSizeKey,
+  PdfFormFieldDescriptor,
   TextReplacementEdit,
 } from '../types';
 
@@ -457,6 +463,257 @@ export async function extractPageTextRuns(
   return { runs, pageWidth: viewport.width, pageHeight: viewport.height };
 }
 
+const pageTextBoxCache = new WeakMap<ArrayBuffer, Map<string, ExtractedTextRun[]>>();
+
+export async function extractPageTextBoxes(
+  pdfBytes: ArrayBuffer,
+  pageNumber: number,
+  extraRotation = 0
+): Promise<ExtractedTextRun[]> {
+  let docMap = pageTextBoxCache.get(pdfBytes);
+  if (!docMap) {
+    docMap = new Map();
+    pageTextBoxCache.set(pdfBytes, docMap);
+  }
+  const cacheKey = `${pageNumber}:${extraRotation}`;
+  const existing = docMap.get(cacheKey);
+  if (existing) return existing;
+
+  const pdf = await getSharedPdfDocument(pdfBytes);
+  const safePage = Math.max(1, Math.min(pageNumber, pdf.numPages));
+  const page = await pdf.getPage(safePage);
+  const rot = (((page.rotate || 0) + extraRotation) % 360 + 360) % 360;
+  const viewport = page.getViewport({ scale: 1, rotation: rot });
+  const tc = await page.getTextContent();
+  const runs: ExtractedTextRun[] = [];
+
+  tc.items.forEach((item, index) => {
+    if (!('str' in item) || !item.str) return;
+    const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+    const fontSize = Math.max(6, Math.hypot(tx[0], tx[1]));
+    const x = tx[4];
+    const y = tx[5] - fontSize * 0.85;
+    const width = Math.max(4, item.width);
+    const height = Math.max(fontSize * 1.12, item.height || fontSize * 1.12);
+    runs.push({
+      id: `tb_${safePage}_${index}`,
+      pageNumber: safePage,
+      str: item.str,
+      x,
+      y,
+      width,
+      height,
+      fontSize,
+      fontName: item.fontName || 'Helvetica',
+    });
+  });
+
+  docMap.set(cacheKey, runs);
+  return runs;
+}
+
+export interface PdfOutlineEntry {
+  title: string;
+  pageNumber: number;
+  level: number;
+}
+
+export async function extractPdfOutline(pdfBytes: ArrayBuffer): Promise<PdfOutlineEntry[]> {
+  const pdf = await getSharedPdfDocument(pdfBytes);
+  const rawOutline = await pdf.getOutline().catch(() => null);
+  if (!rawOutline || rawOutline.length === 0) return [];
+
+  const entries: PdfOutlineEntry[] = [];
+  const walk = async (items: typeof rawOutline, level: number) => {
+    for (const item of items) {
+      let pageNumber = 1;
+      try {
+        let dest = item.dest;
+        if (typeof dest === 'string') {
+          dest = await pdf.getDestination(dest);
+        }
+        if (Array.isArray(dest) && dest[0]) {
+          const idx = await pdf.getPageIndex(dest[0] as Parameters<typeof pdf.getPageIndex>[0]);
+          if (typeof idx === 'number' && idx >= 0) {
+            pageNumber = idx + 1;
+          }
+        }
+      } catch {
+        pageNumber = 1;
+      }
+      if (item.title?.trim()) {
+        entries.push({
+          title: item.title.trim(),
+          pageNumber,
+          level,
+        });
+      }
+      if (item.items && item.items.length > 0 && entries.length < 250) {
+        await walk(item.items, Math.min(3, level + 1));
+      }
+    }
+  };
+  await walk(rawOutline, 0);
+  return entries;
+}
+
+export async function extractPdfFormFields(
+  pdfBytes: ArrayBuffer,
+  extraRotation = 0
+): Promise<PdfFormFieldDescriptor[]> {
+  const libDoc = await PDFDocument.load(cloneBuffer(pdfBytes), { ignoreEncryption: true });
+  const form = libDoc.getForm();
+  const libFields = form.getFields();
+  if (libFields.length === 0) return [];
+
+  const fieldMeta = new Map<
+    string,
+    { kind: PdfFormFieldDescriptor['kind']; value: string; checked: boolean; options?: string[] }
+  >();
+
+  for (const field of libFields) {
+    const name = field.getName();
+    if (field instanceof PDFTextField) {
+      fieldMeta.set(name, {
+        kind: 'text',
+        value: field.getText() || '',
+        checked: false,
+      });
+    } else if (field instanceof PDFCheckBox) {
+      fieldMeta.set(name, {
+        kind: 'checkbox',
+        value: field.isChecked() ? 'true' : 'false',
+        checked: field.isChecked(),
+      });
+    } else if (field instanceof PDFDropdown) {
+      const sel = field.getSelected();
+      fieldMeta.set(name, {
+        kind: 'dropdown',
+        value: sel[0] || '',
+        checked: false,
+        options: field.getOptions(),
+      });
+    } else if (field instanceof PDFOptionList) {
+      const sel = field.getSelected();
+      fieldMeta.set(name, {
+        kind: 'dropdown',
+        value: sel[0] || '',
+        checked: false,
+        options: field.getOptions(),
+      });
+    } else if (field instanceof PDFRadioGroup) {
+      fieldMeta.set(name, {
+        kind: 'radio',
+        value: field.getSelected() || '',
+        checked: false,
+        options: field.getOptions(),
+      });
+    }
+  }
+
+  const pdf = await getSharedPdfDocument(pdfBytes);
+  const descriptors: PdfFormFieldDescriptor[] = [];
+  const seenNames = new Set<string>();
+
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const rot = (((page.rotate || 0) + extraRotation) % 360 + 360) % 360;
+    const viewport = page.getViewport({ scale: 1, rotation: rot });
+    const annotations = await page.getAnnotations().catch(() => []);
+    for (const ann of annotations) {
+      if (ann.subtype !== 'Widget' || !ann.fieldName || !Array.isArray(ann.rect)) continue;
+      const meta = fieldMeta.get(ann.fieldName);
+      if (!meta) continue;
+      const [vx1, vy1] = viewport.convertToViewportPoint(ann.rect[0], ann.rect[1]);
+      const [vx2, vy2] = viewport.convertToViewportPoint(ann.rect[2], ann.rect[3]);
+      const x = Math.min(vx1, vx2);
+      const y = Math.min(vy1, vy2);
+      const width = Math.max(16, Math.abs(vx2 - vx1));
+      const height = Math.max(14, Math.abs(vy2 - vy1));
+      descriptors.push({
+        name: ann.fieldName,
+        pageNumber: p,
+        kind: meta.kind,
+        value: meta.value,
+        checked: meta.checked,
+        options: meta.options,
+        x,
+        y,
+        width,
+        height,
+      });
+      seenNames.add(ann.fieldName);
+    }
+  }
+
+  // Fallback for any fields whose widgets weren't matched
+  let fallbackOffset = 0;
+  for (const [name, meta] of fieldMeta.entries()) {
+    if (!seenNames.has(name)) {
+      descriptors.push({
+        name,
+        pageNumber: 1,
+        kind: meta.kind,
+        value: meta.value,
+        checked: meta.checked,
+        options: meta.options,
+        x: 40,
+        y: 60 + fallbackOffset * 34,
+        width: 220,
+        height: 24,
+      });
+      fallbackOffset++;
+    }
+  }
+
+  return descriptors;
+}
+
+export async function applyPdfFormFieldValues(
+  pdfBytes: ArrayBuffer,
+  values: Record<string, { value?: string; checked?: boolean }>,
+  flatten = false
+): Promise<ArrayBuffer> {
+  const doc = await PDFDocument.load(cloneBuffer(pdfBytes), { ignoreEncryption: true });
+  const form = doc.getForm();
+  for (const field of form.getFields()) {
+    const entry = values[field.getName()];
+    if (!entry) continue;
+    try {
+      if (field instanceof PDFTextField) {
+        field.setText(entry.value ?? '');
+      } else if (field instanceof PDFCheckBox) {
+        if (entry.checked) field.check();
+        else field.uncheck();
+      } else if (field instanceof PDFDropdown || field instanceof PDFOptionList) {
+        if (entry.value) field.select(entry.value);
+      } else if (field instanceof PDFRadioGroup) {
+        if (entry.value) field.select(entry.value);
+      }
+    } catch {
+      // Skip incompatible field value cleanly
+    }
+  }
+
+  try {
+    const helv = await doc.embedFont(StandardFonts.Helvetica);
+    form.updateFieldAppearances(helv);
+  } catch {
+    // Fallback to existing appearances
+  }
+
+  if (flatten) {
+    try {
+      form.flatten();
+    } catch {
+      // Ignore flatten errors on non-standard fields
+    }
+  }
+
+  const out = await doc.save();
+  return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
+}
+
 /**
  * Genuine PDF edit applicator using pdf-lib.
  * Preserves all original vectors/pages while applying text replacements,
@@ -496,13 +753,13 @@ export async function applyPdfEditsToBytes(
     const { height: pageH } = page.getSize();
     const pdfY = pageH - rep.y - rep.height;
 
-    // Clear original text bounding area cleanly
+    // Clear original text bounding area cleanly using matched background color
     page.drawRectangle({
       x: Math.max(0, rep.x - 1.5),
       y: Math.max(0, pdfY - 2),
       width: rep.width + 4,
       height: rep.height + 4,
-      color: rgb(1, 1, 1),
+      color: rep.backgroundColor ? hexToRgb(rep.backgroundColor) : rgb(1, 1, 1),
     });
 
     if (!rep.deleted && rep.newText.trim()) {
@@ -1151,46 +1408,96 @@ export async function addHeaderFooterToPdf(
   return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
 }
 
-export async function compressPdfBytes(
+async function rasterCompressPdf(
   buf: ArrayBuffer,
-  mode: 'object-streams' | 'raster-medium' | 'raster-compact'
+  scale: number,
+  quality: number
 ): Promise<ArrayBuffer> {
-  if (mode === 'object-streams') {
-    const doc = await PDFDocument.load(cloneBuffer(buf), { ignoreEncryption: true });
-    const out = await doc.save({ useObjectStreams: true });
+  const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(buf)) });
+  try {
+    const srcPdf = await loadingTask.promise;
+    const outDoc = await PDFDocument.create();
+
+    for (let p = 1; p <= srcPdf.numPages; p++) {
+      const page = await srcPdf.getPage(p);
+      const vp1 = page.getViewport({ scale: 1 });
+      const vp = page.getViewport({ scale });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(1, Math.floor(vp.width));
+      canvas.height = Math.max(1, Math.floor(vp.height));
+      const ctx = canvas.getContext('2d')!;
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport: vp, canvas }).promise;
+
+      const jpgDataUrl = canvas.toDataURL('image/jpeg', quality);
+      const bin = atob(jpgDataUrl.split(',')[1]);
+      const jpgBytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) jpgBytes[i] = bin.charCodeAt(i);
+      const embedded = await outDoc.embedJpg(jpgBytes);
+      const newPage = outDoc.addPage([vp1.width, vp1.height]);
+      newPage.drawImage(embedded, { x: 0, y: 0, width: vp1.width, height: vp1.height });
+    }
+    const out = await outDoc.save({ useObjectStreams: true });
     return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
+  } finally {
+    await loadingTask.destroy().catch(() => {});
+  }
+}
+
+export async function compressPdfWithReport(
+  buf: ArrayBuffer,
+  mode: 'object-streams' | 'raster-medium' | 'raster-compact' | 'target-size',
+  targetBytes?: number
+): Promise<{ bytes: ArrayBuffer; achievedTarget: boolean }> {
+  const doc = await PDFDocument.load(cloneBuffer(buf), { ignoreEncryption: true });
+  const losslessOut = await doc.save({ useObjectStreams: true });
+  const losslessBuf = losslessOut.buffer.slice(
+    losslessOut.byteOffset,
+    losslessOut.byteOffset + losslessOut.byteLength
+  ) as ArrayBuffer;
+
+  if (mode === 'object-streams') {
+    return { bytes: losslessBuf, achievedTarget: true };
   }
 
-  // Re-rasterize pages at balanced JPEG quality to shrink heavy scanned PDFs substantially
+  if (mode === 'target-size' && targetBytes && targetBytes > 0) {
+    if (losslessBuf.byteLength <= targetBytes) {
+      return { bytes: losslessBuf, achievedTarget: true };
+    }
+    let bestBytes = losslessBuf;
+    const presets: Array<{ scale: number; quality: number }> = [
+      { scale: 1.3, quality: 0.76 },
+      { scale: 1.05, quality: 0.6 },
+      { scale: 0.88, quality: 0.46 },
+      { scale: 0.72, quality: 0.34 },
+      { scale: 0.56, quality: 0.24 },
+    ];
+    for (const preset of presets) {
+      const candidate = await rasterCompressPdf(buf, preset.scale, preset.quality);
+      if (candidate.byteLength < bestBytes.byteLength) {
+        bestBytes = candidate;
+      }
+      if (candidate.byteLength <= targetBytes) {
+        return { bytes: candidate, achievedTarget: true };
+      }
+    }
+    return { bytes: bestBytes, achievedTarget: bestBytes.byteLength <= targetBytes };
+  }
+
   const scale = mode === 'raster-medium' ? 1.35 : 1.0;
   const quality = mode === 'raster-medium' ? 0.72 : 0.52;
-  const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(buf)) });
-  const srcPdf = await loadingTask.promise;
-  const outDoc = await PDFDocument.create();
+  const bytes = await rasterCompressPdf(buf, scale, quality);
+  return { bytes, achievedTarget: true };
+}
 
-  for (let p = 1; p <= srcPdf.numPages; p++) {
-    const page = await srcPdf.getPage(p);
-    const vp1 = page.getViewport({ scale: 1 });
-    const vp = page.getViewport({ scale });
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.max(1, Math.floor(vp.width));
-    canvas.height = Math.max(1, Math.floor(vp.height));
-    const ctx = canvas.getContext('2d')!;
-    ctx.fillStyle = '#FFFFFF';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    await page.render({ canvasContext: ctx, viewport: vp, canvas }).promise;
-
-    const jpgDataUrl = canvas.toDataURL('image/jpeg', quality);
-    const bin = atob(jpgDataUrl.split(',')[1]);
-    const jpgBytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) jpgBytes[i] = bin.charCodeAt(i);
-    const embedded = await outDoc.embedJpg(jpgBytes);
-    const newPage = outDoc.addPage([vp1.width, vp1.height]);
-    newPage.drawImage(embedded, { x: 0, y: 0, width: vp1.width, height: vp1.height });
-  }
-  await loadingTask.destroy();
-  const out = await outDoc.save({ useObjectStreams: true });
-  return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
+export async function compressPdfBytes(
+  buf: ArrayBuffer,
+  mode: 'object-streams' | 'raster-medium' | 'raster-compact' | 'target-size',
+  targetBytes?: number
+): Promise<ArrayBuffer> {
+  const res = await compressPdfWithReport(buf, mode, targetBytes);
+  return res.bytes;
 }
 
 export async function repairPdfBytes(buf: ArrayBuffer): Promise<ArrayBuffer> {

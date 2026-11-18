@@ -52,7 +52,7 @@ import {
   renderPageThumbnail,
   renderPageToCanvas,
 } from '../services/pdfEngine';
-import { downloadArrayBuffer } from '../services/storageService';
+import { saveBufferToDeviceStorage } from '../services/deviceFileActions';
 import { SignatureModal } from './SignatureModal';
 import { usePdfPinchZoom } from '../hooks/usePdfPinchZoom';
 
@@ -122,12 +122,14 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     fontSize: 12,
     fontFamily: 'sans' as 'sans' | 'serif' | 'mono',
     color: '#1E293B',
+    backgroundColor: '#FFFFFF',
     bold: false,
     italic: false,
     underline: false,
     align: 'left' as 'left' | 'center' | 'right',
     letterSpacing: 0,
   });
+  const [showExitConfirm, setShowExitConfirm] = useState(false);
 
   const [addingBoxPos, setAddingBoxPos] = useState<{ x: number; y: number } | null>(null);
   const [editingBoxId, setEditingBoxId] = useState<string | null>(null);
@@ -711,6 +713,46 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     setLiveBox(null);
   };
 
+  const sampleCanvasBgHex = (run: ExtractedTextRun): string => {
+    const canvas = canvasRef.current;
+    if (!canvas || !pageSize.width || !pageSize.height) return '#FFFFFF';
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return '#FFFFFF';
+    const sx = canvas.width / pageSize.width;
+    const sy = canvas.height / pageSize.height;
+    const x1 = Math.max(0, Math.min(canvas.width - 1, Math.round((run.x - 2) * sx)));
+    const x2 = Math.max(0, Math.min(canvas.width - 1, Math.round((run.x + run.width + 2) * sx)));
+    const y1 = Math.max(0, Math.min(canvas.height - 1, Math.round((run.y - 2) * sy)));
+    const y2 = Math.max(0, Math.min(canvas.height - 1, Math.round((run.y + run.height + 2) * sy)));
+    const pts: Array<[number, number]> = [
+      [x1, y1],
+      [x2, y1],
+      [x1, y2],
+      [x2, y2],
+    ];
+    let rSum = 0;
+    let gSum = 0;
+    let bSum = 0;
+    let count = 0;
+    for (const [px, py] of pts) {
+      try {
+        const d = ctx.getImageData(px, py, 1, 1).data;
+        if (d[3] > 20) {
+          rSum += d[0];
+          gSum += d[1];
+          bSum += d[2];
+          count += 1;
+        }
+      } catch {
+        // Ignore read error
+      }
+    }
+    if (count === 0) return '#FFFFFF';
+    const toHex = (n: number) =>
+      Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0');
+    return `#${toHex(rSum / count)}${toHex(gSum / count)}${toHex(bSum / count)}`;
+  };
+
   const handleOpenTextRunEditor = (run: ExtractedTextRun) => {
     const existing = state.replacements.find((r) => r.runId === run.id);
     setEditingRun(run);
@@ -719,6 +761,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       fontSize: existing ? existing.fontSize : Math.round(run.fontSize),
       fontFamily: existing?.fontFamily || 'sans',
       color: existing?.color || '#1E293B',
+      backgroundColor: existing?.backgroundColor || sampleCanvasBgHex(run),
       bold: existing?.bold || false,
       italic: existing?.italic || false,
       underline: existing?.underline || false,
@@ -749,6 +792,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             fontSize: runDraft.fontSize,
             fontFamily: runDraft.fontFamily,
             color: runDraft.color,
+            backgroundColor: runDraft.backgroundColor,
             bold: runDraft.bold,
             italic: runDraft.italic,
             underline: runDraft.underline,
@@ -805,8 +849,12 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         : doc.sha256Seal;
 
       if (mode === 'download') {
-        downloadArrayBuffer(editedBytes, doc.name.replace(/\.pdf$/i, '_edited.pdf'));
-        setStatusMessage('Exported modified PDF');
+        await saveBufferToDeviceStorage(
+          editedBytes,
+          doc.name.replace(/\.pdf$/i, '_edited.pdf'),
+          'application/pdf'
+        );
+        setStatusMessage(language === 'bn' ? 'এক্সপোর্ট সম্পন্ন হয়েছে' : 'Exported modified PDF');
         return;
       }
 
@@ -868,6 +916,20 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     }
   };
 
+  const hasUnsavedChanges =
+    state.replacements.length > 0 ||
+    state.addedTexts.length > 0 ||
+    state.addedImages.length > 0 ||
+    state.annotations.length > 0;
+
+  const handleRequestClose = () => {
+    if (hasUnsavedChanges) {
+      setShowExitConfirm(true);
+    } else {
+      onClose();
+    }
+  };
+
   const pageReplacements = state.replacements.filter((r) => r.pageNumber === pageNumber);
   const pageAddedTexts = state.addedTexts.filter((tb) => tb.pageNumber === pageNumber);
   const pageAddedImages = state.addedImages.filter((im) => im.pageNumber === pageNumber);
@@ -909,7 +971,8 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       <header className="flex items-center justify-between gap-2 px-3 py-2 bg-white dark:bg-slate-900 border-b border-slate-200 dark:border-slate-800 shrink-0">
         <div className="flex items-center gap-1 min-w-0">
           <button
-            onClick={onClose}
+            onClick={handleRequestClose}
+            aria-label="Back"
             className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl hover:bg-slate-100 dark:hover:bg-slate-800"
           >
             <ArrowLeft className="w-5 h-5" />
@@ -919,7 +982,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               {t.editor.title}
             </h1>
             <p className="text-[11px] font-mono-nums text-slate-500">
-              Page {pageNumber}/{doc.pageCount}
+              {t.viewer.page} {pageNumber}/{doc.pageCount}
             </p>
           </div>
         </div>
@@ -956,7 +1019,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             className="min-h-[42px] px-3.5 rounded-xl bg-[#2563EB] text-white text-xs font-semibold flex items-center gap-1.5"
           >
             <Save className="w-3.5 h-3.5" />
-            <span>{saving ? 'Saving...' : 'Save'}</span>
+            <span>{saving ? t.editor.saving : t.editor.save}</span>
           </button>
         </div>
       </header>
@@ -1292,8 +1355,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     top: rep.y * scale,
                     minWidth: Math.max(16, rep.width * scale),
                     minHeight: Math.max(14, rep.height * scale),
+                    backgroundColor: rep.backgroundColor || '#FFFFFF',
                   }}
-                  className="absolute text-left rounded bg-white border border-[#2563EB]/80 z-10"
+                  className="absolute text-left rounded border border-[#2563EB]/80 z-10"
                 >
                   {!rep.deleted && (
                     <span
@@ -2030,7 +2094,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           <div className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-4">
             <div className="flex items-center justify-between">
               <h3 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
-                Modify PDF Text
+                {t.editor.modifyText}
               </h3>
               <button
                 onClick={() => setEditingRun(null)}
@@ -2093,10 +2157,42 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               </button>
               <input
                 type="color"
+                title={language === 'bn' ? 'টেক্সট রঙ' : 'Text color'}
                 value={runDraft.color}
                 onChange={(e) => setRunDraft((d) => ({ ...d, color: e.target.value }))}
                 className="w-10 h-10 rounded-xl border border-slate-200 dark:border-slate-700 cursor-pointer"
               />
+            </div>
+
+            <div className="flex items-center justify-between gap-2 text-xs px-2.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700">
+              <span className="font-semibold text-slate-600 dark:text-slate-300">
+                {t.editor.bgColor}
+              </span>
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="color"
+                  value={runDraft.backgroundColor}
+                  onChange={(e) => setRunDraft((d) => ({ ...d, backgroundColor: e.target.value }))}
+                  className="w-8 h-8 rounded-lg border border-slate-200 dark:border-slate-700 cursor-pointer"
+                />
+                <button
+                  type="button"
+                  onClick={() =>
+                    editingRun &&
+                    setRunDraft((d) => ({ ...d, backgroundColor: sampleCanvasBgHex(editingRun) }))
+                  }
+                  className="px-2.5 h-8 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold"
+                >
+                  {t.editor.autoSampleBg}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRunDraft((d) => ({ ...d, backgroundColor: '#FFFFFF' }))}
+                  className="px-2.5 h-8 rounded-lg bg-white text-slate-800 border border-slate-200 font-semibold"
+                >
+                  #FFF
+                </button>
+              </div>
             </div>
 
             <div className="flex items-center justify-between gap-3 text-xs">
@@ -2143,13 +2239,13 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 onClick={() => handleApplyRunReplacement(true)}
                 className="min-h-[46px] rounded-xl bg-rose-50 dark:bg-rose-950/50 text-rose-600 dark:text-rose-300 text-sm font-semibold"
               >
-                Delete Text
+                {t.editor.deleteText}
               </button>
               <button
                 onClick={() => handleApplyRunReplacement(false)}
                 className="min-h-[46px] rounded-xl bg-[#2563EB] text-white text-sm font-semibold"
               >
-                Replace Text
+                {t.editor.replaceText}
               </button>
             </div>
           </div>
@@ -2535,6 +2631,51 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             >
               Apply Crop
             </button>
+          </div>
+        </div>
+      )}
+      {/* Unsaved Changes Exit Guard Modal */}
+      {showExitConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
+          <div className="w-full max-w-sm rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-5 shadow-2xl space-y-4">
+            <h3 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
+              {t.editor.unsavedTitle}
+            </h3>
+            <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+              {t.editor.unsavedMessage}
+            </p>
+            <div className="space-y-2">
+              <button
+                type="button"
+                disabled={saving}
+                onClick={() => {
+                  setShowExitConfirm(false);
+                  void handleSave('version');
+                }}
+                className="w-full min-h-[44px] rounded-xl bg-[#2563EB] text-white text-xs font-semibold"
+              >
+                {saving ? t.editor.saving : t.editor.saveAndExit}
+              </button>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowExitConfirm(false);
+                    onClose();
+                  }}
+                  className="min-h-[44px] rounded-xl bg-rose-50 dark:bg-rose-950/50 text-rose-600 dark:text-rose-300 text-xs font-semibold"
+                >
+                  {t.editor.discardExit}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowExitConfirm(false)}
+                  className="min-h-[44px] rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold"
+                >
+                  {t.editor.keepEditing}
+                </button>
+              </div>
+            </div>
           </div>
         </div>
       )}

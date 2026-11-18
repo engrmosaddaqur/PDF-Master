@@ -449,6 +449,7 @@ export default function App() {
                 onOpenDoc={openDocumentInViewer}
                 onEditDoc={(doc) => setWorkspace({ type: 'editor', docId: doc.id })}
                 onUpdateDoc={upsertDoc}
+                onSaveNewDoc={upsertDoc}
                 onDuplicateDoc={handleDuplicateDoc}
                 onDeleteForever={handleDeleteForever}
                 onCreateFolder={handleCreateFolder}

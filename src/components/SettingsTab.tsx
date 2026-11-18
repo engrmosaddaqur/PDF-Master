@@ -1,4 +1,5 @@
 import React, { useRef, useState } from 'react';
+import JSZip from 'jszip';
 import { Capacitor } from '@capacitor/core';
 import {
   CheckCircle2,
@@ -24,11 +25,10 @@ import { getT } from '../i18n/translations';
 import { getApiUrl } from '../services/apiConfig';
 import { PAPER_DIMENSIONS } from '../services/pdfEngine';
 import {
-  arrayBufferToBase64,
   base64ToArrayBuffer,
-  downloadArrayBuffer,
   formatBytes,
 } from '../services/storageService';
+import { saveBufferToDeviceStorage } from '../services/deviceFileActions';
 import { PdfMasterLogo } from './Logo';
 import { PWAInstallButton } from './PWAComponents';
 
@@ -98,6 +98,14 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
   const trashedCount = docs.filter((d) => d.isTrashed).length;
 
   const checkApkStatus = async () => {
+    if (settings.localOnlyMode) {
+      setApkError(
+        settings.language === 'bn'
+          ? 'লোকাল-অনলি মোড চালু থাকায় রিমোট APK চেক বন্ধ আছে।'
+          : 'Remote APK checks are disabled while Strict Local-Only Mode is active.'
+      );
+      return;
+    }
     const cleanRepo = repoSlug.trim();
     if (!/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(cleanRepo)) {
       setApkError('Enter repo as username/repository-name');
@@ -131,40 +139,98 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
     }
   };
 
-  const handleExportBackup = () => {
-    const payload = {
-      exportedAt: Date.now(),
-      app: 'PDF MASTER',
-      documents: docs.map((d) => ({
-        ...d,
-        pdfBase64: arrayBufferToBase64(d.pdfBytes),
-        pdfBytes: undefined,
-        versions: d.versions.map((v) => ({
-          ...v,
-          pdfBase64: arrayBufferToBase64(v.pdfBytes),
+  const handleExportBackup = async () => {
+    try {
+      const zip = new JSZip();
+      const manifestDocs = docs.map((d) => {
+        const mainPath = `pdfs/${d.id}.pdf`;
+        zip.file(mainPath, d.pdfBytes.slice(0));
+        const versionMetas = (d.versions || []).map((v, i) => {
+          const vPath = `versions/${d.id}_v${i}.pdf`;
+          zip.file(vPath, v.pdfBytes.slice(0));
+          return {
+            id: v.id,
+            timestamp: v.timestamp,
+            note: v.note,
+            sizeBytes: v.sizeBytes,
+            pdfPath: vPath,
+          };
+        });
+        return {
+          ...d,
           pdfBytes: undefined,
-        })),
-      })),
-    };
-    const jsonBytes = new TextEncoder().encode(JSON.stringify(payload)).buffer;
-    downloadArrayBuffer(
-      jsonBytes,
-      `pdf-master-backup-${new Date().toISOString().slice(0, 10)}.json`,
-      'application/json'
-    );
-    setBackupNotice('Vault backup exported.');
-    setTimeout(() => setBackupNotice(null), 2500);
+          pdfPath: mainPath,
+          versions: versionMetas,
+        };
+      });
+      zip.file(
+        'manifest.json',
+        JSON.stringify({ exportedAt: Date.now(), app: 'PDF MASTER', format: 'zip-v2', documents: manifestDocs })
+      );
+      const zipBuf = await zip.generateAsync({ type: 'arraybuffer' });
+      await saveBufferToDeviceStorage(
+        zipBuf,
+        `PDF-Master-Backup-${new Date().toISOString().slice(0, 10)}.zip`,
+        'application/zip'
+      );
+      setBackupNotice(
+        settings.language === 'bn' ? 'ZIP ভল্ট ব্যাকআপ এক্সপোর্ট হয়েছে।' : 'ZIP Vault backup exported.'
+      );
+    } catch {
+      setBackupNotice(
+        settings.language === 'bn' ? 'ব্যাকআপ এক্সপোর্ট ব্যর্থ হয়েছে।' : 'Failed to export backup.'
+      );
+    }
+    setTimeout(() => setBackupNotice(null), 2600);
   };
 
-  const handleImportBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImportBackup = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
-    const reader = new FileReader();
-    reader.onload = async () => {
-      try {
-        const parsed = JSON.parse(reader.result as string);
+    try {
+      const buf = await file.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      const isZip =
+        file.name.toLowerCase().endsWith('.zip') ||
+        (bytes.length >= 2 && bytes[0] === 0x50 && bytes[1] === 0x4b);
+
+      let restored: DocumentRecord[] = [];
+      if (isZip) {
+        const zip = await JSZip.loadAsync(buf);
+        const manifestFile = zip.file('manifest.json');
+        if (!manifestFile) throw new Error('Missing manifest.json');
+        const parsed = JSON.parse(await manifestFile.async('string'));
         if (!Array.isArray(parsed.documents)) throw new Error('Invalid backup format');
-        const restored: DocumentRecord[] = parsed.documents.map(
+
+        for (const d of parsed.documents) {
+          const pdfEntry = d.pdfPath ? zip.file(d.pdfPath) : null;
+          if (!pdfEntry) continue;
+          const mainBuf = await pdfEntry.async('arraybuffer');
+          const restoredVersions: DocumentRecord['versions'] = [];
+          for (const v of d.versions || []) {
+            const vEntry = v.pdfPath ? zip.file(v.pdfPath) : null;
+            if (!vEntry) continue;
+            const vBuf = await vEntry.async('arraybuffer');
+            restoredVersions.push({
+              id: v.id,
+              timestamp: v.timestamp,
+              note: v.note,
+              sizeBytes: v.sizeBytes,
+              pdfBytes: vBuf,
+            });
+          }
+          restored.push({
+            ...d,
+            pdfBytes: mainBuf,
+            versions: restoredVersions,
+          });
+        }
+      } else {
+        const text = new TextDecoder().decode(bytes);
+        const parsed = JSON.parse(text);
+        if (!Array.isArray(parsed.documents)) throw new Error('Invalid backup format');
+        restored = parsed.documents.map(
           (
             d: Omit<DocumentRecord, 'pdfBytes' | 'versions'> & {
               pdfBase64: string;
@@ -188,15 +254,22 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
             })),
           })
         );
-        await onRestoreBackupDocs(restored);
-        setBackupNotice(`Restored ${restored.length} document(s).`);
-      } catch {
-        setBackupNotice('Failed to restore backup file.');
       }
-      setTimeout(() => setBackupNotice(null), 3000);
-    };
-    reader.readAsText(file);
-    e.target.value = '';
+
+      await onRestoreBackupDocs(restored);
+      setBackupNotice(
+        settings.language === 'bn'
+          ? `${restored.length}টি ডকুমেন্ট পুনরুদ্ধার হয়েছে।`
+          : `Restored ${restored.length} document(s).`
+      );
+    } catch {
+      setBackupNotice(
+        settings.language === 'bn'
+          ? 'ব্যাকআপ ফাইল পুনরুদ্ধার করা যায়নি।'
+          : 'Failed to restore backup file.'
+      );
+    }
+    setTimeout(() => setBackupNotice(null), 3000);
   };
 
   return (
@@ -382,7 +455,7 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
         <input
           ref={backupInputRef}
           type="file"
-          accept=".json"
+          accept=".zip,.json,application/zip,application/json"
           onChange={handleImportBackup}
           className="hidden"
         />
@@ -454,27 +527,35 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
             </span>
           </div>
 
-          <div className="flex items-center gap-2">
-            <input
-              type="text"
-              value={repoSlug}
-              onChange={(e) => setRepoSlug(e.target.value)}
-              placeholder="username/repository-name"
-              className="flex-1 min-h-[42px] px-3.5 rounded-2xl border border-slate-200 dark:border-[#1E293B] bg-slate-50 dark:bg-[#0D1322] text-xs font-mono text-slate-900 dark:text-white"
-            />
-            <button
-              onClick={checkApkStatus}
-              disabled={apkChecking}
-              className="min-h-[42px] px-3.5 rounded-2xl bg-[#3B82F6] text-white text-xs font-bold flex items-center gap-1.5 shrink-0 disabled:opacity-60"
-            >
-              {apkChecking ? (
-                <Loader2 className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <RefreshCw className="w-3.5 h-3.5" />
-              )}
-              <span>{settings.language === 'bn' ? 'চেক করুন' : 'Check APK'}</span>
-            </button>
-          </div>
+          {settings.localOnlyMode ? (
+            <p className="text-xs text-amber-600 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded-2xl px-3 py-2.5">
+              {settings.language === 'bn'
+                ? 'লোকাল-অনলি মোড চালু আছে — সব রিমোট GitHub/APK নেটওয়ার্ক রিকোয়েস্ট বন্ধ রাখা হয়েছে।'
+                : 'Strict Local-Only Mode is active — remote GitHub APK network checks are disabled.'}
+            </p>
+          ) : (
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={repoSlug}
+                onChange={(e) => setRepoSlug(e.target.value)}
+                placeholder="username/repository-name"
+                className="flex-1 min-h-[42px] px-3.5 rounded-2xl border border-slate-200 dark:border-[#1E293B] bg-slate-50 dark:bg-[#0D1322] text-xs font-mono text-slate-900 dark:text-white"
+              />
+              <button
+                onClick={checkApkStatus}
+                disabled={apkChecking}
+                className="min-h-[42px] px-3.5 rounded-2xl bg-[#3B82F6] text-white text-xs font-bold flex items-center gap-1.5 shrink-0 disabled:opacity-60"
+              >
+                {apkChecking ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <RefreshCw className="w-3.5 h-3.5" />
+                )}
+                <span>{settings.language === 'bn' ? 'চেক করুন' : 'Check APK'}</span>
+              </button>
+            </div>
+          )}
 
           {apkError && <p className="text-xs text-rose-500">{apkError}</p>}
 

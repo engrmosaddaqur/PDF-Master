@@ -57,7 +57,8 @@ export async function imagesToPdf(files: File[]): Promise<ArrayBuffer> {
 
 export async function pdfToImagesZip(
   pdfBytes: ArrayBuffer,
-  format: 'image/png' | 'image/jpeg' = 'image/png'
+  format: 'image/png' | 'image/jpeg' = 'image/png',
+  renderScale = 2
 ): Promise<{ zipBuffer: ArrayBuffer; previewImages: string[] }> {
   const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(pdfBytes)) });
   const pdf = await loadingTask.promise;
@@ -69,7 +70,7 @@ export async function pdfToImagesZip(
   const ext = format === 'image/png' ? 'png' : 'jpg';
 
   for (let p = 1; p <= count; p++) {
-    const dataUrl = await renderPageToDataUrl(pdfBytes, p, 2, format);
+    const dataUrl = await renderPageToDataUrl(pdfBytes, p, renderScale, format);
     previewImages.push(dataUrl);
     const base64 = dataUrl.split(',')[1];
     zip.file(`page-${String(p).padStart(3, '0')}.${ext}`, base64, { base64: true });

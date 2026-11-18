@@ -113,7 +113,9 @@ export const CompareView: React.FC<CompareViewProps> = ({
                 </span>
                 <span className="flex items-center gap-1.5 text-xs font-bold text-[#142B4A] dark:text-white truncate mt-0.5">
                   <FileText className="w-3.5 h-3.5 shrink-0 text-[#2563EB]" />
-                  <span className="truncate">{docAObj?.name || 'Choose PDF A'}</span>
+                  <span className="truncate">
+                    {docAObj?.name || (language === 'bn' ? 'পিডিএফ A বাছুন' : 'Choose PDF A')}
+                  </span>
                 </span>
                 {docAObj && (
                   <span className="block text-[10.5px] font-mono-nums text-slate-500 mt-0.5">
@@ -144,7 +146,9 @@ export const CompareView: React.FC<CompareViewProps> = ({
                 </span>
                 <span className="flex items-center gap-1.5 text-xs font-bold text-[#142B4A] dark:text-white truncate mt-0.5">
                   <FileText className="w-3.5 h-3.5 shrink-0 text-[#06B6D4]" />
-                  <span className="truncate">{docBObj?.name || 'Choose PDF B'}</span>
+                  <span className="truncate">
+                    {docBObj?.name || (language === 'bn' ? 'পিডিএফ B বাছুন' : 'Choose PDF B')}
+                  </span>
                 </span>
                 {docBObj && (
                   <span className="block text-[10.5px] font-mono-nums text-slate-500 mt-0.5">
@@ -170,8 +174,8 @@ export const CompareView: React.FC<CompareViewProps> = ({
                 maxListHeightClass="max-h-40"
                 label={
                   pickerSlot === 'a'
-                    ? `${t.compare.selectFirst} — Device Storage or Recent Files`
-                    : `${t.compare.selectSecond} — Device Storage or Recent Files`
+                    ? `${t.compare.selectFirst} — ${language === 'bn' ? 'ডিভাইস স্টোরেজ বা রিসেন্ট ফাইল' : 'Device Storage or Recent Files'}`
+                    : `${t.compare.selectSecond} — ${language === 'bn' ? 'ডিভাইস স্টোরেজ বা রিসেন্ট ফাইল' : 'Device Storage or Recent Files'}`
                 }
                 onImportDoc={onImportDoc}
                 onSelectDoc={(d) => {
@@ -207,7 +211,13 @@ export const CompareView: React.FC<CompareViewProps> = ({
             className="w-full min-h-[46px] rounded-xl bg-[#2563EB] disabled:opacity-40 text-white text-sm font-semibold flex items-center justify-center gap-2"
           >
             <GitCompare className="w-4 h-4" />
-            <span>{running ? 'Comparing...' : t.compare.runCompare}</span>
+            <span>
+              {running
+                ? language === 'bn'
+                  ? 'তুলনা হচ্ছে...'
+                  : 'Comparing...'
+                : t.compare.runCompare}
+            </span>
           </button>
         </div>
 
@@ -272,13 +282,19 @@ export const CompareView: React.FC<CompareViewProps> = ({
                     className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-2"
                   >
                     <div className="flex items-center justify-between text-xs font-semibold text-slate-500 border-b border-slate-100 dark:border-slate-800 pb-2">
-                      <span>Page {pg.pageNumber}</span>
+                      <span>
+                        {t.viewer.page} {pg.pageNumber}
+                      </span>
                       <span className="font-mono-nums">
                         +{pg.addedCount} / -{pg.deletedCount}
                       </span>
                     </div>
                     {pg.lines.length === 0 ? (
-                      <p className="text-xs text-slate-400">No text extracted on this page.</p>
+                      <p className="text-xs text-slate-400">
+                        {language === 'bn'
+                          ? 'এই পৃষ্ঠায় কোনো টেক্সট পাওয়া যায়নি।'
+                          : 'No text extracted on this page.'}
+                      </p>
                     ) : (
                       <div className="space-y-1 font-mono text-xs leading-relaxed">
                         {pg.lines.map((line, idx) => (
@@ -316,14 +332,16 @@ export const CompareView: React.FC<CompareViewProps> = ({
                     key={item.page}
                     className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-3 space-y-2"
                   >
-                    <p className="text-xs font-semibold text-slate-500">Page {item.page}</p>
+                    <p className="text-xs font-semibold text-slate-500">
+                      {t.viewer.page} {item.page}
+                    </p>
                     <div className="grid grid-cols-2 gap-2">
                       <div className="rounded-xl bg-slate-100 dark:bg-slate-800 p-1">
                         {item.a ? (
                           <img src={item.a} alt={`A Page ${item.page}`} className="w-full rounded-lg" />
                         ) : (
                           <div className="h-40 flex items-center justify-center text-xs text-slate-400">
-                            No page
+                            {language === 'bn' ? 'পৃষ্ঠা নেই' : 'No page'}
                           </div>
                         )}
                       </div>
@@ -332,7 +350,7 @@ export const CompareView: React.FC<CompareViewProps> = ({
                           <img src={item.b} alt={`B Page ${item.page}`} className="w-full rounded-lg" />
                         ) : (
                           <div className="h-40 flex items-center justify-center text-xs text-slate-400">
-                            No page
+                            {language === 'bn' ? 'পৃষ্ঠা নেই' : 'No page'}
                           </div>
                         )}
                       </div>

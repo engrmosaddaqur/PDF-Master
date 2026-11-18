@@ -13,6 +13,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import type { AppLanguage, DocumentRecord } from '../types';
+import { getT } from '../i18n/translations';
 import {
   cloneBuffer,
   getPdfDocumentInfo,
@@ -50,6 +51,7 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
   onCreateExtractedDoc,
   onImportDoc,
 }) => {
+  const t = getT(language);
   const [tiles, setTiles] = useState<PageTile[]>([]);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -279,10 +281,11 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
           </button>
           <div className="min-w-0">
             <h1 className="font-display text-sm font-bold text-[#142B4A] dark:text-white truncate">
-              Page Organizer
+              {t.organizer.title}
             </h1>
             <p className="text-[11px] font-mono-nums text-slate-500">
-              {tiles.length} pages · {selectedIndices.length} selected
+              {tiles.length} {language === 'bn' ? 'পৃষ্ঠা' : 'pages'} · {selectedIndices.length}{' '}
+              {language === 'bn' ? 'নির্বাচিত' : 'selected'}
             </p>
           </div>
         </div>
@@ -293,7 +296,7 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
           className="min-h-[44px] px-4 rounded-xl bg-[#2563EB] disabled:opacity-40 text-white text-xs font-semibold flex items-center gap-1.5"
         >
           <Save className="w-4 h-4" />
-          <span>{saving ? 'Applying...' : 'Save Changes'}</span>
+          <span>{saving ? t.organizer.applying : t.organizer.saveChanges}</span>
         </button>
       </header>
 
@@ -306,13 +309,13 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
               onClick={() => setErrorMsg(null)}
               className="font-semibold underline shrink-0"
             >
-              Dismiss
+              {language === 'bn' ? 'বন্ধ করুন' : 'Dismiss'}
             </button>
           </div>
         )}
         {loading ? (
           <div className="py-20 text-center text-sm text-slate-500">
-            Generating page thumbnails...
+            {t.organizer.loadingThumbs}
           </div>
         ) : (
           <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-4 max-w-6xl mx-auto">
@@ -357,7 +360,9 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
                       className="w-full h-full object-contain transition-transform"
                     />
                   ) : (
-                    <span className="text-xs text-slate-400">Blank A4</span>
+                    <span className="text-xs text-slate-400">
+                      {language === 'bn' ? 'খালি A4' : 'Blank A4'}
+                    </span>
                   )}
                 </div>
 
@@ -395,14 +400,14 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
           className="min-h-[44px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0"
         >
           <FilePlus2 className="w-4 h-4 text-[#2563EB]" />
-          Blank Page
+          {t.organizer.blankPage}
         </button>
         <button
           onClick={() => setShowInsertPicker(true)}
           className="min-h-[44px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0"
         >
           <FolderPlus className="w-4 h-4 text-[#2563EB]" />
-          Insert PDF
+          {t.organizer.insertPdf}
         </button>
         <button
           onClick={handleRotateSelected}
@@ -410,7 +415,7 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
           className="min-h-[44px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 disabled:opacity-40 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0"
         >
           <RotateCw className="w-4 h-4" />
-          Rotate
+          {t.organizer.rotate}
         </button>
         <button
           onClick={handleDuplicateSelected}
@@ -418,7 +423,7 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
           className="min-h-[44px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 disabled:opacity-40 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0"
         >
           <CopyPlus className="w-4 h-4" />
-          Duplicate
+          {t.organizer.duplicate}
         </button>
         <button
           onClick={handleExtractSelected}
@@ -426,14 +431,14 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
           className="min-h-[44px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 disabled:opacity-40 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0"
         >
           <Scissors className="w-4 h-4" />
-          Extract
+          {t.organizer.extract}
         </button>
         {selectedIndices.length === 1 && (
           <button
             onClick={handleMoveToNumber}
             className="min-h-[44px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold whitespace-nowrap shrink-0"
           >
-            Move To #
+            {t.organizer.moveTo}
           </button>
         )}
         <button
@@ -442,7 +447,7 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
           className="min-h-[44px] px-3 rounded-xl bg-rose-50 dark:bg-rose-950/50 text-rose-600 dark:text-rose-300 disabled:opacity-40 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0"
         >
           <Trash2 className="w-4 h-4" />
-          Delete
+          {t.organizer.delete}
         </button>
       </div>
 
@@ -480,10 +485,10 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/55 backdrop-blur-sm p-4">
           <div className="w-full max-w-xs rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-3">
             <h3 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
-              Move Page #{moveModalFrom + 1}
+              {t.organizer.movePageTitle} #{moveModalFrom + 1}
             </h3>
             <p className="text-xs text-slate-500">
-              Enter destination position (1 – {tiles.length})
+              {t.organizer.movePrompt} (1 – {tiles.length})
             </p>
             <input
               type="number"
@@ -500,13 +505,13 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
                 onClick={() => setMoveModalFrom(null)}
                 className="min-h-[44px] rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold"
               >
-                Cancel
+                {t.organizer.cancel}
               </button>
               <button
                 onClick={confirmMoveToNumber}
                 className="min-h-[44px] rounded-xl bg-[#2563EB] text-white text-xs font-semibold"
               >
-                Move Page
+                {t.organizer.moveAction}
               </button>
             </div>
           </div>
