@@ -15,10 +15,10 @@ import {
 import type { AppLanguage, DocumentRecord } from '../types';
 import {
   cloneBuffer,
+  getPdfDocumentInfo,
   insertPdfIntoDocument,
   organizePdfPages,
   renderPageThumbnail,
-  splitPdfByRanges,
 } from '../services/pdfEngine';
 import { PdfSourcePicker } from './PdfSourcePicker';
 
@@ -58,6 +58,7 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
   const [dragIndex, setDragIndex] = useState<number | null>(null);
   const [moveModalFrom, setMoveModalFrom] = useState<number | null>(null);
   const [moveTargetInput, setMoveTargetInput] = useState('');
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const loadThumbnails = async (bytes: ArrayBuffer, count: number) => {
     setLoading(true);
@@ -161,25 +162,39 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
   const handleInsertFromOtherPdf = async (other: DocumentRecord) => {
     setShowInsertPicker(false);
     setSaving(true);
+    setErrorMsg(null);
     try {
-      const merged = await insertPdfIntoDocument(workingBytes, other.pdfBytes, tiles.length);
-      const nextCount = doc.pageCount + other.pageCount;
+      const currentPlan = tiles.map((t) => ({
+        sourcePageIndex: t.sourcePageIndex,
+        rotationDelta: t.rotationDelta,
+        insertBlank: t.sourcePageIndex === null,
+      }));
+      const currentBytes =
+        currentPlan.length > 0 ? await organizePdfPages(workingBytes, currentPlan) : workingBytes;
+      const merged = await insertPdfIntoDocument(currentBytes, other.pdfBytes, currentPlan.length);
+      const info = await getPdfDocumentInfo(merged);
       setWorkingBytes(merged);
-      await loadThumbnails(merged, nextCount);
+      await loadThumbnails(merged, info.pageCount);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to insert pages from selected PDF.');
     } finally {
       setSaving(false);
     }
   };
 
   const handleExtractSelected = async () => {
-    const validPages = tiles
-      .filter((t) => t.selected && t.sourcePageIndex !== null)
-      .map((t) => (t.sourcePageIndex as number) + 1);
-    if (validPages.length === 0) return;
+    const selectedTiles = tiles.filter((t) => t.selected);
+    if (selectedTiles.length === 0) return;
 
     setSaving(true);
+    setErrorMsg(null);
     try {
-      const extracted = await splitPdfByRanges(workingBytes, validPages);
+      const plan = selectedTiles.map((t) => ({
+        sourcePageIndex: t.sourcePageIndex,
+        rotationDelta: t.rotationDelta,
+        insertBlank: t.sourcePageIndex === null,
+      }));
+      const extracted = await organizePdfPages(workingBytes, plan);
       const thumb = await renderPageThumbnail(extracted, 1, 200).catch(() => undefined);
       const now = Date.now();
       await onCreateExtractedDoc({
@@ -191,7 +206,7 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
         updatedAt: now,
         lastOpenedAt: now,
         sizeBytes: extracted.byteLength,
-        pageCount: validPages.length,
+        pageCount: selectedTiles.length,
         isStarred: false,
         thumbnailDataUrl: thumb,
         pdfBytes: cloneBuffer(extracted),
@@ -199,13 +214,15 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
           {
             id: `ver_${now}`,
             timestamp: now,
-            note: `Extracted ${validPages.length} pages`,
+            note: `Extracted ${selectedTiles.length} pages`,
             sizeBytes: extracted.byteLength,
             pdfBytes: cloneBuffer(extracted),
           },
         ],
       });
       onClose();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to extract selected pages.');
     } finally {
       setSaving(false);
     }
@@ -213,6 +230,7 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
 
   const handleSaveOrder = async () => {
     setSaving(true);
+    setErrorMsg(null);
     try {
       const plan = tiles.map((t) => ({
         sourcePageIndex: t.sourcePageIndex,
@@ -242,6 +260,8 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
         ],
       });
       onClose();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to save organized PDF.');
     } finally {
       setSaving(false);
     }
@@ -278,6 +298,18 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
       </header>
 
       <div className="flex-1 overflow-y-auto p-4">
+        {errorMsg && (
+          <div className="max-w-6xl mx-auto mb-3 p-3 rounded-xl bg-rose-50 dark:bg-rose-950/50 border border-rose-200 dark:border-rose-800 text-xs text-rose-700 dark:text-rose-200 flex items-center justify-between gap-2">
+            <span>{errorMsg}</span>
+            <button
+              type="button"
+              onClick={() => setErrorMsg(null)}
+              className="font-semibold underline shrink-0"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
         {loading ? (
           <div className="py-20 text-center text-sm text-slate-500">
             Generating page thumbnails...

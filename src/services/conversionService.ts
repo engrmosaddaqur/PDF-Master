@@ -79,8 +79,12 @@ export async function pdfToImagesZip(
   return { zipBuffer, previewImages };
 }
 
-export async function pdfToDocxBytes(pdfBytes: ArrayBuffer, title: string): Promise<ArrayBuffer> {
+export async function pdfToDocxBytes(
+  pdfBytes: ArrayBuffer,
+  title: string
+): Promise<{ buffer: ArrayBuffer; extractedChars: number }> {
   const pages = await extractDocumentPagesText(pdfBytes);
+  const extractedChars = pages.reduce((sum, p) => sum + p.text.trim().length, 0);
   const children: Paragraph[] = [
     new Paragraph({
       text: title.replace(/\.pdf$/i, ''),
@@ -112,43 +116,113 @@ export async function pdfToDocxBytes(pdfBytes: ArrayBuffer, title: string): Prom
     sections: [{ children }],
   });
   const blob = await Packer.toBlob(docx);
-  return blob.arrayBuffer();
+  return { buffer: await blob.arrayBuffer(), extractedChars };
 }
 
-export async function pdfToXlsxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer> {
+export async function pdfToXlsxBytes(
+  pdfBytes: ArrayBuffer
+): Promise<{ buffer: ArrayBuffer; extractedChars: number }> {
   const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(pdfBytes)) });
   const pdf = await loadingTask.promise;
   const wb = XLSX.utils.book_new();
+  let extractedChars = 0;
 
-  for (let p = 1; p <= pdf.numPages; p++) {
-    const page = await pdf.getPage(p);
-    const tc = await page.getTextContent();
-    const rowsMap = new Map<number, Array<{ x: number; str: string }>>();
+  try {
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const tc = await page.getTextContent();
+      const rowsMap = new Map<number, Array<{ x: number; str: string }>>();
+      const allXPositions: number[] = [];
 
-    for (const item of tc.items) {
-      if (!('str' in item) || !item.str.trim()) continue;
-      const yBucket = Math.round((item.transform?.[5] ?? 0) / 6) * 6;
-      const x = item.transform?.[4] ?? 0;
-      const existing = rowsMap.get(yBucket) || [];
-      existing.push({ x, str: item.str.trim() });
-      rowsMap.set(yBucket, existing);
+      for (const item of tc.items) {
+        if (!('str' in item) || !item.str.trim()) continue;
+        const text = item.str.trim();
+        extractedChars += text.length;
+        const yBucket = Math.round((item.transform?.[5] ?? 0) / 6) * 6;
+        const x = item.transform?.[4] ?? 0;
+        allXPositions.push(x);
+        const existing = rowsMap.get(yBucket) || [];
+        existing.push({ x, str: text });
+        rowsMap.set(yBucket, existing);
+      }
+
+      // Build column anchor positions by clustering X coordinates within 28pt
+      const sortedX = [...allXPositions].sort((a, b) => a - b);
+      const colAnchors: number[] = [];
+      for (const x of sortedX) {
+        if (colAnchors.length === 0 || x - colAnchors[colAnchors.length - 1] > 28) {
+          colAnchors.push(x);
+        }
+      }
+
+      const sortedRows = Array.from(rowsMap.entries())
+        .sort((a, b) => b[0] - a[0])
+        .map(([, cells]) => {
+          const ordered = [...cells].sort((a, b) => a.x - b.x);
+          if (colAnchors.length <= 1) {
+            return ordered.map((c) => c.str);
+          }
+          const rowArr: string[] = new Array(colAnchors.length).fill('');
+          for (const cell of ordered) {
+            let bestCol = 0;
+            let bestDist = Infinity;
+            for (let ci = 0; ci < colAnchors.length; ci++) {
+              const d = Math.abs(cell.x - colAnchors[ci]);
+              if (d < bestDist) {
+                bestDist = d;
+                bestCol = ci;
+              }
+            }
+            rowArr[bestCol] = rowArr[bestCol] ? `${rowArr[bestCol]} ${cell.str}` : cell.str;
+          }
+          // Trim trailing empty cells
+          while (rowArr.length > 1 && !rowArr[rowArr.length - 1]) {
+            rowArr.pop();
+          }
+          return rowArr;
+        });
+
+      const sheetData = sortedRows.length > 0 ? sortedRows : [['No tabular text detected']];
+      const ws = XLSX.utils.aoa_to_sheet(sheetData);
+      const maxCols = Math.max(...sheetData.map((r) => r.length), 1);
+      const colWidths = Array.from({ length: maxCols }, (_, cIdx) => {
+        const longest = sheetData.reduce(
+          (max, r) => Math.max(max, (r[cIdx] || '').length),
+          8
+        );
+        return { wch: Math.min(48, Math.max(12, longest + 3)) };
+      });
+      ws['!cols'] = colWidths;
+      XLSX.utils.book_append_sheet(wb, ws, `Page_${p}`);
     }
-
-    const sortedRows = Array.from(rowsMap.entries())
-      .sort((a, b) => b[0] - a[0])
-      .map(([, cells]) => cells.sort((a, b) => a.x - b.x).map((c) => c.str));
-
-    const ws = XLSX.utils.aoa_to_sheet(sortedRows.length > 0 ? sortedRows : [['No tabular text detected']]);
-    XLSX.utils.book_append_sheet(wb, ws, `Page_${p}`);
+  } finally {
+    await loadingTask.destroy().catch(() => {});
   }
-  await loadingTask.destroy();
 
-  return XLSX.write(wb, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer;
+  const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer;
+  return { buffer, extractedChars };
+}
+
+function measureImageDataUrlSize(dataUrl: string): Promise<{ width: number; height: number }> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () =>
+      resolve({
+        width: img.naturalWidth || 1200,
+        height: img.naturalHeight || 900,
+      });
+    img.onerror = () => resolve({ width: 1200, height: 900 });
+    img.src = dataUrl;
+  });
 }
 
 export async function pdfToPptxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer> {
   const { previewImages } = await pdfToImagesZip(pdfBytes, 'image/jpeg');
+  const dimsList = await Promise.all(previewImages.map((url) => measureImageDataUrlSize(url)));
   const zip = new JSZip();
+
+  const slideW = 9144000;
+  const slideH = 6858000;
 
   zip.file(
     '[Content_Types].xml',
@@ -182,8 +256,8 @@ export async function pdfToPptxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer
   <p:sldIdLst>
     ${previewImages.map((_, i) => `<p:sldId id="${256 + i}" r:id="rId${i + 1}"/>`).join('\n    ')}
   </p:sldIdLst>
-  <p:sldSz cx="9144000" cy="6858000" type="screen4x3"/>
-  <p:notesSz cx="6858000" cy="9144000"/>
+  <p:sldSz cx="${slideW}" cy="${slideH}" type="screen4x3"/>
+  <p:notesSz cx="${slideH}" cy="${slideW}"/>
 </p:presentation>`
   );
 
@@ -203,6 +277,13 @@ export async function pdfToPptxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer
   previewImages.forEach((imgDataUrl, i) => {
     const idx = i + 1;
     const b64 = imgDataUrl.split(',')[1];
+    const { width, height } = dimsList[i] || { width: 1200, height: 900 };
+    const ratio = Math.min(slideW / width, slideH / height);
+    const drawCx = Math.max(1, Math.round(width * ratio));
+    const drawCy = Math.max(1, Math.round(height * ratio));
+    const offX = Math.max(0, Math.round((slideW - drawCx) / 2));
+    const offY = Math.max(0, Math.round((slideH - drawCy) / 2));
+
     zip.file(`ppt/media/image${idx}.jpg`, b64, { base64: true });
     zip.file(
       `ppt/slides/slide${idx}.xml`,
@@ -216,7 +297,7 @@ export async function pdfToPptxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer
         <p:nvPicPr><p:cNvPr id="2" name="SlideImage${idx}"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
         <p:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>
         <p:spPr>
-          <a:xfrm><a:off x="0" y="0"/><a:ext cx="9144000" cy="6858000"/></a:xfrm>
+          <a:xfrm><a:off x="${offX}" y="${offY}"/><a:ext cx="${drawCx}" cy="${drawCy}"/></a:xfrm>
           <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
         </p:spPr>
       </p:pic>
@@ -238,6 +319,13 @@ export async function pdfToPptxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer
 
 export async function docxFileToPdf(file: File): Promise<{ pdfBytes: ArrayBuffer; html: string }> {
   const buf = await file.arrayBuffer();
+  const header = new Uint8Array(buf.slice(0, 4));
+  const isZip = header[0] === 0x50 && header[1] === 0x4b;
+  if (!isZip) {
+    throw new Error(
+      'Legacy binary .DOC files are not supported. Please save the file as .DOCX and try again.'
+    );
+  }
   const result = await mammoth.convertToHtml({ arrayBuffer: buf });
   const html = result.value || '<p>(Empty document)</p>';
   const pdfBytes = await htmlDocumentToPdf(html, {
@@ -260,8 +348,10 @@ export async function docxFileToPdf(file: File): Promise<{ pdfBytes: ArrayBuffer
 }
 
 export async function xlsxFileToPdf(file: File): Promise<ArrayBuffer> {
-  const buf = await file.arrayBuffer();
-  const wb = XLSX.read(buf, { type: 'array' });
+  const isCsv = /\.csv$/i.test(file.name);
+  const wb = isCsv
+    ? XLSX.read(await file.text(), { type: 'string' })
+    : XLSX.read(await file.arrayBuffer(), { type: 'array' });
   let html = '';
   for (const sheetName of wb.SheetNames) {
     const sheet = wb.Sheets[sheetName];
@@ -375,10 +465,23 @@ export async function htmlDocumentToPdf(
   }
 
   const blocks: RenderBlock[] = [];
+  const walkChildNodes = (parent: Node) => {
+    parent.childNodes.forEach((child) => {
+      if (child.nodeType === Node.TEXT_NODE) {
+        const txt = (child.textContent || '').trim();
+        if (txt) blocks.push({ kind: 'paragraph', text: txt, fontSize: 11.5 });
+      } else if (child.nodeType === Node.ELEMENT_NODE) {
+        walk(child as Element);
+      }
+    });
+  };
   const walk = (node: Element) => {
     const tag = node.tagName.toLowerCase();
     if (tag === 'hr' || node.classList.contains('pdf-page-break')) {
       blocks.push({ kind: 'page-break' });
+      return;
+    }
+    if (tag === 'br') {
       return;
     }
     if (tag === 'img') {
@@ -424,15 +527,21 @@ export async function htmlDocumentToPdf(
         )
       );
       if (hasBlocks) {
-        Array.from(node.children).forEach(walk);
+        walkChildNodes(node);
       } else {
-        const txt = (node.textContent || '').trim();
+        const lines = (node.innerHTML || '')
+          .split(/<br\s*\/?>/i)
+          .map((frag) => {
+            const tmp = parser.parseFromString(`<span>${frag}</span>`, 'text/html');
+            return (tmp.body.textContent || '').trim();
+          })
+          .filter(Boolean);
         const styleAttr = node.getAttribute('style') || '';
         const alignMatch = styleAttr.match(/text-align:\s*(left|center|right)/i);
         const align = (alignMatch?.[1]?.toLowerCase() as 'left' | 'center' | 'right') || 'left';
         const bold = Boolean(node.querySelector('b,strong'));
         const italic = Boolean(node.querySelector('i,em'));
-        if (txt) {
+        for (const txt of lines) {
           blocks.push({
             kind: 'paragraph',
             text: txt,
@@ -445,10 +554,23 @@ export async function htmlDocumentToPdf(
       }
       return;
     }
-    Array.from(node.children).forEach(walk);
+    if (['span', 'b', 'strong', 'i', 'em', 'u', 'a', 'font', 'sub', 'sup'].includes(tag)) {
+      const txt = (node.textContent || '').trim();
+      if (txt) {
+        blocks.push({
+          kind: 'paragraph',
+          text: txt,
+          fontSize: 11.5,
+          bold: tag === 'b' || tag === 'strong' || Boolean(node.querySelector('b,strong')),
+          italic: tag === 'i' || tag === 'em' || Boolean(node.querySelector('i,em')),
+        });
+      }
+      return;
+    }
+    walkChildNodes(node);
   };
 
-  Array.from(rootEl.children).forEach(walk);
+  walkChildNodes(rootEl);
   if (blocks.length === 0 && (rootEl.textContent || '').trim()) {
     blocks.push({ kind: 'paragraph', text: (rootEl.textContent || '').trim(), fontSize: 11.5 });
   }

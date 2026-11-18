@@ -111,11 +111,31 @@ export async function renderUnicodeTextPng(opts: {
     }
     const words = rawLine.split(' ');
     let cur = '';
+    const pushTokenChars = (token: string) => {
+      let chunk = '';
+      for (const ch of token) {
+        const testChunk = chunk + ch;
+        if (measureInkWidth(testChunk) > limit && chunk) {
+          wrappedLines.push(chunk);
+          chunk = ch;
+        } else {
+          chunk = testChunk;
+        }
+      }
+      cur = chunk;
+    };
     for (const w of words) {
       const test = cur ? `${cur} ${w}` : w;
-      if (measureInkWidth(test) > limit && cur) {
-        wrappedLines.push(cur);
-        cur = w;
+      if (measureInkWidth(test) > limit) {
+        if (cur) {
+          wrappedLines.push(cur);
+          cur = '';
+        }
+        if (measureInkWidth(w) > limit) {
+          pushTokenChars(w);
+        } else {
+          cur = w;
+        }
       } else {
         cur = test;
       }
@@ -1211,32 +1231,42 @@ export async function unlockPasswordProtectedPdf(
     data: new Uint8Array(cloneBuffer(buf)),
     password,
   });
-  const srcPdf = await loadingTask.promise;
-  const outDoc = await PDFDocument.create();
+  try {
+    const srcPdf = await loadingTask.promise;
+    const outDoc = await PDFDocument.create();
 
-  for (let p = 1; p <= srcPdf.numPages; p++) {
-    const page = await srcPdf.getPage(p);
-    const vp1 = page.getViewport({ scale: 1 });
-    const vp = page.getViewport({ scale: 2 });
-    const canvas = document.createElement('canvas');
-    canvas.width = Math.floor(vp.width);
-    canvas.height = Math.floor(vp.height);
-    const ctx = canvas.getContext('2d')!;
-    ctx.fillStyle = '#FFFFFF';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    await page.render({ canvasContext: ctx, viewport: vp, canvas }).promise;
+    for (let p = 1; p <= srcPdf.numPages; p++) {
+      const page = await srcPdf.getPage(p);
+      const vp1 = page.getViewport({ scale: 1 });
+      const vp = page.getViewport({ scale: 2 });
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.floor(vp.width);
+      canvas.height = Math.floor(vp.height);
+      const ctx = canvas.getContext('2d')!;
+      ctx.fillStyle = '#FFFFFF';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport: vp, canvas }).promise;
 
-    const pngDataUrl = canvas.toDataURL('image/png');
-    const bin = atob(pngDataUrl.split(',')[1]);
-    const pngBytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) pngBytes[i] = bin.charCodeAt(i);
-    const embedded = await outDoc.embedPng(pngBytes);
-    const newPage = outDoc.addPage([vp1.width, vp1.height]);
-    newPage.drawImage(embedded, { x: 0, y: 0, width: vp1.width, height: vp1.height });
+      const pngDataUrl = canvas.toDataURL('image/png');
+      const bin = atob(pngDataUrl.split(',')[1]);
+      const pngBytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) pngBytes[i] = bin.charCodeAt(i);
+      const embedded = await outDoc.embedPng(pngBytes);
+      const newPage = outDoc.addPage([vp1.width, vp1.height]);
+      newPage.drawImage(embedded, { x: 0, y: 0, width: vp1.width, height: vp1.height });
+    }
+    const out = await outDoc.save();
+    return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
+  } catch (err: unknown) {
+    const name = (err as { name?: string })?.name || '';
+    const msg = err instanceof Error ? err.message : '';
+    if (name === 'PasswordException' || /password/i.test(msg)) {
+      throw new Error('Incorrect PDF password or unable to decrypt this file.');
+    }
+    throw err instanceof Error ? err : new Error('Failed to unlock PDF.');
+  } finally {
+    await loadingTask.destroy().catch(() => {});
   }
-  await loadingTask.destroy();
-  const out = await outDoc.save();
-  return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
 }
 
 /**
@@ -1375,12 +1405,12 @@ export async function createStarterSamplePdfs(): Promise<
   const body1 = [
     'PDF MASTER combines genuine PDF text editing, page organization, smart camera scanning,',
     'English and Bengali OCR, Word-style document creation, format conversion, document',
-    'comparison, digital signatures, and an AI PDF Assistant in one mobile-first workspace.',
+    'comparison, and cryptographic digital signatures in one mobile-first workspace.',
     '',
     'Try opening this document in:',
     '- Edit PDF: Tap any existing text line to edit or replace it directly.',
     '- Page Organizer: Reorder, duplicate, rotate, or split pages visually.',
-    '- AI Assistant: Summarize, translate to Bengali, or ask questions with page citations.',
+    '- OCR & Scanner: Scan documents with 4-corner detection and extract English/Bengali text.',
     '- Compare PDFs: Diff this guide against a revised version line by line.',
   ];
   let y = 660;

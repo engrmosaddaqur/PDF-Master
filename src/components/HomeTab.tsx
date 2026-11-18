@@ -1,6 +1,5 @@
 import React, { useMemo, useState } from 'react';
 import {
-  Bot,
   Camera,
   ChevronRight,
   Combine,
@@ -13,6 +12,7 @@ import {
   Minimize2,
   RefreshCw,
   RotateCw,
+  ScanText,
   Scissors,
   Search,
   Star,
@@ -60,8 +60,6 @@ export const HomeTab: React.FC<HomeTabProps> = ({
     return activeDocs.filter((d) => d.name.toLowerCase().includes(q)).slice(0, 12);
   }, [activeDocs, search]);
 
-  const firstEditableDoc = activeDocs.find((d) => !d.isVaultLocked);
-
   const quickActions = [
     {
       id: 'edit',
@@ -106,12 +104,11 @@ export const HomeTab: React.FC<HomeTabProps> = ({
       onClick: () => onOpenWorkspace({ type: 'toolRunner', toolId: 'compress' }),
     },
     {
-      id: 'ai',
-      label: language === 'bn' ? 'এআই অ্যাসিস্ট্যান্ট' : 'AI Assistant',
-      icon: <Bot className="w-5 h-5" />,
+      id: 'ocr',
+      label: language === 'bn' ? 'ওসিআর টেক্সট' : 'OCR Text',
+      icon: <ScanText className="w-5 h-5" />,
       tint: 'bg-[#172542] text-[#3B82F6] dark:bg-[#172542] dark:text-[#60A5FA]',
-      onClick: () =>
-        onOpenWorkspace({ type: 'aiAssistant', docId: firstEditableDoc?.id }),
+      onClick: () => onOpenWorkspace({ type: 'ocr' }),
     },
     {
       id: 'tools',

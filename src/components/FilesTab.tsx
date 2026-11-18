@@ -153,7 +153,7 @@ export const FilesTab: React.FC<FilesTabProps> = ({
   const handleRenameSubmit = async () => {
     if (!renameTarget || !renameValue.trim()) return;
     const trimmed = renameValue.trim();
-    const normalized = trimmed.endsWith('.pdf') ? trimmed : `${trimmed}.pdf`;
+    const normalized = trimmed.toLowerCase().endsWith('.pdf') ? trimmed : `${trimmed}.pdf`;
     await onUpdateDoc({ ...renameTarget, name: normalized, updatedAt: Date.now() });
     setRenameTarget(null);
     setRenameValue('');

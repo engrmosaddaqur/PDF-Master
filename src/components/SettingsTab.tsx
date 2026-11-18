@@ -425,18 +425,6 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
 
         <label className="flex items-center justify-between gap-3 cursor-pointer min-h-[40px]">
           <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">
-            {t.settings.aiConsent}
-          </span>
-          <input
-            type="checkbox"
-            checked={settings.aiConsentGranted}
-            onChange={(e) => onUpdateSettings({ aiConsentGranted: e.target.checked })}
-            className="w-5 h-5 accent-[#3B82F6]"
-          />
-        </label>
-
-        <label className="flex items-center justify-between gap-3 cursor-pointer min-h-[40px]">
-          <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">
             {t.settings.localOnly}
           </span>
           <input

@@ -13,7 +13,6 @@ import {
   RotateCw,
   Search,
   Share2,
-  Sparkles,
   ZoomIn,
   ZoomOut,
   X,
@@ -42,7 +41,6 @@ interface PdfViewerViewProps {
   onUpdateDoc: (updated: DocumentRecord) => Promise<void>;
   onOpenEditor: () => void;
   onOpenOrganizer: () => void;
-  onOpenAI: () => void;
 }
 
 const LazyPageCanvas: React.FC<{
@@ -153,7 +151,6 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
   onUpdateDoc,
   onOpenEditor,
   onOpenOrganizer,
-  onOpenAI,
 }) => {
   const t = getT(language);
   const [viewMode, setViewMode] = useState<'continuous' | 'single'>(defaultViewMode);
@@ -794,7 +791,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
             </div>
           )}
 
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-2 gap-2">
             <button
               onClick={onOpenEditor}
               className="min-h-[44px] rounded-xl bg-[#2563EB] text-white text-xs font-semibold flex items-center justify-center gap-1.5 active:scale-[0.98] transition-transform"
@@ -808,13 +805,6 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
             >
               <Layers className="w-4 h-4" />
               <span>{t.viewer.organize}</span>
-            </button>
-            <button
-              onClick={onOpenAI}
-              className="min-h-[44px] rounded-xl bg-[#142B4A] dark:bg-[#06B6D4]/20 text-white dark:text-[#38BDF8] text-xs font-semibold flex items-center justify-center gap-1.5 active:scale-[0.98] transition-transform"
-            >
-              <Sparkles className="w-4 h-4" />
-              <span>{t.viewer.askAi}</span>
             </button>
           </div>
         </footer>

@@ -1,6 +1,5 @@
 import React, { useMemo, useState } from 'react';
 import {
-  Bot,
   Camera,
   Combine,
   Edit3,
@@ -53,8 +52,6 @@ export const ToolsTab: React.FC<ToolsTabProps> = ({
   onPickDocForWorkspace,
 }) => {
   const [query, setQuery] = useState('');
-
-  const firstDoc = docs.find((d) => !d.isTrashed && !d.isVaultLocked);
 
   const tools: ToolCardItem[] = [
     // ORGANIZE
@@ -291,15 +288,6 @@ export const ToolsTab: React.FC<ToolsTabProps> = ({
       iconBg: 'bg-amber-500/15',
       onClick: () => onOpenWorkspace({ type: 'ocr' }),
     },
-    {
-      id: 'aiAssistant',
-      name: language === 'bn' ? 'এআই পিডিএফ অ্যাসিস্ট্যান্ট' : 'AI PDF Assistant',
-      desc: language === 'bn' ? 'সারসংক্ষেপ ও প্রশ্নোত্তর' : 'Summarize and ask questions',
-      group: 'smart',
-      icon: <Bot className="w-5 h-5 text-[#3B82F6]" />,
-      iconBg: 'bg-[#2563EB]/15',
-      onClick: () => onOpenWorkspace({ type: 'aiAssistant', docId: firstDoc?.id }),
-    },
   ];
 
   const groups: Array<{ id: ToolGroupId; label: string }> = [
@@ -307,7 +295,7 @@ export const ToolsTab: React.FC<ToolsTabProps> = ({
     { id: 'convert', label: language === 'bn' ? 'কনভার্ট' : 'CONVERT' },
     { id: 'edit', label: language === 'bn' ? 'এডিট ও টীকা' : 'EDIT & ANNOTATE' },
     { id: 'security', label: language === 'bn' ? 'সুরক্ষা' : 'SECURITY' },
-    { id: 'smart', label: language === 'bn' ? 'স্মার্ট টুলস' : 'SMART TOOLS' },
+    { id: 'smart', label: language === 'bn' ? 'স্ক্যান ও ওসিআর' : 'SCAN & OCR' },
   ];
 
   const filteredTools = useMemo(() => {
@@ -317,7 +305,7 @@ export const ToolsTab: React.FC<ToolsTabProps> = ({
       (item) =>
         item.name.toLowerCase().includes(q) || item.desc.toLowerCase().includes(q)
     );
-  }, [query, firstDoc?.id, language]);
+  }, [query, language]);
 
   return (
     <div className="space-y-6 pb-8">

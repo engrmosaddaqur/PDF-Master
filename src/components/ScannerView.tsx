@@ -42,6 +42,7 @@ interface ScannerViewProps {
 interface ScannedPageItem {
   id: string;
   rawCanvas: HTMLCanvasElement;
+  warpedCanvas: HTMLCanvasElement;
   corners: [Point2D, Point2D, Point2D, Point2D];
   sideLocked: { top: boolean; right: boolean; bottom: boolean; left: boolean };
   filter: ScanFilter;
@@ -200,6 +201,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     const newItem: ScannedPageItem = {
       id: `scan_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
       rawCanvas,
+      warpedCanvas: warped,
       corners: detected.corners,
       sideLocked: detected.sideLocked,
       filter: defaultFilter,
@@ -319,37 +321,49 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
     return () => clearInterval(id);
   }, [cameraActive, step, edgeSensitivity, autoCapture, continuousMode]);
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
+    e.target.value = '';
     if (!files.length) return;
     const isMultiBatch = files.length > 1;
-    files.forEach((file, idx) => {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const img = new Image();
-        img.onload = () => {
-          const maxDim = 1600;
-          let w = img.naturalWidth || 1000;
-          let h = img.naturalHeight || 1300;
-          if (w > maxDim || h > maxDim) {
-            const s = maxDim / Math.max(w, h);
-            w = Math.round(w * s);
-            h = Math.round(h * s);
-          }
-          const c = document.createElement('canvas');
-          c.width = w;
-          c.height = h;
-          c.getContext('2d')!.drawImage(img, 0, 0, w, h);
-          ingestSourceCanvas(c, { stayInCamera: isMultiBatch && idx < files.length - 1 });
-          if (isMultiBatch && idx === files.length - 1) {
-            setStep('review');
-          }
-        };
-        img.src = reader.result as string;
-      };
-      reader.readAsDataURL(file);
-    });
-    e.target.value = '';
+
+    for (let idx = 0; idx < files.length; idx++) {
+      const file = files[idx];
+      try {
+        const dataUrl = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result || ''));
+          reader.onerror = () => reject(new Error('Failed to read image'));
+          reader.readAsDataURL(file);
+        });
+        const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+          const image = new Image();
+          image.onload = () => resolve(image);
+          image.onerror = () => reject(new Error('Failed to decode image'));
+          image.src = dataUrl;
+        });
+
+        const maxDim = 1600;
+        let w = img.naturalWidth || 1000;
+        let h = img.naturalHeight || 1300;
+        if (w > maxDim || h > maxDim) {
+          const s = maxDim / Math.max(w, h);
+          w = Math.round(w * s);
+          h = Math.round(h * s);
+        }
+        const c = document.createElement('canvas');
+        c.width = w;
+        c.height = h;
+        c.getContext('2d')!.drawImage(img, 0, 0, w, h);
+        ingestSourceCanvas(c, { stayInCamera: isMultiBatch });
+      } catch {
+        // Skip unreadable image file without blocking batch
+      }
+    }
+
+    if (isMultiBatch) {
+      setStep('review');
+    }
   };
 
   const activePage = pages[activeIdx];
@@ -357,7 +371,11 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
   const reprocessActivePage = (patch: Partial<ScannedPageItem>) => {
     if (!activePage) return;
     const updated = { ...activePage, ...patch };
-    const warped = perspectiveWarpCanvas(updated.rawCanvas, updated.corners);
+    const warped =
+      patch.corners !== undefined
+        ? perspectiveWarpCanvas(updated.rawCanvas, updated.corners)
+        : updated.warpedCanvas;
+    updated.warpedCanvas = warped;
     updated.processedUrl = applyScanEnhancement(warped, {
       filter: updated.filter,
       brightness: updated.brightness,
@@ -425,7 +443,7 @@ export const ScannerView: React.FC<ScannerViewProps> = ({
 
   const applyCropAndProceed = () => {
     if (!activePage) return;
-    reprocessActivePage({});
+    reprocessActivePage({ corners: activePage.corners });
     setStep('review');
   };
 

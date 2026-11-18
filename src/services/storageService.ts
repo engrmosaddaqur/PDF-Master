@@ -31,7 +31,6 @@ export const DEFAULT_SETTINGS: AppSettings = {
   scannerAutoCrop: true,
   scannerDefaultFilter: 'magic',
   exportQuality: 'high',
-  aiConsentGranted: false,
   localOnlyMode: false,
 };
 

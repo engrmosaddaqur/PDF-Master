@@ -108,7 +108,6 @@ export interface AppSettings {
   scannerAutoCrop: boolean;
   scannerDefaultFilter: 'color' | 'magic' | 'grayscale' | 'bw';
   exportQuality: 'standard' | 'high' | 'maximum';
-  aiConsentGranted: boolean;
   localOnlyMode: boolean;
 }
 
@@ -212,5 +211,4 @@ export type ActiveWorkspace =
   | { type: 'ocr'; docId?: string; initialImage?: string }
   | { type: 'wordCreator'; docId?: string }
   | { type: 'compare'; docIdA?: string; docIdB?: string }
-  | { type: 'aiAssistant'; docId?: string }
   | { type: 'toolRunner'; toolId: string; preselectedDocId?: string };

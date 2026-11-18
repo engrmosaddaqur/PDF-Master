@@ -46,7 +46,8 @@ import {
   pptxFileToPdf,
   xlsxFileToPdf,
 } from '../services/conversionService';
-import { downloadArrayBuffer, formatBytes, formatRelativeTime } from '../services/storageService';
+import { formatBytes, formatRelativeTime } from '../services/storageService';
+import { saveBufferToDeviceStorage } from '../services/deviceFileActions';
 import { PdfSourcePicker } from './PdfSourcePicker';
 
 interface ToolRunnerModalProps {
@@ -304,19 +305,31 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
       } else if (toolId === 'split') {
         if (!primaryDoc) throw new Error('Select a PDF to split.');
         const pagesToKeep: number[] = [];
+        const seen = new Set<number>();
         splitRange.split(',').forEach((part) => {
           const trimmed = part.trim();
+          if (!trimmed) return;
           if (trimmed.includes('-')) {
             const [s, e] = trimmed.split('-').map((n) => parseInt(n, 10));
-            if (s && e) {
-              for (let p = Math.min(s, e); p <= Math.max(s, e); p++) pagesToKeep.push(p);
+            if (Number.isFinite(s) && Number.isFinite(e)) {
+              for (let p = Math.min(s, e); p <= Math.max(s, e); p++) {
+                if (p >= 1 && p <= primaryDoc.pageCount && !seen.has(p)) {
+                  seen.add(p);
+                  pagesToKeep.push(p);
+                }
+              }
             }
           } else {
             const n = parseInt(trimmed, 10);
-            if (n) pagesToKeep.push(n);
+            if (Number.isFinite(n) && n >= 1 && n <= primaryDoc.pageCount && !seen.has(n)) {
+              seen.add(n);
+              pagesToKeep.push(n);
+            }
           }
         });
-        if (!pagesToKeep.length) throw new Error('Enter valid page numbers like 1-2, 4.');
+        if (!pagesToKeep.length) {
+          throw new Error(`Enter valid page numbers between 1 and ${primaryDoc.pageCount}.`);
+        }
         const splitBytes = await splitPdfByRanges(primaryDoc.pdfBytes, pagesToKeep);
         await saveNewPdf(
           splitBytes,
@@ -398,6 +411,9 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           pdfBytes: encrypted,
           updatedAt: Date.now(),
         });
+        setPasswordInput('');
+        const nextUnlocked = available.find((d) => d.id !== primaryDoc.id);
+        setSelectedIds(nextUnlocked ? [nextUnlocked.id] : []);
         setResultMsg('Document encrypted with AES-256-GCM inside your local Vault.');
       } else if (toolId === 'unlockPdf') {
         const file = uploadedFiles[0];
@@ -422,7 +438,7 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         if (!primaryDoc) throw new Error('Select a PDF.');
         const { zipBuffer, previewImages } = await pdfToImagesZip(primaryDoc.pdfBytes, 'image/png');
         setPreviewUrls(previewImages);
-        downloadArrayBuffer(
+        await saveBufferToDeviceStorage(
           zipBuffer,
           primaryDoc.name.replace(/\.pdf$/i, '_pages.zip'),
           'application/zip'
@@ -431,16 +447,21 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
       } else if (toolId === 'extractText') {
         if (!primaryDoc) throw new Error('Select a PDF.');
         const pages = await extractDocumentPagesText(primaryDoc.pdfBytes);
+        const totalChars = pages.reduce((sum, p) => sum + p.text.trim().length, 0);
         const fullText = pages
           .map((p) => `--- Page ${p.pageNumber} ---\n${p.text}`)
           .join('\n\n');
         const buf = new TextEncoder().encode(fullText).buffer;
-        downloadArrayBuffer(
+        await saveBufferToDeviceStorage(
           buf,
           primaryDoc.name.replace(/\.pdf$/i, '.txt'),
           'text/plain;charset=utf-8'
         );
-        setResultMsg(`Extracted text from ${pages.length} page(s).`);
+        setResultMsg(
+          totalChars === 0
+            ? `Exported .TXT (${pages.length} page(s)), but no selectable text was found. Use the OCR Text tool for scanned pages.`
+            : `Extracted text from ${pages.length} page(s).`
+        );
       } else if (toolId === 'editMetadata') {
         if (!primaryDoc) throw new Error('Select a PDF.');
         const out = await updatePdfMetadata(primaryDoc.pdfBytes, {
@@ -452,6 +473,7 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         await onUpdateExistingDoc({
           ...primaryDoc,
           pdfBytes: cloneBuffer(out),
+          sizeBytes: out.byteLength,
           updatedAt: Date.now(),
         });
         setResultMsg('PDF metadata updated.');
@@ -488,26 +510,37 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         }
       } else if (toolId === 'pdfToDocx') {
         if (!primaryDoc) throw new Error('Select a PDF.');
-        const docxBuf = await pdfToDocxBytes(primaryDoc.pdfBytes, primaryDoc.name);
-        downloadArrayBuffer(
+        const { buffer: docxBuf, extractedChars } = await pdfToDocxBytes(
+          primaryDoc.pdfBytes,
+          primaryDoc.name
+        );
+        await saveBufferToDeviceStorage(
           docxBuf,
           primaryDoc.name.replace(/\.pdf$/i, '.docx'),
           'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         );
-        setResultMsg('Converted and downloaded Word (.DOCX) file.');
+        setResultMsg(
+          extractedChars === 0
+            ? 'Converted Word (.DOCX) file saved, but no embedded text was found (use OCR Text for scanned PDFs).'
+            : 'Converted and saved Word (.DOCX) file.'
+        );
       } else if (toolId === 'pdfToXlsx') {
         if (!primaryDoc) throw new Error('Select a PDF.');
-        const xlsxBuf = await pdfToXlsxBytes(primaryDoc.pdfBytes);
-        downloadArrayBuffer(
+        const { buffer: xlsxBuf, extractedChars } = await pdfToXlsxBytes(primaryDoc.pdfBytes);
+        await saveBufferToDeviceStorage(
           xlsxBuf,
           primaryDoc.name.replace(/\.pdf$/i, '.xlsx'),
           'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
         );
-        setResultMsg('Extracted tabular data to Excel (.XLSX) workbook.');
+        setResultMsg(
+          extractedChars === 0
+            ? 'Excel (.XLSX) workbook saved, but no embedded text was found (use OCR Text for scanned PDFs).'
+            : 'Extracted tabular data to Excel (.XLSX) workbook.'
+        );
       } else if (toolId === 'pdfToPptx') {
         if (!primaryDoc) throw new Error('Select a PDF.');
         const pptxBuf = await pdfToPptxBytes(primaryDoc.pdfBytes);
-        downloadArrayBuffer(
+        await saveBufferToDeviceStorage(
           pptxBuf,
           primaryDoc.name.replace(/\.pdf$/i, '.pptx'),
           'application/vnd.openxmlformats-officedocument.presentationml.presentation'
@@ -518,27 +551,51 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         if (!file && recentExternalDocId) {
           const rDoc = available.find((d) => d.id === recentExternalDocId);
           if (!rDoc) throw new Error('Select a .DOCX, .XLSX, or .PPTX file.');
-          const outBytes = rDoc.editableHtml
-            ? await htmlDocumentToPdf(
-                rDoc.editableHtml,
-                rDoc.wordSettings || {
-                  paperSize: 'A4',
-                  orientation: 'portrait',
-                  customWidthMm: 210,
-                  customHeightMm: 297,
-                  marginTopMm: 20,
-                  marginBottomMm: 20,
-                  marginLeftMm: 20,
-                  marginRightMm: 20,
-                  backgroundColor: '#FFFFFF',
-                  borderEnabled: false,
-                  borderColor: '#CBD5E1',
-                  headerText: '',
-                  footerText: '',
-                  pageNumbering: true,
-                }
+          const escapeHtml = (s: string) =>
+            s
+              .replace(/&/g, '&amp;')
+              .replace(/</g, '&lt;')
+              .replace(/>/g, '&gt;');
+          let htmlToRender = rDoc.editableHtml;
+          if (!htmlToRender) {
+            const pages = await extractDocumentPagesText(rDoc.pdfBytes);
+            const blocks = pages
+              .map((pg) =>
+                pg.text
+                  .split(/\r?\n/)
+                  .map((l) => l.trim())
+                  .filter(Boolean)
+                  .map((l) => `<p>${escapeHtml(l)}</p>`)
+                  .join('')
               )
-            : cloneBuffer(rDoc.pdfBytes);
+              .filter(Boolean)
+              .join('<hr class="pdf-page-break"/>');
+            if (!blocks) {
+              throw new Error(
+                'Selected file has no editable Word HTML or selectable text layer. Use OCR Text first or pick a .DOCX file.'
+              );
+            }
+            htmlToRender = blocks;
+          }
+          const outBytes = await htmlDocumentToPdf(
+            htmlToRender,
+            rDoc.wordSettings || {
+              paperSize: 'A4',
+              orientation: 'portrait',
+              customWidthMm: 210,
+              customHeightMm: 297,
+              marginTopMm: 20,
+              marginBottomMm: 20,
+              marginLeftMm: 20,
+              marginRightMm: 20,
+              backgroundColor: '#FFFFFF',
+              borderEnabled: false,
+              borderColor: '#CBD5E1',
+              headerText: '',
+              footerText: '',
+              pageNumbering: true,
+            }
+          );
           await saveNewPdf(
             outBytes,
             rDoc.name.replace(/\.pdf$/i, '_converted.pdf'),
@@ -707,14 +764,7 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                       : 'Or pick from Recent Files'}
                   </span>
                   <div className="max-h-36 overflow-y-auto space-y-1.5">
-                    {recentSorted
-                      .filter((d) =>
-                        toolId === 'wordToPdf'
-                          ? Boolean(d.editableHtml) || d.origin === 'converted' || d.origin === 'created'
-                          : true
-                      )
-                      .slice(0, 8)
-                      .map((d) => {
+                    {recentSorted.slice(0, 8).map((d) => {
                         const active = recentExternalDocId === d.id && uploadedFiles.length === 0;
                         return (
                           <button
@@ -980,7 +1030,7 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           {toolId === 'split' && (
             <div>
               <label className="block text-xs font-semibold text-slate-500 mb-1">
-                Pages to Extract (e.g. 1-2, 4)
+                Pages to Extract (e.g. 1-2, 4{primaryDoc ? ` · max ${primaryDoc.pageCount}` : ''})
               </label>
               <input
                 type="text"
@@ -1244,7 +1294,7 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                 <button
                   type="button"
                   onClick={() =>
-                    void downloadArrayBuffer(
+                    void saveBufferToDeviceStorage(
                       lastMergedResult.bytes,
                       lastMergedResult.name,
                       'application/pdf'

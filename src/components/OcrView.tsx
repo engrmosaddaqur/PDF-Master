@@ -8,8 +8,6 @@ import {
   Loader2,
   ScanText,
   Search,
-  ShieldAlert,
-  Sparkles,
 } from 'lucide-react';
 import type { AppLanguage, DocumentRecord } from '../types';
 import { getT } from '../i18n/translations';
@@ -20,18 +18,15 @@ import {
   renderPageThumbnail,
   renderPageToDataUrl,
 } from '../services/pdfEngine';
-import { runAiVisionOcr, runOnDeviceOcr, type OcrLanguage } from '../services/ocrService';
-import { downloadArrayBuffer } from '../services/storageService';
+import { runOnDeviceOcrBatch, type OcrLanguage } from '../services/ocrService';
+import { saveBufferToDeviceStorage } from '../services/deviceFileActions';
 import { PdfSourcePicker } from './PdfSourcePicker';
 
 interface OcrViewProps {
   language: AppLanguage;
   docs: DocumentRecord[];
   initialDocId?: string;
-  aiConsentGranted: boolean;
-  localOnlyMode: boolean;
   onImportDoc?: (doc: DocumentRecord) => Promise<void>;
-  onGrantAiConsent: () => void;
   onClose: () => void;
   onSaveSearchablePdf: (doc: DocumentRecord) => Promise<void>;
   onOpenInWordCreator: (initialHtml: string) => void;
@@ -41,16 +36,13 @@ export const OcrView: React.FC<OcrViewProps> = ({
   language,
   docs,
   initialDocId,
-  aiConsentGranted,
-  localOnlyMode,
   onImportDoc,
-  onGrantAiConsent,
   onClose,
   onSaveSearchablePdf,
   onOpenInWordCreator,
 }) => {
   const t = getT(language);
-  const [sourceType, setSourceType] = useState<'pdf' | 'image'>(initialDocId ? 'pdf' : 'pdf');
+  const [sourceType, setSourceType] = useState<'pdf' | 'image'>('pdf');
   const [selectedDocId, setSelectedDocId] = useState<string>(
     initialDocId || docs.find((d) => !d.isTrashed && !d.isVaultLocked)?.id || ''
   );
@@ -61,8 +53,8 @@ export const OcrView: React.FC<OcrViewProps> = ({
 
   const [pageImages, setPageImages] = useState<string[]>([]);
   const [ocrLang, setOcrLang] = useState<OcrLanguage>('eng+ben');
-  const [engine, setEngine] = useState<'device' | 'ai'>('device');
   const [running, setRunning] = useState(false);
+  const [savingSearchable, setSavingSearchable] = useState(false);
   const [progress, setProgress] = useState(0);
   const [statusText, setStatusText] = useState('');
   const [extractedPages, setExtractedPages] = useState<Array<{ imageDataUrl: string; ocrText: string }>>([]);
@@ -183,37 +175,30 @@ export const OcrView: React.FC<OcrViewProps> = ({
 
   const handleRunOcr = async () => {
     if (pageImages.length === 0) return;
-    if (engine === 'ai' && (localOnlyMode || !aiConsentGranted)) {
-      return;
-    }
 
     setRunning(true);
     setErrorMsg(null);
     setProgress(0);
-    const outPages: Array<{ imageDataUrl: string; ocrText: string }> = [];
+    setStatusText(`Preparing offline OCR (${pageImages.length} page${pageImages.length > 1 ? 's' : ''})...`);
 
     try {
-      for (let i = 0; i < pageImages.length; i++) {
-        setStatusText(`Processing page ${i + 1} of ${pageImages.length}...`);
-        let text = '';
-        if (engine === 'ai') {
-          text = await runAiVisionOcr(pageImages[i], ocrLang);
-          setProgress(Math.round(((i + 1) / pageImages.length) * 100));
-        } else {
-          text = await runOnDeviceOcr(pageImages[i], ocrLang, (pct, st) => {
-            const overall = Math.round(((i + pct / 100) / pageImages.length) * 100);
-            setProgress(overall);
-            setStatusText(`Page ${i + 1}/${pageImages.length}: ${st}`);
-          });
-        }
-        outPages.push({ imageDataUrl: pageImages[i], ocrText: text });
-      }
+      const texts = await runOnDeviceOcrBatch(pageImages, ocrLang, (pageIdx, pct, st) => {
+        const overall = Math.round(((pageIdx + pct / 100) / pageImages.length) * 100);
+        setProgress(overall);
+        setStatusText(`Page ${pageIdx + 1}/${pageImages.length}: ${st}`);
+      });
+
+      const outPages = pageImages.map((imageDataUrl, idx) => ({
+        imageDataUrl,
+        ocrText: texts[idx] || '',
+      }));
       setExtractedPages(outPages);
       setCombinedText(
         outPages
           .map((p, idx) => (outPages.length > 1 ? `--- Page ${idx + 1} ---\n${p.ocrText}` : p.ocrText))
           .join('\n\n')
       );
+      setProgress(100);
       setStatusText('OCR completed');
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'OCR processing failed');
@@ -223,41 +208,53 @@ export const OcrView: React.FC<OcrViewProps> = ({
   };
 
   const handleSaveSearchable = async () => {
-    if (extractedPages.length === 0) return;
-    const pdfBytes = await createSearchablePdfFromOcr(extractedPages);
-    const thumb = await renderPageThumbnail(pdfBytes, 1, 200).catch(() => extractedPages[0].imageDataUrl);
-    const now = Date.now();
-    const baseName =
-      sourceType === 'pdf' && activePdfName
-        ? activePdfName.replace(/\.pdf$/i, '_searchable.pdf')
-        : `OCR_Searchable_${new Date(now).toISOString().slice(0, 10)}.pdf`;
+    if (extractedPages.length === 0 || savingSearchable) return;
+    setSavingSearchable(true);
+    setErrorMsg(null);
+    try {
+      const pagesToSave = extractedPages.map((p, idx) => ({
+        ...p,
+        ocrText: extractedPages.length === 1 ? combinedText : p.ocrText,
+      }));
+      const pdfBytes = await createSearchablePdfFromOcr(pagesToSave);
+      const thumb = await renderPageThumbnail(pdfBytes, 1, 200).catch(() => pagesToSave[0].imageDataUrl);
+      const now = Date.now();
+      const baseName =
+        sourceType === 'pdf' && activePdfName
+          ? activePdfName.replace(/\.pdf$/i, '_searchable.pdf')
+          : `OCR_Searchable_${new Date(now).toISOString().slice(0, 10)}.pdf`;
 
-    await onSaveSearchablePdf({
-      id: `doc_ocr_${now}`,
-      name: baseName,
-      origin: 'scanned',
-      createdAt: now,
-      updatedAt: now,
-      lastOpenedAt: now,
-      sizeBytes: pdfBytes.byteLength,
-      pageCount: extractedPages.length,
-      isStarred: false,
-      isShared: false,
-      isTrashed: false,
-      folderId: null,
-      thumbnailDataUrl: thumb,
-      pdfBytes: cloneBuffer(pdfBytes),
-      versions: [
-        {
-          id: `ver_${now}`,
-          timestamp: now,
-          note: `OCR Searchable PDF (${ocrLang})`,
-          sizeBytes: pdfBytes.byteLength,
-          pdfBytes: cloneBuffer(pdfBytes),
-        },
-      ],
-    });
-    onClose();
+      await onSaveSearchablePdf({
+        id: `doc_ocr_${now}`,
+        name: baseName,
+        origin: 'scanned',
+        createdAt: now,
+        updatedAt: now,
+        lastOpenedAt: now,
+        sizeBytes: pdfBytes.byteLength,
+        pageCount: pagesToSave.length,
+        isStarred: false,
+        isShared: false,
+        isTrashed: false,
+        folderId: null,
+        thumbnailDataUrl: thumb,
+        pdfBytes: cloneBuffer(pdfBytes),
+        versions: [
+          {
+            id: `ver_${now}`,
+            timestamp: now,
+            note: `OCR Searchable PDF (${ocrLang})`,
+            sizeBytes: pdfBytes.byteLength,
+            pdfBytes: cloneBuffer(pdfBytes),
+          },
+        ],
+      });
+      onClose();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to save searchable PDF.');
+    } finally {
+      setSavingSearchable(false);
+    }
   };
 
   const matchCount =
@@ -471,57 +468,14 @@ export const OcrView: React.FC<OcrViewProps> = ({
             </div>
           </div>
 
-          <div>
-            <label className="block text-xs font-semibold text-slate-600 dark:text-slate-400 mb-1.5">
-              OCR Engine
-            </label>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-              <button
-                onClick={() => setEngine('device')}
-                className={`min-h-[46px] px-3 rounded-xl text-xs font-semibold border text-left flex items-center gap-2 ${
-                  engine === 'device'
-                    ? 'bg-[#142B4A] text-white border-[#142B4A]'
-                    : 'border-slate-200 dark:border-slate-700'
-                }`}
-              >
-                <ScanText className="w-4 h-4 shrink-0" />
-                <span>{t.ocr.engineDevice}</span>
-              </button>
-              <button
-                onClick={() => setEngine('ai')}
-                disabled={localOnlyMode}
-                className={`min-h-[46px] px-3 rounded-xl text-xs font-semibold border text-left flex items-center gap-2 disabled:opacity-40 ${
-                  engine === 'ai'
-                    ? 'bg-[#2563EB] text-white border-[#2563EB]'
-                    : 'border-slate-200 dark:border-slate-700'
-                }`}
-              >
-                <Sparkles className="w-4 h-4 shrink-0" />
-                <span>{t.ocr.engineAi}</span>
-              </button>
-            </div>
+          <div className="flex items-center gap-2 px-3 py-2 rounded-xl bg-slate-100 dark:bg-slate-800/70 text-xs text-slate-600 dark:text-slate-300">
+            <ScanText className="w-4 h-4 text-[#2563EB] shrink-0" />
+            <span>{t.ocr.engineDevice}</span>
           </div>
-
-          {engine === 'ai' && !aiConsentGranted && !localOnlyMode && (
-            <div className="p-3 rounded-xl bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 text-xs space-y-2">
-              <div className="flex items-start gap-2 text-amber-900 dark:text-amber-200">
-                <ShieldAlert className="w-4 h-4 shrink-0 mt-0.5" />
-                <span>
-                  AI Vision OCR sends the page image securely to our Gemini server endpoint for high-accuracy Bengali/English layout extraction.
-                </span>
-              </div>
-              <button
-                onClick={onGrantAiConsent}
-                className="min-h-[38px] px-3 rounded-lg bg-[#2563EB] text-white font-semibold"
-              >
-                Allow AI Vision OCR
-              </button>
-            </div>
-          )}
 
           <button
             onClick={handleRunOcr}
-            disabled={running || loadingPdfPages || pageImages.length === 0 || (engine === 'ai' && !aiConsentGranted)}
+            disabled={running || loadingPdfPages || pageImages.length === 0}
             className="w-full min-h-[48px] rounded-xl bg-[#2563EB] disabled:opacity-40 text-white text-sm font-semibold flex items-center justify-center gap-2"
           >
             <ScanText className="w-4 h-4" />
@@ -585,7 +539,7 @@ export const OcrView: React.FC<OcrViewProps> = ({
               <button
                 onClick={() => {
                   const buf = new TextEncoder().encode(combinedText).buffer;
-                  downloadArrayBuffer(buf, 'ocr-extracted.txt', 'text/plain;charset=utf-8');
+                  void saveBufferToDeviceStorage(buf, 'ocr-extracted.txt', 'text/plain;charset=utf-8');
                 }}
                 className="min-h-[44px] rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center justify-center gap-1.5"
               >
@@ -607,10 +561,15 @@ export const OcrView: React.FC<OcrViewProps> = ({
               </button>
               <button
                 onClick={handleSaveSearchable}
-                className="min-h-[44px] rounded-xl bg-[#142B4A] dark:bg-[#2563EB] text-white text-xs font-semibold flex items-center justify-center gap-1.5"
+                disabled={savingSearchable}
+                className="min-h-[44px] rounded-xl bg-[#142B4A] dark:bg-[#2563EB] disabled:opacity-50 text-white text-xs font-semibold flex items-center justify-center gap-1.5"
               >
-                <ScanText className="w-4 h-4" />
-                {t.ocr.makeSearchablePdf}
+                {savingSearchable ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <ScanText className="w-4 h-4" />
+                )}
+                <span>{savingSearchable ? 'Saving...' : t.ocr.makeSearchablePdf}</span>
               </button>
             </div>
           </div>

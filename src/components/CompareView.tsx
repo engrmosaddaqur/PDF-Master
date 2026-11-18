@@ -43,6 +43,7 @@ export const CompareView: React.FC<CompareViewProps> = ({
     totalUnchanged: number;
   } | null>(null);
   const [sideImages, setSideImages] = useState<Array<{ a?: string; b?: string; page: number }>>([]);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const docAObj = available.find((d) => d.id === docAId);
   const docBObj = available.find((d) => d.id === docBId);
@@ -53,6 +54,7 @@ export const CompareView: React.FC<CompareViewProps> = ({
     if (!docA || !docB) return;
     setPickerSlot(null);
     setRunning(true);
+    setErrorMsg(null);
     try {
       const [pagesA, pagesB] = await Promise.all([
         extractDocumentPagesText(docA.pdfBytes),
@@ -69,6 +71,8 @@ export const CompareView: React.FC<CompareViewProps> = ({
         imgs.push({ a: aUrl, b: bUrl, page: p });
       }
       setSideImages(imgs);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to compare selected PDFs.');
     } finally {
       setRunning(false);
     }
@@ -181,6 +185,20 @@ export const CompareView: React.FC<CompareViewProps> = ({
                 }}
               />
             </div>
+          )}
+
+          {docAId && docBId && docAId === docBId && (
+            <p className="text-xs text-amber-600 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded-xl px-3 py-2">
+              {language === 'bn'
+                ? 'দুটি আলাদা ডকুমেন্ট নির্বাচন করলে পরিবর্তনগুলো দেখা যাবে (বর্তমানে একই ফাইল নির্বাচিত)।'
+                : 'Tip: Pick two different documents above to highlight differences (currently comparing the same file).'}
+            </p>
+          )}
+
+          {errorMsg && (
+            <p className="text-xs text-rose-700 dark:text-rose-200 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-xl px-3 py-2">
+              {errorMsg}
+            </p>
           )}
 
           <button

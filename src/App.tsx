@@ -68,7 +68,6 @@ import { ScannerView } from './components/ScannerView';
 import { OcrView } from './components/OcrView';
 import { WordCreatorView } from './components/WordCreatorView';
 import { CompareView } from './components/CompareView';
-import { AIAssistantView } from './components/AIAssistantView';
 import { ToolRunnerModal } from './components/ToolRunnerModal';
 
 export default function App() {
@@ -629,7 +628,6 @@ export default function App() {
           onUpdateDoc={upsertDoc}
           onOpenEditor={() => setWorkspace({ type: 'editor', docId: activeDocForWorkspace.id })}
           onOpenOrganizer={() => setWorkspace({ type: 'organizer', docId: activeDocForWorkspace.id })}
-          onOpenAI={() => setWorkspace({ type: 'aiAssistant', docId: activeDocForWorkspace.id })}
         />
       )}
 
@@ -677,10 +675,7 @@ export default function App() {
           language={settings.language}
           docs={docs}
           initialDocId={workspace.docId}
-          aiConsentGranted={settings.aiConsentGranted}
-          localOnlyMode={settings.localOnlyMode}
           onImportDoc={upsertDoc}
-          onGrantAiConsent={() => updateSettings({ aiConsentGranted: true })}
           onClose={() => setWorkspace({ type: 'none' })}
           onSaveSearchablePdf={upsertDoc}
           onOpenInWordCreator={(html) => {
@@ -708,20 +703,6 @@ export default function App() {
           initialDocA={workspace.docIdA}
           initialDocB={workspace.docIdB}
           onImportDoc={upsertDoc}
-          onClose={() => setWorkspace({ type: 'none' })}
-        />
-      )}
-
-      {workspace.type === 'aiAssistant' && (
-        <AIAssistantView
-          language={settings.language}
-          docs={docs}
-          initialDocId={workspace.docId}
-          aiConsentGranted={settings.aiConsentGranted}
-          localOnlyMode={settings.localOnlyMode}
-          onImportDoc={upsertDoc}
-          onGrantConsent={() => updateSettings({ aiConsentGranted: true })}
-          onDisableLocalOnly={() => updateSettings({ localOnlyMode: false })}
           onClose={() => setWorkspace({ type: 'none' })}
         />
       )}

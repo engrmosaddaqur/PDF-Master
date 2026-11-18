@@ -35,7 +35,12 @@ import type {
 } from '../types';
 import { getT } from '../i18n/translations';
 import { htmlDocumentToPdf } from '../services/conversionService';
-import { cloneBuffer, PAPER_DIMENSIONS, renderPageThumbnail } from '../services/pdfEngine';
+import {
+  cloneBuffer,
+  getPdfDocumentInfo,
+  PAPER_DIMENSIONS,
+  renderPageThumbnail,
+} from '../services/pdfEngine';
 import { saveBufferToDeviceStorage } from '../services/deviceFileActions';
 
 interface WordCreatorViewProps {
@@ -91,6 +96,7 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
   const [headings, setHeadings] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [savedNotice, setSavedNotice] = useState<string | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [showLinkModal, setShowLinkModal] = useState(false);
   const [linkUrl, setLinkUrl] = useState('https://');
   const savedRangeRef = useRef<Range | null>(null);
@@ -149,7 +155,9 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
   const handleSaveAndExport = async (action: 'saveVault' | 'downloadPdf' | 'downloadDocx') => {
     const html = editorRef.current?.innerHTML || '';
     setSaving(true);
+    setErrorMsg(null);
     try {
+      const rawTitle = docTitle.trim() || 'Untitled Document';
       if (action === 'downloadDocx') {
         const plainLines = (editorRef.current?.innerText || '').split('\n');
         const docx = new Document({
@@ -163,19 +171,20 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
         });
         const blob = await Packer.toBlob(docx);
         const buf = await blob.arrayBuffer();
+        const docxBase = rawTitle.replace(/\.pdf$/i, '');
+        const docxName = docxBase.toLowerCase().endsWith('.docx') ? docxBase : `${docxBase}.docx`;
         await saveBufferToDeviceStorage(
           buf,
-          `${docTitle.trim() || 'document'}.docx`,
+          docxName,
           'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
         );
         return;
       }
 
       const pdfBytes = await htmlDocumentToPdf(html, settings);
-      const fileName = `${docTitle.trim() || 'Untitled Document'}.pdf`;
+      const fileName = rawTitle.toLowerCase().endsWith('.pdf') ? rawTitle : `${rawTitle}.pdf`;
 
       const thumb = await renderPageThumbnail(pdfBytes, 1, 200).catch(() => undefined);
-      const { getPdfDocumentInfo } = await import('../services/pdfEngine');
       const info = await getPdfDocumentInfo(pdfBytes).catch(() => ({ pageCount: 1 }));
       const now = Date.now();
       const baseDoc = savedDoc || existingDoc;
@@ -239,6 +248,8 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
         setSavedNotice('Saved to Files & Device Storage');
         setTimeout(() => setSavedNotice(null), 2400);
       }
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to export document.');
     } finally {
       setSaving(false);
     }
@@ -429,6 +440,11 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
         )}
 
         <div className="w-full flex flex-col items-center shrink-0" style={{ maxWidth: `${maxPagePx}px` }}>
+          {errorMsg && (
+            <div className="mb-3 px-4 py-2 rounded-xl bg-rose-600 text-white text-xs font-semibold shadow">
+              {errorMsg}
+            </div>
+          )}
           {savedNotice && (
             <div className="mb-3 px-4 py-2 rounded-xl bg-emerald-600 text-white text-xs font-semibold shadow">
               {savedNotice}

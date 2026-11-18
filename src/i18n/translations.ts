@@ -26,7 +26,6 @@ export const translations = {
         mergePdf: 'Merge PDF',
         convertPdf: 'Convert',
         compressPdf: 'Compress',
-        aiAssistant: 'AI Assistant',
         ocrText: 'OCR Text',
       },
       collections: 'Document Collections',
@@ -74,7 +73,7 @@ export const translations = {
         edit: 'Edit & Organize',
         convert: 'Convert',
         security: 'Sign & Security',
-        ai: 'Scan, OCR & AI',
+        ai: 'Scan & OCR',
       },
     },
     viewer: {
@@ -92,7 +91,6 @@ export const translations = {
       share: 'Share',
       download: 'Download',
       editMode: 'Edit PDF',
-      askAi: 'Ask AI',
       organize: 'Pages',
     },
     editor: {
@@ -137,7 +135,6 @@ export const translations = {
     ocr: {
       title: 'OCR — Image to Editable Text',
       engineDevice: 'On-Device (Tesseract Offline)',
-      engineAi: 'AI Vision OCR (English + বাংলা)',
       language: 'Recognition Language',
       langEn: 'English',
       langBn: 'Bengali (বাংলা)',
@@ -174,25 +171,6 @@ export const translations = {
       sideBySide: 'Side-by-Side',
       textDiff: 'Text Diff',
     },
-    ai: {
-      title: 'AI PDF Assistant',
-      consentTitle: 'Privacy & AI Processing Consent',
-      consentBody:
-        'PDF MASTER prioritizes local processing. When you use AI Assistant, extracted text from the selected document is sent securely to the server-side Gemini API for analysis. Original files remain on your device.',
-      consentAllow: 'Enable AI Assistant',
-      selectDoc: 'Select Document',
-      askPlaceholder: 'Ask anything about this PDF in English or বাংলা...',
-      quickPrompts: {
-        summarize: 'Summarize',
-        keypoints: 'Key Points',
-        outline: 'Outline',
-        explain: 'Explain Terms',
-        tables: 'Extract Tables',
-        translate_bn: 'Translate to বাংলা',
-        translate_en: 'Translate to English',
-        report: 'Concise Report',
-      },
-    },
     settings: {
       title: 'Settings',
       appearance: 'Appearance',
@@ -214,7 +192,6 @@ export const translations = {
       emptyTrash: 'Empty Trash',
       deleteAllFiles: 'Delete all files',
       privacyTitle: 'Privacy',
-      aiConsent: 'Allow AI Document Processing',
       localOnly: 'Strict Local-Only Mode',
       installApp: 'Install PDF MASTER App',
       aboutTitle: 'About',
@@ -245,7 +222,6 @@ export const translations = {
         mergePdf: 'মার্জ পিডিএফ',
         convertPdf: 'কনভার্ট',
         compressPdf: 'কমপ্রেস',
-        aiAssistant: 'এআই অ্যাসিস্ট্যান্ট',
         ocrText: 'ওসিআর টেক্সট',
       },
       collections: 'ডকুমেন্ট সংগ্রহ',
@@ -293,7 +269,7 @@ export const translations = {
         edit: 'এডিট ও পেজ',
         convert: 'কনভার্ট',
         security: 'স্বাক্ষর ও সুরক্ষা',
-        ai: 'স্ক্যান, ওসিআর ও এআই',
+        ai: 'স্ক্যান ও ওসিআর',
       },
     },
     viewer: {
@@ -311,7 +287,6 @@ export const translations = {
       share: 'শেয়ার',
       download: 'ডাউনলোড',
       editMode: 'এডিট পিডিএফ',
-      askAi: 'এআইকে জিজ্ঞাসা',
       organize: 'পৃষ্ঠা সাজান',
     },
     editor: {
@@ -356,7 +331,6 @@ export const translations = {
     ocr: {
       title: 'ওসিআর — ছবি থেকে টেক্সট',
       engineDevice: 'অন-ডিভাইস (অফলাইন Tesseract)',
-      engineAi: 'এআই ভিশন ওসিআর (বাংলা + English)',
       language: 'শনাক্তকরণ ভাষা',
       langEn: 'ইংরেজি',
       langBn: 'বাংলা',
@@ -393,25 +367,6 @@ export const translations = {
       sideBySide: 'পাশাপাশি',
       textDiff: 'টেক্সট পার্থক্য',
     },
-    ai: {
-      title: 'এআই পিডিএফ অ্যাসিস্ট্যান্ট',
-      consentTitle: 'গোপনীয়তা ও এআই সম্মতি',
-      consentBody:
-        'PDF MASTER লোকাল প্রসেসিংকে অগ্রাধিকার দেয়। এআই অ্যাসিস্ট্যান্ট ব্যবহার করলে নির্বাচিত ডকুমেন্টের টেক্সট নিরাপদে সার্ভার-সাইড Gemini API-তে পাঠানো হবে। মূল ফাইল আপনার ডিভাইসেই থাকবে।',
-      consentAllow: 'এআই অ্যাসিস্ট্যান্ট চালু করুন',
-      selectDoc: 'ডকুমেন্ট নির্বাচন করুন',
-      askPlaceholder: 'বাংলা বা ইংরেজিতে এই পিডিএফ সম্পর্কে প্রশ্ন করুন...',
-      quickPrompts: {
-        summarize: 'সারসংক্ষেপ',
-        keypoints: 'মূল পয়েন্ট',
-        outline: 'রূপরেখা',
-        explain: 'টার্ম ব্যাখ্যা',
-        tables: 'টেবিল বের করুন',
-        translate_bn: 'বাংলায় অনুবাদ',
-        translate_en: 'ইংরেজিতে অনুবাদ',
-        report: 'সংক্ষিপ্ত রিপোর্ট',
-      },
-    },
     settings: {
       title: 'সেটিংস',
       appearance: 'অ্যাপিয়ারেন্স',
@@ -433,7 +388,6 @@ export const translations = {
       emptyTrash: 'ট্র্যাশ খালি করুন',
       deleteAllFiles: 'সব ফাইল মুছুন',
       privacyTitle: 'গোপনীয়তা',
-      aiConsent: 'এআই প্রসেসিংয়ের অনুমতি',
       localOnly: 'শুধুমাত্র লোকাল মোড',
       installApp: 'PDF MASTER অ্যাপ ইনস্টল করুন',
       aboutTitle: 'অ্যাপ সম্পর্কে',

@@ -1,5 +1,4 @@
 import { createWorker } from 'tesseract.js';
-import { getApiUrl } from './apiConfig';
 
 export type OcrLanguage = 'eng' | 'ben' | 'eng+ben';
 
@@ -8,40 +7,39 @@ export async function runOnDeviceOcr(
   lang: OcrLanguage,
   onProgress?: (pct: number, status: string) => void
 ): Promise<string> {
+  const results = await runOnDeviceOcrBatch([imageInput], lang, (_idx, pct, status) => {
+    onProgress?.(pct, status);
+  });
+  return results[0] || '';
+}
+
+export async function runOnDeviceOcrBatch(
+  imageInputs: Array<string | HTMLCanvasElement>,
+  lang: OcrLanguage,
+  onPageProgress?: (pageIdx: number, pct: number, status: string) => void
+): Promise<string[]> {
+  if (imageInputs.length === 0) return [];
+
+  let activeIdx = 0;
   const worker = await createWorker(lang, 1, {
     logger: (m) => {
-      if (onProgress && typeof m.progress === 'number') {
-        onProgress(Math.round(m.progress * 100), m.status || 'Recognizing...');
+      if (onPageProgress && typeof m.progress === 'number') {
+        onPageProgress(activeIdx, Math.round(m.progress * 100), m.status || 'Recognizing...');
       }
     },
   });
 
   try {
-    const {
-      data: { text },
-    } = await worker.recognize(imageInput);
-    return text.trim();
+    const out: string[] = [];
+    for (let i = 0; i < imageInputs.length; i++) {
+      activeIdx = i;
+      const {
+        data: { text },
+      } = await worker.recognize(imageInputs[i]);
+      out.push(text.trim());
+    }
+    return out;
   } finally {
     await worker.terminate();
   }
-}
-
-export async function runAiVisionOcr(
-  imageBase64: string,
-  lang: OcrLanguage
-): Promise<string> {
-  const res = await fetch(getApiUrl('/api/ai/ocr-vision'), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      imageBase64,
-      mimeType: imageBase64.startsWith('data:image/png') ? 'image/png' : 'image/jpeg',
-      language: lang,
-    }),
-  });
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.error || 'AI Vision OCR failed');
-  }
-  return data.text || '';
 }
