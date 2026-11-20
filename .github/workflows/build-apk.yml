@@ -81,13 +81,15 @@ jobs:
             }
             fs.writeFileSync(manifestPath, xml, "utf8");
           '
-          mkdir -p android/app/src/main/res/values
-          cat > android/app/src/main/res/values/ic_launcher_background.xml << 'EOF'
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <color name="ic_launcher_background">#020A24</color>
-</resources>
-EOF
+          node -e '
+            const fs = require("fs");
+            fs.mkdirSync("android/app/src/main/res/values", { recursive: true });
+            fs.writeFileSync(
+              "android/app/src/main/res/values/ic_launcher_background.xml",
+              "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n<resources>\n    <color name=\"ic_launcher_background\">#020A24</color>\n</resources>\n",
+              "utf8"
+            );
+          '
           for dir in android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi; do
             if [ -d "$dir" ]; then
               cp public/pwa-512x512.png "$dir/ic_launcher.png"
