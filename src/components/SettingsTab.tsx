@@ -1,28 +1,19 @@
 import React, { useRef, useState } from 'react';
 import JSZip from 'jszip';
-import { Capacitor } from '@capacitor/core';
 import {
-  CheckCircle2,
-  Copy,
   Download,
-  ExternalLink,
-  FolderArchive,
   HardDrive,
   Info,
   Languages,
-  Loader2,
   Monitor,
   Moon,
-  RefreshCw,
   Shield,
-  Smartphone,
   Sun,
   Trash2,
   Upload,
 } from 'lucide-react';
 import type { AppSettings, DocumentRecord, PaperSizeKey } from '../types';
 import { getT } from '../i18n/translations';
-import { getApiUrl } from '../services/apiConfig';
 import { PAPER_DIMENSIONS } from '../services/pdfEngine';
 import {
   base64ToArrayBuffer,
@@ -30,28 +21,6 @@ import {
 } from '../services/storageService';
 import { saveBufferToDeviceStorage } from '../services/deviceFileActions';
 import { PdfMasterLogo } from './Logo';
-import { PWAInstallButton } from './PWAComponents';
-
-interface ApkStatusResponse {
-  repo: string;
-  repoExists: boolean;
-  release: {
-    tag: string;
-    name: string;
-    publishedAt: string;
-    apkUrl: string;
-    apkName: string;
-    apkSizeBytes: number;
-  } | null;
-  latestRun: {
-    status: string;
-    conclusion: string | null;
-    htmlUrl: string;
-    updatedAt: string;
-  } | null;
-  directFallbackUrl: string;
-  error?: string;
-}
 
 interface SettingsTabProps {
   settings: AppSettings;
@@ -86,58 +55,10 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
   const t = getT(settings.language);
   const backupInputRef = useRef<HTMLInputElement | null>(null);
   const [backupNotice, setBackupNotice] = useState<string | null>(null);
-  const [repoSlug, setRepoSlug] = useState('engrmosaddaqur/PDF-Master');
-  const [apkStatus, setApkStatus] = useState<ApkStatusResponse | null>(null);
-  const [apkChecking, setApkChecking] = useState(false);
-  const [apkError, setApkError] = useState<string | null>(null);
-  const [copiedCmds, setCopiedCmds] = useState(false);
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
 
-  const isNativeAndroid = Capacitor.isNativePlatform();
   const totalBytes = docs.reduce((sum, d) => sum + d.sizeBytes, 0);
   const trashedCount = docs.filter((d) => d.isTrashed).length;
-
-  const checkApkStatus = async () => {
-    if (settings.localOnlyMode) {
-      setApkError(
-        settings.language === 'bn'
-          ? 'লোকাল-অনলি মোড চালু থাকায় রিমোট APK চেক বন্ধ আছে।'
-          : 'Remote APK checks are disabled while Strict Local-Only Mode is active.'
-      );
-      return;
-    }
-    const cleanRepo = repoSlug.trim();
-    if (!/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(cleanRepo)) {
-      setApkError('Enter repo as username/repository-name');
-      return;
-    }
-    setApkChecking(true);
-    setApkError(null);
-    try {
-      const resp = await fetch(getApiUrl(`/api/apk/status?repo=${encodeURIComponent(cleanRepo)}`));
-      const data = (await resp.json()) as ApkStatusResponse;
-      if (!resp.ok) {
-        throw new Error(data.error || 'Could not check GitHub APK status.');
-      }
-      setApkStatus(data);
-    } catch (err: unknown) {
-      setApkError(err instanceof Error ? err.message : 'Unable to reach GitHub.');
-    } finally {
-      setApkChecking(false);
-    }
-  };
-
-  const handleCopyPushCommands = async () => {
-    const cleanRepo = repoSlug.trim() || 'engrmosaddaqur/PDF-Master';
-    const cmds = `git init\ngit add -A\ngit commit -m "Build PDF MASTER APK"\ngit branch -M main\ngit remote add origin https://github.com/${cleanRepo}.git\ngit push -u origin main --force`;
-    try {
-      await navigator.clipboard.writeText(cmds);
-      setCopiedCmds(true);
-      setTimeout(() => setCopiedCmds(false), 2000);
-    } catch {
-      // Ignore clipboard failures
-    }
-  };
 
   const handleExportBackup = async () => {
     try {
@@ -509,130 +430,7 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
         </label>
       </section>
 
-      {/* PWA Install Card */}
-      <PWAInstallButton label={t.settings.installApp} />
-
-      {/* Android APK Easy Builder & Downloader */}
-      {!isNativeAndroid && (
-        <section className="rounded-3xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] p-4 space-y-3">
-          <div className="flex items-center justify-between gap-2">
-            <h2 className="font-display text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
-              <Smartphone className="w-4 h-4 text-[#3B82F6]" />
-              {settings.language === 'bn'
-                ? 'অ্যান্ড্রয়েড APK ডাউনলোড ও বিল্ডার'
-                : 'Android APK Download & Easy Builder'}
-            </h2>
-            <span className="text-[11px] font-semibold px-2.5 py-0.5 rounded-full bg-[#2563EB]/15 text-[#3B82F6]">
-              PDF-Master.apk
-            </span>
-          </div>
-
-          {settings.localOnlyMode ? (
-            <p className="text-xs text-amber-600 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded-2xl px-3 py-2.5">
-              {settings.language === 'bn'
-                ? 'লোকাল-অনলি মোড চালু আছে — সব রিমোট GitHub/APK নেটওয়ার্ক রিকোয়েস্ট বন্ধ রাখা হয়েছে।'
-                : 'Strict Local-Only Mode is active — remote GitHub APK network checks are disabled.'}
-            </p>
-          ) : (
-            <div className="flex items-center gap-2">
-              <input
-                type="text"
-                value={repoSlug}
-                onChange={(e) => setRepoSlug(e.target.value)}
-                placeholder="username/repository-name"
-                className="flex-1 min-h-[42px] px-3.5 rounded-2xl border border-slate-200 dark:border-[#1E293B] bg-slate-50 dark:bg-[#0D1322] text-xs font-mono text-slate-900 dark:text-white"
-              />
-              <button
-                onClick={checkApkStatus}
-                disabled={apkChecking}
-                className="min-h-[42px] px-3.5 rounded-2xl bg-[#3B82F6] text-white text-xs font-bold flex items-center gap-1.5 shrink-0 disabled:opacity-60"
-              >
-                {apkChecking ? (
-                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <RefreshCw className="w-3.5 h-3.5" />
-                )}
-                <span>{settings.language === 'bn' ? 'চেক করুন' : 'Check APK'}</span>
-              </button>
-            </div>
-          )}
-
-          {apkError && <p className="text-xs text-rose-500">{apkError}</p>}
-
-          {apkStatus?.release && (
-            <div className="rounded-2xl bg-emerald-500/10 border border-emerald-500/30 p-3 space-y-2">
-              <div className="flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2 text-emerald-500 text-xs font-bold">
-                  <CheckCircle2 className="w-4 h-4 shrink-0" />
-                  <span>
-                    {apkStatus.release.apkName} ({apkStatus.release.tag})
-                  </span>
-                </div>
-                {apkStatus.release.apkSizeBytes > 0 && (
-                  <span className="text-[11px] font-mono-nums text-emerald-500">
-                    {formatBytes(apkStatus.release.apkSizeBytes)}
-                  </span>
-                )}
-              </div>
-              <a
-                href={apkStatus.release.apkUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                download={apkStatus.release.apkName}
-                className="w-full min-h-[44px] rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold flex items-center justify-center gap-2"
-              >
-                <Download className="w-4 h-4" />
-                <span>Download {apkStatus.release.apkName}</span>
-              </a>
-            </div>
-          )}
-
-          {apkStatus && !apkStatus.release && apkStatus.latestRun && (
-            <div className="rounded-2xl bg-amber-500/10 border border-amber-500/30 p-3 flex items-center justify-between gap-2">
-              <div className="text-xs text-amber-500">
-                <p className="font-bold">
-                  GitHub Build: {apkStatus.latestRun.status}
-                  {apkStatus.latestRun.conclusion ? ` (${apkStatus.latestRun.conclusion})` : ''}
-                </p>
-              </div>
-              <a
-                href={apkStatus.latestRun.htmlUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="min-h-[36px] px-3 rounded-xl bg-amber-600 text-white text-xs font-semibold flex items-center gap-1 shrink-0"
-              >
-                <span>Logs</span>
-                <ExternalLink className="w-3 h-3" />
-              </a>
-            </div>
-          )}
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
-            <a
-              href={getApiUrl(`/api/apk/project-zip?repo=${encodeURIComponent(repoSlug.trim() || 'engrmosaddaqur/PDF-Master')}`)}
-              download="PDF-Master-Android-APK-Kit.zip"
-              className="min-h-[44px] px-3 rounded-2xl bg-gradient-to-r from-[#3B82F6] to-[#06B6D4] text-white text-xs font-bold flex items-center justify-center gap-2"
-            >
-              <FolderArchive className="w-4 h-4 shrink-0" />
-              <span>
-                {settings.language === 'bn'
-                  ? '১. APK বিল্ড কিট (.zip) ডাউনলোড'
-                  : '1. Download APK Kit (.zip)'}
-              </span>
-            </a>
-
-            <button
-              onClick={handleCopyPushCommands}
-              className="min-h-[44px] px-3 rounded-2xl bg-slate-100 dark:bg-[#0D1322] border border-slate-200 dark:border-[#1E293B] text-slate-900 dark:text-slate-100 text-xs font-bold flex items-center justify-center gap-2"
-            >
-              <Copy className="w-4 h-4 shrink-0 text-[#3B82F6]" />
-              <span>{copiedCmds ? 'Copied!' : 'Copy Git Commands'}</span>
-            </button>
-          </div>
-        </section>
-      )}
-
-      {/* About Card matching Screenshot */}
+      {/* About Card */}
       <section className="rounded-3xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] p-4 space-y-3">
         <h2 className="font-display text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
           <Info className="w-4 h-4 text-[#3B82F6]" />
@@ -646,9 +444,15 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
             tagline={t.tagline}
           />
         </div>
-        <p className="text-xs text-slate-500 dark:text-slate-400">
-          Version 1.0.5
-        </p>
+        <div className="pt-2 border-t border-slate-100 dark:border-[#1E293B]/70 flex items-center justify-between text-xs text-slate-600 dark:text-slate-300">
+          <span>
+            {settings.language === 'bn' ? 'তৈরি করেছেন:' : 'Developed by'}{' '}
+            <strong className="font-semibold text-slate-900 dark:text-white">Mosaddaq</strong>
+          </span>
+          <span className="font-mono-nums text-slate-500 dark:text-slate-400">
+            Version 1.0
+          </span>
+        </div>
       </section>
 
       {/* In-App Delete All Files Confirmation Modal (No window.confirm) */}
