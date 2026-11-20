@@ -1684,12 +1684,19 @@ export async function insertPdfIntoDocument(
 // UTILITY TOOLS
 // ==========================================
 
-export async function rotateAllPages(buf: ArrayBuffer, angleDelta: number): Promise<ArrayBuffer> {
+export async function rotateAllPages(
+  buf: ArrayBuffer,
+  angleDelta: number,
+  pageNumbers1Based?: number[]
+): Promise<ArrayBuffer> {
   const doc = await PDFDocument.load(cloneBuffer(buf), { ignoreEncryption: true });
-  for (const page of doc.getPages()) {
+  const targetSet =
+    pageNumbers1Based && pageNumbers1Based.length > 0 ? new Set(pageNumbers1Based) : null;
+  doc.getPages().forEach((page, idx) => {
+    if (targetSet && !targetSet.has(idx + 1)) return;
     const cur = page.getRotation().angle;
     page.setRotation(degrees((cur + angleDelta + 360) % 360));
-  }
+  });
   const out = await doc.save();
   return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
 }
@@ -1718,16 +1725,39 @@ export async function resizePdfPages(
 
   for (const srcPage of srcPages) {
     const { width: srcW, height: srcH } = srcPage.getSize();
+    const rot = ((srcPage.getRotation().angle % 360) + 360) % 360;
+    const isSwapped = rot === 90 || rot === 270;
+    const visW = isSwapped ? srcH : srcW;
+    const visH = isSwapped ? srcW : srcH;
+
     const embedded = await outDoc.embedPage(srcPage);
-    const scaleFactor = Math.min(targetW / Math.max(1, srcW), targetH / Math.max(1, srcH));
+    const scaleFactor = Math.min(targetW / Math.max(1, visW), targetH / Math.max(1, visH));
     const drawW = srcW * scaleFactor;
     const drawH = srcH * scaleFactor;
-    const x = (targetW - drawW) / 2;
-    const y = (targetH - drawH) / 2;
 
     const newPage = outDoc.addPage([targetW, targetH]);
     newPage.drawRectangle({ x: 0, y: 0, width: targetW, height: targetH, color: rgb(1, 1, 1) });
-    newPage.drawPage(embedded, { x, y, width: drawW, height: drawH });
+
+    if (rot === 0) {
+      newPage.drawPage(embedded, {
+        x: (targetW - drawW) / 2,
+        y: (targetH - drawH) / 2,
+        width: drawW,
+        height: drawH,
+      });
+    } else {
+      const pdfRotDeg = -rot;
+      const rad = (pdfRotDeg * Math.PI) / 180;
+      const ox = (drawW / 2) * Math.cos(rad) - (drawH / 2) * Math.sin(rad);
+      const oy = (drawW / 2) * Math.sin(rad) + (drawH / 2) * Math.cos(rad);
+      newPage.drawPage(embedded, {
+        x: targetW / 2 - ox,
+        y: targetH / 2 - oy,
+        width: drawW,
+        height: drawH,
+        rotate: degrees(pdfRotDeg),
+      });
+    }
   }
 
   const out = await outDoc.save();
@@ -1768,6 +1798,29 @@ export async function createBlankPdf(options: {
   return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
 }
 
+function getVisualPageGeometry(page: ReturnType<PDFDocument['getPages']>[number]) {
+  const cb = page.getCropBox?.() || { x: 0, y: 0, width: page.getWidth(), height: page.getHeight() };
+  const rot = ((page.getRotation().angle % 360) + 360) % 360;
+  const swapped = rot === 90 || rot === 270;
+  const visW = swapped ? cb.height : cb.width;
+  const visH = swapped ? cb.width : cb.height;
+
+  const toPdfPoint = (vx: number, vy: number, visAngleDeg = 0) => {
+    if (rot === 90) {
+      return { x: cb.x + cb.width - vy, y: cb.y + vx, angleDeg: visAngleDeg + 90 };
+    }
+    if (rot === 180) {
+      return { x: cb.x + cb.width - vx, y: cb.y + cb.height - vy, angleDeg: visAngleDeg + 180 };
+    }
+    if (rot === 270) {
+      return { x: cb.x + vy, y: cb.y + cb.height - vx, angleDeg: visAngleDeg + 270 };
+    }
+    return { x: cb.x + vx, y: cb.y + vy, angleDeg: visAngleDeg };
+  };
+
+  return { visW, visH, toPdfPoint };
+}
+
 export async function addWatermarkToPdf(
   buf: ArrayBuffer,
   options: { text: string; opacity: number; fontSize: number; color: string; angle: number }
@@ -1777,38 +1830,57 @@ export async function addWatermarkToPdf(
   const col = hexToRgb(options.color);
   const safeText = options.text.trim() || 'CONFIDENTIAL';
 
+  let cachedUnicodeImg: Awaited<ReturnType<typeof doc.embedPng>> | null = null;
+  let unicodeW = 0;
+  let unicodeH = 0;
+  if (hasNonWinAnsiChars(safeText)) {
+    const rendered = await renderUnicodeTextPng({
+      text: safeText,
+      fontSize: options.fontSize,
+      fontFamily: 'sans',
+      color: options.color,
+      bold: true,
+      italic: false,
+      underline: false,
+      align: 'center',
+    });
+    cachedUnicodeImg = await doc.embedPng(rendered.pngBytes);
+    unicodeW = rendered.widthPt;
+    unicodeH = rendered.heightPt;
+  }
+
   for (const page of doc.getPages()) {
-    const { width, height } = page.getSize();
-    if (hasNonWinAnsiChars(safeText)) {
-      const rendered = await renderUnicodeTextPng({
-        text: safeText,
-        fontSize: options.fontSize,
-        fontFamily: 'sans',
-        color: options.color,
-        bold: true,
-        italic: false,
-        underline: false,
-        align: 'center',
-      });
-      const img = await doc.embedPng(rendered.pngBytes);
-      page.drawImage(img, {
-        x: (width - rendered.widthPt) / 2,
-        y: (height - rendered.heightPt) / 2,
-        width: rendered.widthPt,
-        height: rendered.heightPt,
+    const { visW, visH, toPdfPoint } = getVisualPageGeometry(page);
+    const vcx = visW / 2;
+    const vcy = visH / 2;
+    const vRad = (options.angle * Math.PI) / 180;
+
+    if (cachedUnicodeImg) {
+      const ox = (unicodeW / 2) * Math.cos(vRad) - (unicodeH / 2) * Math.sin(vRad);
+      const oy = (unicodeW / 2) * Math.sin(vRad) + (unicodeH / 2) * Math.cos(vRad);
+      const pt = toPdfPoint(vcx - ox, vcy - oy, options.angle);
+      page.drawImage(cachedUnicodeImg, {
+        x: pt.x,
+        y: pt.y,
+        width: unicodeW,
+        height: unicodeH,
         opacity: options.opacity,
-        rotate: degrees(options.angle),
+        rotate: degrees(pt.angleDeg),
       });
     } else {
       const tw = font.widthOfTextAtSize(safeText, options.fontSize);
+      const th = options.fontSize * 0.72;
+      const ox = (tw / 2) * Math.cos(vRad) - (th / 2) * Math.sin(vRad);
+      const oy = (tw / 2) * Math.sin(vRad) + (th / 2) * Math.cos(vRad);
+      const pt = toPdfPoint(vcx - ox, vcy - oy, options.angle);
       page.drawText(safeText, {
-        x: width / 2 - tw / 2,
-        y: height / 2,
+        x: pt.x,
+        y: pt.y,
         size: options.fontSize,
         font,
         color: col,
         opacity: options.opacity,
-        rotate: degrees(options.angle),
+        rotate: degrees(pt.angleDeg),
       });
     }
   }
@@ -1816,35 +1888,59 @@ export async function addWatermarkToPdf(
   return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
 }
 
+export type PageNumberPosition =
+  | 'bottom-left'
+  | 'bottom-center'
+  | 'bottom-right'
+  | 'top-left'
+  | 'top-center'
+  | 'top-right';
+
 export async function addPageNumbersToPdf(
   buf: ArrayBuffer,
-  position: 'bottom-center' | 'bottom-right' | 'top-right' = 'bottom-center',
-  format: 'number' | 'pageOfTotal' = 'pageOfTotal'
+  position: PageNumberPosition = 'bottom-center',
+  format: 'number' | 'slash' | 'pageOfTotal' = 'pageOfTotal',
+  options?: { startNumber?: number; skipFirstPage?: boolean; fontSize?: number; color?: string }
 ): Promise<ArrayBuffer> {
   const doc = await PDFDocument.load(cloneBuffer(buf), { ignoreEncryption: true });
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const pages = doc.getPages();
   const total = pages.length;
+  const startNum = Math.max(1, Math.floor(options?.startNumber ?? 1));
+  const skipFirst = Boolean(options?.skipFirstPage);
+  const fontSize = Math.max(7, Math.min(20, options?.fontSize ?? 10));
+  const color = options?.color ? hexToRgb(options.color) : rgb(0.32, 0.39, 0.5);
 
   pages.forEach((page, idx) => {
-    const { width, height } = page.getSize();
-    const label = format === 'pageOfTotal' ? `Page ${idx + 1} of ${total}` : `${idx + 1}`;
-    const tw = font.widthOfTextAtSize(label, 10);
-    let x = width / 2 - tw / 2;
-    let y = 22;
-    if (position === 'bottom-right') {
-      x = width - tw - 32;
-      y = 22;
-    } else if (position === 'top-right') {
-      x = width - tw - 32;
-      y = height - 28;
+    if (skipFirst && idx === 0) return;
+    const displayNum = startNum + idx;
+    const displayTotal = startNum + total - 1;
+    const label =
+      format === 'pageOfTotal'
+        ? `Page ${displayNum} of ${displayTotal}`
+        : format === 'slash'
+        ? `${displayNum} / ${displayTotal}`
+        : `${displayNum}`;
+
+    const { visW, visH, toPdfPoint } = getVisualPageGeometry(page);
+    const tw = font.widthOfTextAtSize(label, fontSize);
+    const isTop = position.startsWith('top');
+    const vy = isTop ? visH - 26 : 20;
+    let vx = (visW - tw) / 2;
+    if (position.endsWith('-left')) {
+      vx = 32;
+    } else if (position.endsWith('-right')) {
+      vx = Math.max(32, visW - tw - 32);
     }
+
+    const pt = toPdfPoint(vx, vy, 0);
     page.drawText(label, {
-      x,
-      y,
-      size: 10,
+      x: pt.x,
+      y: pt.y,
+      size: fontSize,
       font,
-      color: rgb(0.35, 0.42, 0.52),
+      color,
+      ...(pt.angleDeg !== 0 ? { rotate: degrees(pt.angleDeg) } : {}),
     });
   });
 
@@ -1855,30 +1951,114 @@ export async function addPageNumbersToPdf(
 export async function addHeaderFooterToPdf(
   buf: ArrayBuffer,
   headerText: string,
-  footerText: string
+  footerText: string,
+  options?: { align?: 'left' | 'center' | 'right'; fontSize?: number; color?: string }
 ): Promise<ArrayBuffer> {
   const doc = await PDFDocument.load(cloneBuffer(buf), { ignoreEncryption: true });
   const font = await doc.embedFont(StandardFonts.Helvetica);
+  const align = options?.align || 'left';
+  const fontSize = Math.max(7, Math.min(18, options?.fontSize ?? 9.5));
+  const colorHex = options?.color || '#475569';
+  const col = hexToRgb(colorHex);
+
+  const cleanHeader = headerText.trim().slice(0, 120);
+  const cleanFooter = footerText.trim().slice(0, 120);
+
+  let headerUnicodeImg: Awaited<ReturnType<typeof doc.embedPng>> | null = null;
+  let headerUnicodeW = 0;
+  let headerUnicodeH = 0;
+  if (cleanHeader && hasNonWinAnsiChars(cleanHeader)) {
+    const rendered = await renderUnicodeTextPng({
+      text: cleanHeader,
+      fontSize,
+      fontFamily: 'sans',
+      color: colorHex,
+      bold: false,
+      italic: false,
+      underline: false,
+      align,
+    });
+    headerUnicodeImg = await doc.embedPng(rendered.pngBytes);
+    headerUnicodeW = rendered.widthPt;
+    headerUnicodeH = rendered.heightPt;
+  }
+
+  let footerUnicodeImg: Awaited<ReturnType<typeof doc.embedPng>> | null = null;
+  let footerUnicodeW = 0;
+  let footerUnicodeH = 0;
+  if (cleanFooter && hasNonWinAnsiChars(cleanFooter)) {
+    const rendered = await renderUnicodeTextPng({
+      text: cleanFooter,
+      fontSize,
+      fontFamily: 'sans',
+      color: colorHex,
+      bold: false,
+      italic: false,
+      underline: false,
+      align,
+    });
+    footerUnicodeImg = await doc.embedPng(rendered.pngBytes);
+    footerUnicodeW = rendered.widthPt;
+    footerUnicodeH = rendered.heightPt;
+  }
 
   for (const page of doc.getPages()) {
-    const { width, height } = page.getSize();
-    if (headerText.trim()) {
-      page.drawText(headerText.trim().slice(0, 100).replace(/[^\x20-\x7E]/g, ''), {
-        x: 36,
-        y: height - 28,
-        size: 9.5,
-        font,
-        color: rgb(0.3, 0.36, 0.46),
-      });
+    const { visW, visH, toPdfPoint } = getVisualPageGeometry(page);
+    const computeVx = (itemW: number) => {
+      if (align === 'center') return Math.max(24, (visW - itemW) / 2);
+      if (align === 'right') return Math.max(24, visW - itemW - 32);
+      return 32;
+    };
+
+    if (cleanHeader) {
+      if (headerUnicodeImg) {
+        const vx = computeVx(headerUnicodeW);
+        const vy = Math.max(12, visH - 18 - headerUnicodeH);
+        const pt = toPdfPoint(vx, vy, 0);
+        page.drawImage(headerUnicodeImg, {
+          x: pt.x,
+          y: pt.y,
+          width: headerUnicodeW,
+          height: headerUnicodeH,
+          ...(pt.angleDeg !== 0 ? { rotate: degrees(pt.angleDeg) } : {}),
+        });
+      } else {
+        const tw = font.widthOfTextAtSize(cleanHeader, fontSize);
+        const pt = toPdfPoint(computeVx(tw), Math.max(12, visH - 26), 0);
+        page.drawText(cleanHeader, {
+          x: pt.x,
+          y: pt.y,
+          size: fontSize,
+          font,
+          color: col,
+          ...(pt.angleDeg !== 0 ? { rotate: degrees(pt.angleDeg) } : {}),
+        });
+      }
     }
-    if (footerText.trim()) {
-      page.drawText(footerText.trim().slice(0, 100).replace(/[^\x20-\x7E]/g, ''), {
-        x: 36,
-        y: 22,
-        size: 9.5,
-        font,
-        color: rgb(0.3, 0.36, 0.46),
-      });
+
+    if (cleanFooter) {
+      if (footerUnicodeImg) {
+        const vx = computeVx(footerUnicodeW);
+        const pt = toPdfPoint(vx, 16, 0);
+        page.drawImage(footerUnicodeImg, {
+          x: pt.x,
+          y: pt.y,
+          width: footerUnicodeW,
+          height: footerUnicodeH,
+          ...(pt.angleDeg !== 0 ? { rotate: degrees(pt.angleDeg) } : {}),
+        });
+      } else {
+        const tw = font.widthOfTextAtSize(cleanFooter, fontSize);
+        const pt = toPdfPoint(computeVx(tw), 20, 0);
+        page.drawText(cleanFooter, {
+          x: pt.x,
+          y: pt.y,
+          size: fontSize,
+          font,
+          color: col,
+          ...(pt.angleDeg !== 0 ? { rotate: degrees(pt.angleDeg) } : {}),
+        });
+      }
     }
   }
   const out = await doc.save();
@@ -1914,6 +2094,7 @@ async function rasterCompressPdf(
       const embedded = await outDoc.embedJpg(jpgBytes);
       const newPage = outDoc.addPage([vp1.width, vp1.height]);
       newPage.drawImage(embedded, { x: 0, y: 0, width: vp1.width, height: vp1.height });
+      if (p % 6 === 0) await new Promise((r) => setTimeout(r, 0));
     }
     const out = await outDoc.save({ useObjectStreams: true });
     return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
@@ -1934,21 +2115,25 @@ export async function compressPdfWithReport(
     losslessOut.byteOffset + losslessOut.byteLength
   ) as ArrayBuffer;
 
+  const smallestLosslessOrOrig =
+    losslessBuf.byteLength <= buf.byteLength ? losslessBuf : cloneBuffer(buf);
+
   if (mode === 'object-streams') {
-    return { bytes: losslessBuf, achievedTarget: true };
+    return { bytes: smallestLosslessOrOrig, achievedTarget: true };
   }
 
   if (mode === 'target-size' && targetBytes && targetBytes > 0) {
-    if (losslessBuf.byteLength <= targetBytes) {
-      return { bytes: losslessBuf, achievedTarget: true };
+    if (smallestLosslessOrOrig.byteLength <= targetBytes) {
+      return { bytes: smallestLosslessOrOrig, achievedTarget: true };
     }
-    let bestBytes = losslessBuf;
+    let bestBytes = smallestLosslessOrOrig;
     const presets: Array<{ scale: number; quality: number }> = [
-      { scale: 1.3, quality: 0.76 },
-      { scale: 1.05, quality: 0.6 },
-      { scale: 0.88, quality: 0.46 },
-      { scale: 0.72, quality: 0.34 },
-      { scale: 0.56, quality: 0.24 },
+      { scale: 1.35, quality: 0.78 },
+      { scale: 1.15, quality: 0.65 },
+      { scale: 0.95, quality: 0.5 },
+      { scale: 0.78, quality: 0.36 },
+      { scale: 0.62, quality: 0.25 },
+      { scale: 0.48, quality: 0.18 },
     ];
     for (const preset of presets) {
       const candidate = await rasterCompressPdf(buf, preset.scale, preset.quality);
@@ -1964,7 +2149,12 @@ export async function compressPdfWithReport(
 
   const scale = mode === 'raster-medium' ? 1.35 : 1.0;
   const quality = mode === 'raster-medium' ? 0.72 : 0.52;
-  const bytes = await rasterCompressPdf(buf, scale, quality);
+  const candidate = await rasterCompressPdf(buf, scale, quality);
+  // Never return a bloated rasterized file when lossless/original is already smaller
+  const bytes =
+    candidate.byteLength <= smallestLosslessOrOrig.byteLength
+      ? candidate
+      : smallestLosslessOrOrig;
   return { bytes, achievedTarget: true };
 }
 
@@ -2022,24 +2212,27 @@ export async function unlockPasswordProtectedPdf(
     for (let p = 1; p <= srcPdf.numPages; p++) {
       const page = await srcPdf.getPage(p);
       const vp1 = page.getViewport({ scale: 1 });
-      const vp = page.getViewport({ scale: 2 });
+      const maxDim = Math.max(vp1.width, vp1.height, 1);
+      const safeScale = Math.min(2.0, Math.max(1.25, 2200 / maxDim));
+      const vp = page.getViewport({ scale: safeScale });
       const canvas = document.createElement('canvas');
-      canvas.width = Math.floor(vp.width);
-      canvas.height = Math.floor(vp.height);
+      canvas.width = Math.max(1, Math.floor(vp.width));
+      canvas.height = Math.max(1, Math.floor(vp.height));
       const ctx = canvas.getContext('2d')!;
       ctx.fillStyle = '#FFFFFF';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       await page.render({ canvasContext: ctx, viewport: vp, canvas }).promise;
 
-      const pngDataUrl = canvas.toDataURL('image/png');
-      const bin = atob(pngDataUrl.split(',')[1]);
-      const pngBytes = new Uint8Array(bin.length);
-      for (let i = 0; i < bin.length; i++) pngBytes[i] = bin.charCodeAt(i);
-      const embedded = await outDoc.embedPng(pngBytes);
+      const jpgDataUrl = canvas.toDataURL('image/jpeg', 0.94);
+      const bin = atob(jpgDataUrl.split(',')[1]);
+      const jpgBytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) jpgBytes[i] = bin.charCodeAt(i);
+      const embedded = await outDoc.embedJpg(jpgBytes);
       const newPage = outDoc.addPage([vp1.width, vp1.height]);
       newPage.drawImage(embedded, { x: 0, y: 0, width: vp1.width, height: vp1.height });
+      if (p % 6 === 0) await new Promise((r) => setTimeout(r, 0));
     }
-    const out = await outDoc.save();
+    const out = await outDoc.save({ useObjectStreams: true });
     return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
   } catch (err: unknown) {
     const name = (err as { name?: string })?.name || '';
@@ -2064,6 +2257,7 @@ export async function createSearchablePdfFromOcr(
 
   for (const p of pages) {
     const base64 = p.imageDataUrl.split(',')[1];
+    if (!base64) continue;
     const bin = atob(base64);
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
@@ -2071,23 +2265,52 @@ export async function createSearchablePdfFromOcr(
       ? await doc.embedPng(bytes)
       : await doc.embedJpg(bytes);
 
-    const aspect = embedded.height / embedded.width;
+    const aspect = embedded.height / Math.max(1, embedded.width);
     const widthPt = 595.28;
     const heightPt = widthPt * aspect;
     const page = doc.addPage([widthPt, heightPt]);
 
-    // Draw invisible searchable text behind image for ASCII-compatible terms
-    const asciiSafe = p.ocrText.replace(/[^\x20-\x7E\n]/g, ' ').trim();
-    if (asciiSafe) {
-      page.drawText(asciiSafe.slice(0, 12000), {
-        x: 24,
-        y: heightPt - 36,
-        size: 9,
-        font,
-        color: rgb(1, 1, 1),
-        opacity: 0.01,
-        maxWidth: widthPt - 48,
-        lineHeight: 12,
+    // Filter to characters encodable by WinAnsi Helvetica so stray symbols never throw
+    let safeText = '';
+    for (const ch of p.ocrText) {
+      if (ch === '\n' || ch === ' ') {
+        safeText += ch;
+        continue;
+      }
+      const code = ch.charCodeAt(0);
+      if (code >= 32 && code <= 255) {
+        try {
+          font.encodeText(ch);
+          safeText += ch;
+        } catch {
+          safeText += ' ';
+        }
+      }
+    }
+
+    const lines = safeText
+      .split('\n')
+      .map((l) => l.replace(/\s+/g, ' ').trim())
+      .filter(Boolean);
+
+    if (lines.length > 0) {
+      const margin = 20;
+      const usableH = Math.max(40, heightPt - margin * 2);
+      const stepY = Math.min(13, Math.max(7, usableH / lines.length));
+      const fontSize = Math.min(9.5, Math.max(5.5, stepY * 0.8));
+      lines.forEach((line, idx) => {
+        const y = heightPt - margin - fontSize - idx * stepY;
+        if (y < margin) return;
+        page.drawText(line, {
+          x: margin,
+          y,
+          size: fontSize,
+          font,
+          color: rgb(1, 1, 1),
+          opacity: 0.01,
+          maxWidth: widthPt - margin * 2,
+          lineHeight: stepY,
+        });
       });
     }
 

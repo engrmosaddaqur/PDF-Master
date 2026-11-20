@@ -19,7 +19,7 @@ import {
   renderPageToDataUrl,
 } from '../services/pdfEngine';
 import { runOnDeviceOcrBatch, type OcrLanguage } from '../services/ocrService';
-import { saveBufferToDeviceStorage } from '../services/deviceFileActions';
+import { emitAppToast, saveBufferToDeviceStorage } from '../services/deviceFileActions';
 import { PdfSourcePicker } from './PdfSourcePicker';
 
 interface OcrViewProps {
@@ -213,9 +213,28 @@ export const OcrView: React.FC<OcrViewProps> = ({
     setSavingSearchable(true);
     setErrorMsg(null);
     try {
+      const perPageEdits = new Map<number, string>();
+      if (extractedPages.length > 1) {
+        const markerRegex = /---\s*Page\s+(\d+)\s*---\s*\n?/gi;
+        const matches = [...combinedText.matchAll(markerRegex)];
+        for (let i = 0; i < matches.length; i++) {
+          const pageIdx = parseInt(matches[i][1], 10) - 1;
+          const start = (matches[i].index ?? 0) + matches[i][0].length;
+          const end = i + 1 < matches.length ? (matches[i + 1].index ?? combinedText.length) : combinedText.length;
+          if (pageIdx >= 0 && pageIdx < extractedPages.length) {
+            perPageEdits.set(pageIdx, combinedText.slice(start, end).trim());
+          }
+        }
+      }
+
       const pagesToSave = extractedPages.map((p, idx) => ({
         ...p,
-        ocrText: extractedPages.length === 1 ? combinedText : p.ocrText,
+        ocrText:
+          extractedPages.length === 1
+            ? combinedText
+            : perPageEdits.has(idx)
+            ? perPageEdits.get(idx)!
+            : p.ocrText,
       }));
       const pdfBytes = await createSearchablePdfFromOcr(pagesToSave);
       const thumb = await renderPageThumbnail(pdfBytes, 1, 200).catch(() => pagesToSave[0].imageDataUrl);
@@ -249,6 +268,13 @@ export const OcrView: React.FC<OcrViewProps> = ({
             pdfBytes: cloneBuffer(pdfBytes),
           },
         ],
+      });
+      emitAppToast({
+        message:
+          language === 'bn'
+            ? `সার্চেবল পিডিএফ সেভ হয়েছে: ${baseName}`
+            : `Saved Searchable PDF: ${baseName}`,
+        variant: 'success',
       });
       onClose();
     } catch (err) {

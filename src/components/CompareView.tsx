@@ -1,9 +1,25 @@
 import React, { useState } from 'react';
-import { ArrowLeft, ChevronDown, ChevronUp, FileText, GitCompare, Minus, Plus } from 'lucide-react';
+import {
+  ArrowLeft,
+  ArrowLeftRight,
+  ChevronDown,
+  ChevronUp,
+  Download,
+  FileText,
+  GitCompare,
+  Loader2,
+  Minus,
+  Plus,
+} from 'lucide-react';
 import type { AppLanguage, DocumentRecord } from '../types';
 import { getT } from '../i18n/translations';
 import { extractDocumentPagesText, renderPageToDataUrl } from '../services/pdfEngine';
-import { comparePdfPagesText, type PageComparisonResult } from '../services/diffEngine';
+import {
+  comparePdfPagesText,
+  formatDiffReportText,
+  type PageComparisonResult,
+} from '../services/diffEngine';
+import { saveBufferToDeviceStorage } from '../services/deviceFileActions';
 import { formatBytes } from '../services/storageService';
 import { PdfSourcePicker } from './PdfSourcePicker';
 
@@ -35,7 +51,10 @@ export const CompareView: React.FC<CompareViewProps> = ({
   );
   const [pickerSlot, setPickerSlot] = useState<'a' | 'b' | null>('a');
   const [running, setRunning] = useState(false);
+  const [loadingMoreSide, setLoadingMoreSide] = useState(false);
   const [mode, setMode] = useState<'diff' | 'sideBySide'>('diff');
+  const [diffFilter, setDiffFilter] = useState<'all' | 'changes'>('all');
+  const [changedPagesOnly, setChangedPagesOnly] = useState(false);
   const [summary, setSummary] = useState<{
     pages: PageComparisonResult[];
     totalAdded: number;
@@ -43,10 +62,34 @@ export const CompareView: React.FC<CompareViewProps> = ({
     totalUnchanged: number;
   } | null>(null);
   const [sideImages, setSideImages] = useState<Array<{ a?: string; b?: string; page: number }>>([]);
+  const [comparedPair, setComparedPair] = useState<{ a: DocumentRecord; b: DocumentRecord } | null>(
+    null
+  );
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   const docAObj = available.find((d) => d.id === docAId);
   const docBObj = available.find((d) => d.id === docBId);
+
+  const renderSideRange = async (
+    docA: DocumentRecord,
+    docB: DocumentRecord,
+    startPage: number,
+    endPage: number
+  ) => {
+    const imgs: Array<{ a?: string; b?: string; page: number }> = [];
+    for (let p = startPage; p <= endPage; p++) {
+      const aUrl =
+        p <= docA.pageCount
+          ? await renderPageToDataUrl(docA.pdfBytes, p, 1.0, 'image/jpeg')
+          : undefined;
+      const bUrl =
+        p <= docB.pageCount
+          ? await renderPageToDataUrl(docB.pdfBytes, p, 1.0, 'image/jpeg')
+          : undefined;
+      imgs.push({ a: aUrl, b: bUrl, page: p });
+    }
+    return imgs;
+  };
 
   const runComparison = async () => {
     const docA = available.find((d) => d.id === docAId);
@@ -62,14 +105,10 @@ export const CompareView: React.FC<CompareViewProps> = ({
       ]);
       const result = comparePdfPagesText(pagesA, pagesB);
       setSummary(result);
+      setComparedPair({ a: docA, b: docB });
 
-      const maxP = Math.min(6, Math.max(docA.pageCount, docB.pageCount));
-      const imgs: Array<{ a?: string; b?: string; page: number }> = [];
-      for (let p = 1; p <= maxP; p++) {
-        const aUrl = p <= docA.pageCount ? await renderPageToDataUrl(docA.pdfBytes, p, 1.0, 'image/jpeg') : undefined;
-        const bUrl = p <= docB.pageCount ? await renderPageToDataUrl(docB.pdfBytes, p, 1.0, 'image/jpeg') : undefined;
-        imgs.push({ a: aUrl, b: bUrl, page: p });
-      }
+      const initialMax = Math.min(6, Math.max(docA.pageCount, docB.pageCount));
+      const imgs = await renderSideRange(docA, docB, 1, initialMax);
       setSideImages(imgs);
     } catch (err) {
       setErrorMsg(err instanceof Error ? err.message : 'Failed to compare selected PDFs.');
@@ -77,6 +116,45 @@ export const CompareView: React.FC<CompareViewProps> = ({
       setRunning(false);
     }
   };
+
+  const handleLoadMoreSide = async (loadAll = false) => {
+    if (!comparedPair || loadingMoreSide) return;
+    const totalMax = Math.max(comparedPair.a.pageCount, comparedPair.b.pageCount);
+    const nextStart = sideImages.length + 1;
+    if (nextStart > totalMax) return;
+    const nextEnd = loadAll ? totalMax : Math.min(totalMax, sideImages.length + 6);
+    setLoadingMoreSide(true);
+    try {
+      const more = await renderSideRange(comparedPair.a, comparedPair.b, nextStart, nextEnd);
+      setSideImages((prev) => [...prev, ...more]);
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to render additional pages.');
+    } finally {
+      setLoadingMoreSide(false);
+    }
+  };
+
+  const handleSwapDocs = () => {
+    setDocAId(docBId);
+    setDocBId(docAId);
+  };
+
+  const handleExportReport = async () => {
+    if (!summary || !comparedPair) return;
+    const report = formatDiffReportText(comparedPair.a.name, comparedPair.b.name, summary);
+    const buf = new TextEncoder().encode(report).buffer;
+    const baseA = comparedPair.a.name.replace(/\.pdf$/i, '');
+    const baseB = comparedPair.b.name.replace(/\.pdf$/i, '');
+    await saveBufferToDeviceStorage(buf, `Compare_${baseA}_vs_${baseB}.txt`, 'text/plain;charset=utf-8');
+  };
+
+  const totalSidePages = comparedPair
+    ? Math.max(comparedPair.a.pageCount, comparedPair.b.pageCount)
+    : 0;
+
+  const visibleDiffPages = summary
+    ? summary.pages.filter((pg) => !changedPagesOnly || pg.addedCount > 0 || pg.deletedCount > 0)
+    : [];
 
   return (
     <div className="fixed inset-0 z-40 flex flex-col bg-[#F8FAFC] dark:bg-[#0B1120]">
@@ -92,11 +170,21 @@ export const CompareView: React.FC<CompareViewProps> = ({
             {t.compare.title}
           </h1>
         </div>
+        {summary && (
+          <button
+            type="button"
+            onClick={() => void handleExportReport()}
+            className="min-h-[38px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold flex items-center gap-1.5"
+          >
+            <Download className="w-3.5 h-3.5 text-[#2563EB]" />
+            <span>{language === 'bn' ? 'রিপোর্ট (.TXT)' : 'Export .TXT'}</span>
+          </button>
+        )}
       </header>
 
       <div className="flex-1 overflow-y-auto p-4 max-w-4xl w-full mx-auto space-y-4">
         <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-3">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-[1fr_auto_1fr] items-stretch gap-2.5">
             {/* Slot A Summary Toggle */}
             <button
               type="button"
@@ -128,6 +216,18 @@ export const CompareView: React.FC<CompareViewProps> = ({
               ) : (
                 <ChevronDown className="w-4 h-4 text-slate-400 shrink-0" />
               )}
+            </button>
+
+            <button
+              type="button"
+              onClick={handleSwapDocs}
+              disabled={!docAId || !docBId}
+              aria-label="Swap A and B"
+              title={language === 'bn' ? 'A এবং B অদলবদল করুন' : 'Swap A and B'}
+              className="min-h-[40px] sm:min-w-[44px] px-3 sm:px-0 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 hover:bg-slate-100 dark:hover:bg-slate-700 disabled:opacity-40 flex items-center justify-center gap-1.5 text-xs font-semibold text-slate-600 dark:text-slate-300"
+            >
+              <ArrowLeftRight className="w-4 h-4" />
+              <span className="sm:hidden">{language === 'bn' ? 'অদলবদল' : 'Swap A ↔ B'}</span>
             </button>
 
             {/* Slot B Summary Toggle */}
@@ -276,54 +376,111 @@ export const CompareView: React.FC<CompareViewProps> = ({
 
             {mode === 'diff' ? (
               <div className="space-y-3">
-                {summary.pages.map((pg) => (
-                  <div
-                    key={pg.pageNumber}
-                    className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-2"
-                  >
-                    <div className="flex items-center justify-between text-xs font-semibold text-slate-500 border-b border-slate-100 dark:border-slate-800 pb-2">
-                      <span>
-                        {t.viewer.page} {pg.pageNumber}
-                      </span>
-                      <span className="font-mono-nums">
-                        +{pg.addedCount} / -{pg.deletedCount}
-                      </span>
-                    </div>
-                    {pg.lines.length === 0 ? (
-                      <p className="text-xs text-slate-400">
-                        {language === 'bn'
-                          ? 'এই পৃষ্ঠায় কোনো টেক্সট পাওয়া যায়নি।'
-                          : 'No text extracted on this page.'}
-                      </p>
-                    ) : (
-                      <div className="space-y-1 font-mono text-xs leading-relaxed">
-                        {pg.lines.map((line, idx) => (
-                          <div
-                            key={idx}
-                            className={`flex items-start gap-2 px-2 py-1 rounded-lg ${
-                              line.type === 'added'
-                                ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-200'
-                                : line.type === 'deleted'
-                                ? 'bg-rose-50 dark:bg-rose-950/40 text-rose-800 dark:text-rose-200 line-through'
-                                : 'text-slate-600 dark:text-slate-400'
-                            }`}
-                          >
-                            <span className="shrink-0 mt-0.5">
-                              {line.type === 'added' ? (
-                                <Plus className="w-3.5 h-3.5" />
-                              ) : line.type === 'deleted' ? (
-                                <Minus className="w-3.5 h-3.5" />
-                              ) : (
-                                <span className="inline-block w-3.5" />
-                              )}
-                            </span>
-                            <span className="break-words">{line.text}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
+                {/* Diff Filter Controls */}
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => setDiffFilter('all')}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-semibold border ${
+                        diffFilter === 'all'
+                          ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                          : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      {language === 'bn' ? 'সব লাইন' : 'All Lines'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDiffFilter('changes')}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-semibold border ${
+                        diffFilter === 'changes'
+                          ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                          : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300'
+                      }`}
+                    >
+                      {language === 'bn' ? 'শুধু পরিবর্তন' : 'Differences Only'}
+                    </button>
                   </div>
-                ))}
+                  <button
+                    type="button"
+                    onClick={() => setChangedPagesOnly((v) => !v)}
+                    className={`px-3 py-1.5 rounded-xl text-xs font-semibold border ${
+                      changedPagesOnly
+                        ? 'bg-[#06B6D4] text-white border-[#06B6D4]'
+                        : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-800 text-slate-600 dark:text-slate-300'
+                    }`}
+                  >
+                    {language === 'bn' ? 'শুধু পরিবর্তিত পৃষ্ঠা' : 'Changed Pages Only'}
+                  </button>
+                </div>
+
+                {visibleDiffPages.length === 0 ? (
+                  <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 text-center text-xs text-slate-500">
+                    {language === 'bn'
+                      ? 'উভয় ডকুমেন্টের টেক্সট একই রয়েছে।'
+                      : 'No text differences detected between the two documents.'}
+                  </div>
+                ) : (
+                  visibleDiffPages.map((pg) => {
+                    const linesToShow =
+                      diffFilter === 'changes'
+                        ? pg.lines.filter((l) => l.type !== 'equal')
+                        : pg.lines;
+                    return (
+                      <div
+                        key={pg.pageNumber}
+                        className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-4 space-y-2"
+                      >
+                        <div className="flex items-center justify-between text-xs font-semibold text-slate-500 border-b border-slate-100 dark:border-slate-800 pb-2">
+                          <span>
+                            {t.viewer.page} {pg.pageNumber}
+                          </span>
+                          <span className="font-mono-nums">
+                            +{pg.addedCount} / -{pg.deletedCount}
+                          </span>
+                        </div>
+                        {linesToShow.length === 0 ? (
+                          <p className="text-xs text-slate-400">
+                            {pg.lines.length === 0
+                              ? language === 'bn'
+                                ? 'এই পৃষ্ঠায় কোনো টেক্সট পাওয়া যায়নি।'
+                                : 'No text extracted on this page.'
+                              : language === 'bn'
+                              ? 'এই পৃষ্ঠায় কোনো পরিবর্তন নেই।'
+                              : 'No differences on this page.'}
+                          </p>
+                        ) : (
+                          <div className="space-y-1 font-mono text-xs leading-relaxed">
+                            {linesToShow.map((line, idx) => (
+                              <div
+                                key={idx}
+                                className={`flex items-start gap-2 px-2 py-1 rounded-lg ${
+                                  line.type === 'added'
+                                    ? 'bg-emerald-50 dark:bg-emerald-950/40 text-emerald-800 dark:text-emerald-200'
+                                    : line.type === 'deleted'
+                                    ? 'bg-rose-50 dark:bg-rose-950/40 text-rose-800 dark:text-rose-200 line-through'
+                                    : 'text-slate-600 dark:text-slate-400'
+                                }`}
+                              >
+                                <span className="shrink-0 mt-0.5">
+                                  {line.type === 'added' ? (
+                                    <Plus className="w-3.5 h-3.5" />
+                                  ) : line.type === 'deleted' ? (
+                                    <Minus className="w-3.5 h-3.5" />
+                                  ) : (
+                                    <span className="inline-block w-3.5" />
+                                  )}
+                                </span>
+                                <span className="break-words">{line.text}</span>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })
+                )}
               </div>
             ) : (
               <div className="space-y-4">
@@ -357,6 +514,34 @@ export const CompareView: React.FC<CompareViewProps> = ({
                     </div>
                   </div>
                 ))}
+
+                {sideImages.length < totalSidePages && (
+                  <div className="flex flex-wrap items-center justify-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      disabled={loadingMoreSide}
+                      onClick={() => void handleLoadMoreSide(false)}
+                      className="min-h-[42px] px-4 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-xs font-semibold flex items-center gap-1.5 disabled:opacity-50"
+                    >
+                      {loadingMoreSide && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                      <span>
+                        {language === 'bn'
+                          ? `আরও পৃষ্ঠা লোড করুন (${sideImages.length}/${totalSidePages})`
+                          : `Load More Pages (${sideImages.length}/${totalSidePages})`}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={loadingMoreSide}
+                      onClick={() => void handleLoadMoreSide(true)}
+                      className="min-h-[42px] px-4 rounded-xl bg-[#2563EB] text-white text-xs font-semibold disabled:opacity-50"
+                    >
+                      {language === 'bn'
+                        ? `বাকি সব (${totalSidePages - sideImages.length})`
+                        : `Load All Remaining (${totalSidePages - sideImages.length})`}
+                    </button>
+                  </div>
+                )}
               </div>
             )}
           </>
@@ -365,3 +550,4 @@ export const CompareView: React.FC<CompareViewProps> = ({
     </div>
   );
 };
+

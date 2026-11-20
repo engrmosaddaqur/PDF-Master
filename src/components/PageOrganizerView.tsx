@@ -12,6 +12,7 @@ import {
   Save,
   Scissors,
   Trash2,
+  Undo2,
 } from 'lucide-react';
 import type { AppLanguage, DocumentRecord } from '../types';
 import { getT } from '../i18n/translations';
@@ -62,6 +63,20 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
   const [moveModalFrom, setMoveModalFrom] = useState<number | null>(null);
   const [moveTargetInput, setMoveTargetInput] = useState('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [undoStack, setUndoStack] = useState<PageTile[][]>([]);
+
+  const pushUndoSnapshot = (snapshot: PageTile[]) => {
+    setUndoStack((prev) => [...prev.slice(-24), snapshot.map((t) => ({ ...t }))]);
+  };
+
+  const handleUndo = () => {
+    setUndoStack((prev) => {
+      if (prev.length === 0) return prev;
+      const last = prev[prev.length - 1];
+      setTiles(last);
+      return prev.slice(0, -1);
+    });
+  };
 
   const loadThumbnails = async (bytes: ArrayBuffer, count: number) => {
     setLoading(true);
@@ -78,6 +93,7 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
       });
     }
     setTiles(list);
+    setUndoStack([]);
     setLoading(false);
   };
 
@@ -102,7 +118,17 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
     setTiles((prev) => prev.map((t) => ({ ...t, selected: nextVal })));
   };
 
+  const selectOddOrEven = (parity: 'odd' | 'even') => {
+    setTiles((prev) =>
+      prev.map((t, i) => ({
+        ...t,
+        selected: parity === 'odd' ? (i + 1) % 2 === 1 : (i + 1) % 2 === 0,
+      }))
+    );
+  };
+
   const handleAddBlank = () => {
+    pushUndoSnapshot(tiles);
     setTiles((prev) => [
       ...prev,
       {
@@ -118,6 +144,7 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
 
   const handleDuplicateSelected = () => {
     if (selectedIndices.length === 0) return;
+    pushUndoSnapshot(tiles);
     const next: PageTile[] = [];
     tiles.forEach((t) => {
       next.push(t);
@@ -135,11 +162,13 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
 
   const handleDeleteSelected = () => {
     if (selectedIndices.length === 0 || selectedIndices.length >= tiles.length) return;
+    pushUndoSnapshot(tiles);
     setTiles((prev) => prev.filter((t) => !t.selected));
   };
 
   const handleRotateSelected = () => {
     if (selectedIndices.length === 0) return;
+    pushUndoSnapshot(tiles);
     setTiles((prev) =>
       prev.map((t) =>
         t.selected ? { ...t, rotationDelta: (t.rotationDelta + 90) % 360 } : t
@@ -149,6 +178,7 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
 
   const moveTile = (from: number, to: number) => {
     if (to < 0 || to >= tiles.length || from === to) return;
+    pushUndoSnapshot(tiles);
     const copy = [...tiles];
     const [item] = copy.splice(from, 1);
     copy.splice(to, 0, item);
@@ -299,6 +329,35 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
         </div>
 
         <div className="flex items-center gap-1.5 shrink-0">
+          {undoStack.length > 0 && (
+            <button
+              type="button"
+              onClick={handleUndo}
+              title={language === 'bn' ? 'পূর্বাবস্থায় ফিরুন' : 'Undo'}
+              className="min-h-[44px] px-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold flex items-center gap-1 text-slate-700 dark:text-slate-200"
+            >
+              <Undo2 className="w-4 h-4" />
+              <span className="hidden sm:inline">{language === 'bn' ? 'আনডু' : 'Undo'}</span>
+            </button>
+          )}
+          <div className="hidden sm:flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => selectOddOrEven('odd')}
+              disabled={tiles.length === 0}
+              className="min-h-[44px] px-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-40"
+            >
+              {language === 'bn' ? 'বিজোড়' : 'Odd'}
+            </button>
+            <button
+              type="button"
+              onClick={() => selectOddOrEven('even')}
+              disabled={tiles.length < 2}
+              className="min-h-[44px] px-2.5 rounded-xl bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-xs font-semibold text-slate-700 dark:text-slate-200 disabled:opacity-40"
+            >
+              {language === 'bn' ? 'জোড়' : 'Even'}
+            </button>
+          </div>
           <button
             type="button"
             onClick={toggleSelectAll}

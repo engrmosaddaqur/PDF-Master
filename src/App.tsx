@@ -907,6 +907,7 @@ export default function App() {
           onClose={() => setWorkspace({ type: 'none' })}
           onSaveResultDoc={upsertDoc}
           onUpdateExistingDoc={upsertDoc}
+          onOpenResultDoc={(doc, target) => setWorkspace({ type: target, docId: doc.id })}
         />
       )}
 

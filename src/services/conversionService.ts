@@ -1,21 +1,28 @@
-import { Document, Packer, Paragraph, TextRun, HeadingLevel } from 'docx';
+import { Document, Packer, Paragraph, TextRun, HeadingLevel, PageBreak } from 'docx';
 import * as XLSX from 'xlsx';
 import mammoth from 'mammoth';
 import JSZip from 'jszip';
 import { PDFDocument, PDFFont, StandardFonts, rgb } from 'pdf-lib';
 import * as pdfjsLib from 'pdfjs-dist';
-import type { WordPageSettings } from '../types';
+import type { PdfFontFamily, WordPageSettings } from '../types';
 import {
   PAPER_DIMENSIONS,
   cloneBuffer,
-  extractDocumentPagesText,
+  getSharedPdfDocument,
   hasNonWinAnsiChars,
   hexToRgb,
   renderPageToDataUrl,
   renderUnicodeTextPng,
+  splitPdfByRanges,
 } from './pdfEngine';
 
-export async function imagesToPdf(files: File[]): Promise<ArrayBuffer> {
+export type ImageToPdfFitMode = 'a4-fit' | 'a4-fill' | 'auto';
+
+export async function imagesToPdf(
+  files: File[],
+  options?: { fitMode?: ImageToPdfFitMode }
+): Promise<ArrayBuffer> {
+  const fitMode: ImageToPdfFitMode = options?.fitMode || 'a4-fit';
   const doc = await PDFDocument.create();
   for (const file of files) {
     const dataUrl = await new Promise<string>((resolve, reject) => {
@@ -46,10 +53,34 @@ export async function imagesToPdf(files: File[]): Promise<ArrayBuffer> {
     const bytes = new Uint8Array(bin.length);
     for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
     const embedded = await doc.embedJpg(bytes);
-    const widthPt = 595.28;
-    const heightPt = (embedded.height / embedded.width) * widthPt;
-    const page = doc.addPage([widthPt, heightPt]);
-    page.drawImage(embedded, { x: 0, y: 0, width: widthPt, height: heightPt });
+
+    if (fitMode === 'auto') {
+      const widthPt = 595.28;
+      const heightPt = (embedded.height / Math.max(1, embedded.width)) * widthPt;
+      const page = doc.addPage([widthPt, heightPt]);
+      page.drawImage(embedded, { x: 0, y: 0, width: widthPt, height: heightPt });
+    } else {
+      const isLandscape = embedded.width > embedded.height * 1.05;
+      const pageW = isLandscape ? 841.89 : 595.28;
+      const pageH = isLandscape ? 595.28 : 841.89;
+      const margin = fitMode === 'a4-fit' ? 24 : 0;
+      const availW = pageW - margin * 2;
+      const availH = pageH - margin * 2;
+      const scale = Math.min(
+        availW / Math.max(1, embedded.width),
+        availH / Math.max(1, embedded.height)
+      );
+      const drawW = embedded.width * scale;
+      const drawH = embedded.height * scale;
+      const page = doc.addPage([pageW, pageH]);
+      page.drawRectangle({ x: 0, y: 0, width: pageW, height: pageH, color: rgb(1, 1, 1) });
+      page.drawImage(embedded, {
+        x: (pageW - drawW) / 2,
+        y: (pageH - drawH) / 2,
+        width: drawW,
+        height: drawH,
+      });
+    }
   }
   const out = await doc.save();
   return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
@@ -60,10 +91,8 @@ export async function pdfToImagesZip(
   format: 'image/png' | 'image/jpeg' = 'image/png',
   renderScale = 2
 ): Promise<{ zipBuffer: ArrayBuffer; previewImages: string[] }> {
-  const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(pdfBytes)) });
-  const pdf = await loadingTask.promise;
+  const pdf = await getSharedPdfDocument(pdfBytes);
   const count = pdf.numPages;
-  await loadingTask.destroy();
 
   const zip = new JSZip();
   const previewImages: string[] = [];
@@ -74,18 +103,128 @@ export async function pdfToImagesZip(
     previewImages.push(dataUrl);
     const base64 = dataUrl.split(',')[1];
     zip.file(`page-${String(p).padStart(3, '0')}.${ext}`, base64, { base64: true });
+    if (p % 6 === 0) await new Promise((r) => setTimeout(r, 0));
   }
 
   const zipBuffer = await zip.generateAsync({ type: 'arraybuffer' });
   return { zipBuffer, previewImages };
 }
 
+export async function splitPdfPagesAsZip(
+  pdfBytes: ArrayBuffer,
+  pageNumbers1Based: number[],
+  baseName: string
+): Promise<ArrayBuffer> {
+  const zip = new JSZip();
+  const cleanBase = baseName.replace(/\.pdf$/i, '') || 'document';
+  for (const pageNum of pageNumbers1Based) {
+    const single = await splitPdfByRanges(pdfBytes, [pageNum]);
+    zip.file(`${cleanBase}_page_${String(pageNum).padStart(3, '0')}.pdf`, new Uint8Array(single));
+  }
+  return zip.generateAsync({ type: 'arraybuffer' });
+}
+
+interface PositionedSpan {
+  str: string;
+  x: number;
+  baselineY: number;
+  width: number;
+  fontSize: number;
+  isBold: boolean;
+}
+
+async function extractVisualSpansPerPage(pdfBytes: ArrayBuffer): Promise<
+  Array<{ pageNumber: number; width: number; height: number; spans: PositionedSpan[] }>
+> {
+  const pdf = await getSharedPdfDocument(pdfBytes);
+  const pages: Array<{ pageNumber: number; width: number; height: number; spans: PositionedSpan[] }> = [];
+
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const viewport = page.getViewport({ scale: 1 });
+    const tc = await page.getTextContent();
+    const spans: PositionedSpan[] = [];
+
+    for (const item of tc.items) {
+      if (!('str' in item) || !item.str || !item.str.trim()) continue;
+      const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
+      const scaleX = Math.hypot(tx[0], tx[1]);
+      const scaleY = Math.hypot(tx[2], tx[3]);
+      const fontSize = Math.max(5.5, Math.max(scaleX, scaleY));
+      const x = tx[4];
+      const baselineY = tx[5];
+      const width =
+        item.width && item.width > 0
+          ? item.width
+          : Math.max(4, item.str.length * fontSize * 0.48);
+      const fname = (item.fontName || '').toLowerCase();
+      const isBold = fname.includes('bold') || fname.includes('black') || fname.includes('heavy');
+
+      spans.push({
+        str: item.str,
+        x,
+        baselineY,
+        width,
+        fontSize,
+        isBold,
+      });
+    }
+
+    pages.push({
+      pageNumber: p,
+      width: viewport.width,
+      height: viewport.height,
+      spans,
+    });
+    if (p % 10 === 0) await new Promise((r) => setTimeout(r, 0));
+  }
+
+  return pages;
+}
+
+function clusterSpansIntoRows(spans: PositionedSpan[]) {
+  const sorted = [...spans].sort((a, b) => a.baselineY - b.baselineY || a.x - b.x);
+  const rows: Array<{ avgY: number; avgFontSize: number; spans: PositionedSpan[] }> = [];
+
+  for (const sp of sorted) {
+    const last = rows[rows.length - 1];
+    if (
+      last &&
+      Math.abs(sp.baselineY - last.avgY) <=
+        Math.max(2.6, Math.min(sp.fontSize, last.avgFontSize) * 0.45)
+    ) {
+      const n = last.spans.length;
+      last.avgY = (last.avgY * n + sp.baselineY) / (n + 1);
+      last.avgFontSize = (last.avgFontSize * n + sp.fontSize) / (n + 1);
+      last.spans.push(sp);
+    } else {
+      rows.push({ avgY: sp.baselineY, avgFontSize: sp.fontSize, spans: [sp] });
+    }
+  }
+
+  rows.forEach((r) => r.spans.sort((a, b) => a.x - b.x));
+  return rows;
+}
+
 export async function pdfToDocxBytes(
   pdfBytes: ArrayBuffer,
   title: string
 ): Promise<{ buffer: ArrayBuffer; extractedChars: number }> {
-  const pages = await extractDocumentPagesText(pdfBytes);
-  const extractedChars = pages.reduce((sum, p) => sum + p.text.trim().length, 0);
+  const pages = await extractVisualSpansPerPage(pdfBytes);
+
+  // Estimate dominant body font size across document for accurate heading classification
+  const allFontSizes: number[] = [];
+  let extractedChars = 0;
+  for (const pg of pages) {
+    for (const sp of pg.spans) {
+      extractedChars += sp.str.trim().length;
+      allFontSizes.push(Math.round(sp.fontSize * 2) / 2);
+    }
+  }
+  allFontSizes.sort((a, b) => a - b);
+  const bodySize =
+    allFontSizes.length > 0 ? allFontSizes[Math.floor(allFontSizes.length * 0.5)] : 11;
+
   const children: Paragraph[] = [
     new Paragraph({
       text: title.replace(/\.pdf$/i, ''),
@@ -93,25 +232,70 @@ export async function pdfToDocxBytes(
     }),
   ];
 
-  for (const page of pages) {
-    children.push(
-      new Paragraph({
-        children: [
-          new TextRun({
-            text: `Page ${page.pageNumber}`,
-            bold: true,
-            color: '2563EB',
-            size: 20,
-          }),
-        ],
-      })
-    );
-    const lines = (page.text || '(No extractable text on this page)').split('\n');
-    for (const line of lines) {
-      children.push(new Paragraph({ text: line }));
+  pages.forEach((page, pageIdx) => {
+    if (pageIdx > 0) {
+      children.push(new Paragraph({ children: [new PageBreak()] }));
     }
-    children.push(new Paragraph({ text: '' }));
-  }
+
+    const rows = clusterSpansIntoRows(page.spans);
+    if (rows.length === 0) {
+      children.push(
+        new Paragraph({
+          children: [
+            new TextRun({
+              text: `(Page ${page.pageNumber}: No extractable text — use OCR for scanned pages)`,
+              italics: true,
+              color: '64748B',
+            }),
+          ],
+        })
+      );
+      return;
+    }
+
+    for (const row of rows) {
+      let lineText = '';
+      let lastRight = -Infinity;
+      let boldCount = 0;
+      let maxFs = 0;
+
+      for (const sp of row.spans) {
+        const gap = lastRight === -Infinity ? 0 : sp.x - lastRight;
+        if (lineText) {
+          if (gap > sp.fontSize * 1.8) {
+            lineText += '    ';
+          } else if (gap > sp.fontSize * 0.16 && !lineText.endsWith(' ') && !sp.str.startsWith(' ')) {
+            lineText += ' ';
+          }
+        }
+        lineText += sp.str;
+        lastRight = Math.max(lastRight, sp.x + sp.width);
+        if (sp.isBold) boldCount++;
+        maxFs = Math.max(maxFs, sp.fontSize);
+      }
+
+      const clean = lineText.trim();
+      if (!clean) continue;
+
+      const mostlyBold = boldCount >= Math.ceil(row.spans.length * 0.65);
+      if (maxFs >= bodySize * 1.38 && clean.length <= 120) {
+        children.push(new Paragraph({ text: clean, heading: HeadingLevel.HEADING_2 }));
+      } else if ((maxFs >= bodySize * 1.16 || (mostlyBold && clean.length <= 90)) && clean.length <= 120) {
+        children.push(new Paragraph({ text: clean, heading: HeadingLevel.HEADING_3 }));
+      } else {
+        children.push(
+          new Paragraph({
+            children: [
+              new TextRun({
+                text: clean,
+                bold: mostlyBold,
+              }),
+            ],
+          })
+        );
+      }
+    }
+  });
 
   const docx = new Document({
     sections: [{ children }],
@@ -120,84 +304,109 @@ export async function pdfToDocxBytes(
   return { buffer: await blob.arrayBuffer(), extractedChars };
 }
 
+function parseExcelCellValue(raw: string): string | number {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  // Preserve phone numbers / IDs with leading zeros like "017123456" as text
+  if (/^0\d+$/.test(trimmed)) return trimmed;
+  if (/^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(trimmed)) {
+    const n = Number(trimmed.replace(/,/g, ''));
+    if (Number.isFinite(n)) return n;
+  }
+  if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
+    const n = Number(trimmed);
+    if (Number.isFinite(n)) return n;
+  }
+  return trimmed;
+}
+
 export async function pdfToXlsxBytes(
   pdfBytes: ArrayBuffer
 ): Promise<{ buffer: ArrayBuffer; extractedChars: number }> {
-  const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(cloneBuffer(pdfBytes)) });
-  const pdf = await loadingTask.promise;
+  const pages = await extractVisualSpansPerPage(pdfBytes);
   const wb = XLSX.utils.book_new();
   let extractedChars = 0;
 
-  try {
-    for (let p = 1; p <= pdf.numPages; p++) {
-      const page = await pdf.getPage(p);
-      const tc = await page.getTextContent();
-      const rowsMap = new Map<number, Array<{ x: number; str: string }>>();
-      const allXPositions: number[] = [];
+  for (const page of pages) {
+    const rows = clusterSpansIntoRows(page.spans);
+    const mergedRowCells: Array<Array<{ x: number; text: string }>> = [];
+    const allCellX: number[] = [];
 
-      for (const item of tc.items) {
-        if (!('str' in item) || !item.str.trim()) continue;
-        const text = item.str.trim();
-        extractedChars += text.length;
-        const yBucket = Math.round((item.transform?.[5] ?? 0) / 6) * 6;
-        const x = item.transform?.[4] ?? 0;
-        allXPositions.push(x);
-        const existing = rowsMap.get(yBucket) || [];
-        existing.push({ x, str: text });
-        rowsMap.set(yBucket, existing);
-      }
+    for (const row of rows) {
+      const cells: Array<{ x: number; right: number; fontSize: number; text: string }> = [];
+      for (const sp of row.spans) {
+        const clean = sp.str.trim();
+        if (!clean) continue;
+        extractedChars += clean.length;
 
-      // Build column anchor positions by clustering X coordinates within 28pt
-      const sortedX = [...allXPositions].sort((a, b) => a - b);
-      const colAnchors: number[] = [];
-      for (const x of sortedX) {
-        if (colAnchors.length === 0 || x - colAnchors[colAnchors.length - 1] > 28) {
-          colAnchors.push(x);
+        const prev = cells[cells.length - 1];
+        const gap = prev ? sp.x - prev.right : Infinity;
+        // Join tokens in the same phrase/column cell (only split columns on wide horizontal gaps)
+        if (prev && gap <= Math.max(prev.fontSize, sp.fontSize) * 1.1) {
+          prev.text = `${prev.text} ${clean}`.replace(/\s+/g, ' ').trim();
+          prev.right = Math.max(prev.right, sp.x + sp.width);
+          prev.fontSize = Math.max(prev.fontSize, sp.fontSize);
+        } else {
+          cells.push({
+            x: sp.x,
+            right: sp.x + sp.width,
+            fontSize: sp.fontSize,
+            text: clean,
+          });
         }
       }
-
-      const sortedRows = Array.from(rowsMap.entries())
-        .sort((a, b) => b[0] - a[0])
-        .map(([, cells]) => {
-          const ordered = [...cells].sort((a, b) => a.x - b.x);
-          if (colAnchors.length <= 1) {
-            return ordered.map((c) => c.str);
-          }
-          const rowArr: string[] = new Array(colAnchors.length).fill('');
-          for (const cell of ordered) {
-            let bestCol = 0;
-            let bestDist = Infinity;
-            for (let ci = 0; ci < colAnchors.length; ci++) {
-              const d = Math.abs(cell.x - colAnchors[ci]);
-              if (d < bestDist) {
-                bestDist = d;
-                bestCol = ci;
-              }
-            }
-            rowArr[bestCol] = rowArr[bestCol] ? `${rowArr[bestCol]} ${cell.str}` : cell.str;
-          }
-          // Trim trailing empty cells
-          while (rowArr.length > 1 && !rowArr[rowArr.length - 1]) {
-            rowArr.pop();
-          }
-          return rowArr;
-        });
-
-      const sheetData = sortedRows.length > 0 ? sortedRows : [['No tabular text detected']];
-      const ws = XLSX.utils.aoa_to_sheet(sheetData);
-      const maxCols = Math.max(...sheetData.map((r) => r.length), 1);
-      const colWidths = Array.from({ length: maxCols }, (_, cIdx) => {
-        const longest = sheetData.reduce(
-          (max, r) => Math.max(max, (r[cIdx] || '').length),
-          8
-        );
-        return { wch: Math.min(48, Math.max(12, longest + 3)) };
-      });
-      ws['!cols'] = colWidths;
-      XLSX.utils.book_append_sheet(wb, ws, `Page_${p}`);
+      if (cells.length > 0) {
+        mergedRowCells.push(cells.map((c) => ({ x: c.x, text: c.text })));
+        cells.forEach((c) => allCellX.push(c.x));
+      }
     }
-  } finally {
-    await loadingTask.destroy().catch(() => {});
+
+    // Build column anchors by clustering X positions within 18pt
+    allCellX.sort((a, b) => a - b);
+    const colAnchors: number[] = [];
+    for (const x of allCellX) {
+      if (colAnchors.length === 0 || x - colAnchors[colAnchors.length - 1] > 18) {
+        colAnchors.push(x);
+      }
+    }
+
+    const sheetRows: Array<Array<string | number>> = mergedRowCells.map((rowCells) => {
+      if (colAnchors.length <= 1) {
+        return rowCells.map((c) => parseExcelCellValue(c.text));
+      }
+      const rowArr: Array<string | number> = new Array(colAnchors.length).fill('');
+      for (const cell of rowCells) {
+        let bestCol = 0;
+        let bestDist = Infinity;
+        for (let ci = 0; ci < colAnchors.length; ci++) {
+          const d = Math.abs(cell.x - colAnchors[ci]);
+          if (d < bestDist) {
+            bestDist = d;
+            bestCol = ci;
+          }
+        }
+        const existing = rowArr[bestCol];
+        const combined = existing ? `${existing} ${cell.text}` : cell.text;
+        rowArr[bestCol] = parseExcelCellValue(combined);
+      }
+      while (rowArr.length > 1 && rowArr[rowArr.length - 1] === '') {
+        rowArr.pop();
+      }
+      return rowArr;
+    });
+
+    const sheetData = sheetRows.length > 0 ? sheetRows : [['No tabular text detected']];
+    const ws = XLSX.utils.aoa_to_sheet(sheetData);
+    const maxCols = Math.max(...sheetData.map((r) => r.length), 1);
+    const colWidths = Array.from({ length: maxCols }, (_, cIdx) => {
+      const longest = sheetData.reduce(
+        (max, r) => Math.max(max, String(r[cIdx] ?? '').length),
+        8
+      );
+      return { wch: Math.min(48, Math.max(12, longest + 3)) };
+    });
+    ws['!cols'] = colWidths;
+    XLSX.utils.book_append_sheet(wb, ws, `Page_${page.pageNumber}`.slice(0, 31));
   }
 
   const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer;
@@ -218,12 +427,18 @@ function measureImageDataUrlSize(dataUrl: string): Promise<{ width: number; heig
 }
 
 export async function pdfToPptxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer> {
-  const { previewImages } = await pdfToImagesZip(pdfBytes, 'image/jpeg');
+  const { previewImages } = await pdfToImagesZip(pdfBytes, 'image/jpeg', 2);
   const dimsList = await Promise.all(previewImages.map((url) => measureImageDataUrlSize(url)));
   const zip = new JSZip();
 
-  const slideW = 9144000;
-  const slideH = 6858000;
+  // Match PowerPoint slide size to first PDF page aspect ratio so slides fill crisply without letterbox bars
+  const firstDim = dimsList[0] || { width: 1200, height: 900 };
+  const isFirstLandscape = firstDim.width >= firstDim.height;
+  const slideW = isFirstLandscape ? 12192000 : 6858000;
+  const slideH = Math.max(
+    4572000,
+    Math.min(13716000, Math.round((firstDim.height / Math.max(1, firstDim.width)) * slideW))
+  );
 
   zip.file(
     '[Content_Types].xml',
@@ -257,7 +472,7 @@ export async function pdfToPptxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer
   <p:sldIdLst>
     ${previewImages.map((_, i) => `<p:sldId id="${256 + i}" r:id="rId${i + 1}"/>`).join('\n    ')}
   </p:sldIdLst>
-  <p:sldSz cx="${slideW}" cy="${slideH}" type="screen4x3"/>
+  <p:sldSz cx="${slideW}" cy="${slideH}" type="custom"/>
   <p:notesSz cx="${slideH}" cy="${slideW}"/>
 </p:presentation>`
   );
@@ -279,7 +494,7 @@ export async function pdfToPptxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer
     const idx = i + 1;
     const b64 = imgDataUrl.split(',')[1];
     const { width, height } = dimsList[i] || { width: 1200, height: 900 };
-    const ratio = Math.min(slideW / width, slideH / height);
+    const ratio = Math.min(slideW / Math.max(1, width), slideH / Math.max(1, height));
     const drawCx = Math.max(1, Math.round(width * ratio));
     const drawCy = Math.max(1, Math.round(height * ratio));
     const offX = Math.max(0, Math.round((slideW - drawCx) / 2));
@@ -377,6 +592,13 @@ export async function xlsxFileToPdf(file: File): Promise<ArrayBuffer> {
   });
 }
 
+function escapeHtmlText(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 export async function pptxFileToPdf(file: File): Promise<ArrayBuffer> {
   const buf = await file.arrayBuffer();
   const zip = await JSZip.loadAsync(buf);
@@ -393,12 +615,33 @@ export async function pptxFileToPdf(file: File): Promise<ArrayBuffer> {
     const xml = await zip.files[sf].async('string');
     const parser = new DOMParser();
     const doc = parser.parseFromString(xml, 'application/xml');
-    const texts = Array.from(doc.getElementsByTagName('a:t')).map((n) => n.textContent || '');
+    // Group DrawingML text runs (<a:t>) by paragraph (<a:p>) so styled inline words remain on one line
+    const pNodes = Array.from(doc.getElementsByTagNameNS('*', 'p'));
+    const paragraphs = pNodes
+      .map((pEl) =>
+        Array.from(pEl.getElementsByTagNameNS('*', 't'))
+          .map((tEl) => tEl.textContent || '')
+          .join('')
+          .replace(/\s+/g, ' ')
+          .trim()
+      )
+      .filter(Boolean);
+
+    const bodyHtml = paragraphs.length
+      ? paragraphs
+          .map((para, idx) =>
+            idx === 0
+              ? `<h2>${escapeHtmlText(para)}</h2>`
+              : `<p style="font-size:13.5px;line-height:1.55;">${escapeHtmlText(para)}</p>`
+          )
+          .join('')
+      : '<p>(Slide with graphic content)</p>';
+
     sections.push(
-      `<div style="padding:18px;border:1px solid #cbd5e1;border-radius:8px;margin-bottom:18px;page-break-after:always;">
-        <div style="font-size:11px;color:#64748b;margin-bottom:8px;">Slide ${sections.length + 1}</div>
-        <p style="font-size:15px;line-height:1.6;">${texts.join('</p><p style="font-size:14px;line-height:1.6;">') || '(Slide with graphic content)'}</p>
-      </div>`
+      `<div>
+        <div style="font-size:11px;color:#64748b;margin-bottom:8px;">Slide ${sections.length + 1} of ${slideFiles.length}</div>
+        ${bodyHtml}
+      </div>${sections.length + 1 < slideFiles.length ? '<hr class="pdf-page-break"/>' : ''}`
     );
   }
   return htmlDocumentToPdf(sections.join('') || '<p>No slides found</p>', {
@@ -419,9 +662,29 @@ export async function pptxFileToPdf(file: File): Promise<ArrayBuffer> {
   });
 }
 
+function inferFontFamilyFromStyle(styleStr: string): 'sans' | 'serif' | 'mono' {
+  const s = styleStr.toLowerCase();
+  if (s.includes('courier') || s.includes('mono') || s.includes('consolas')) return 'mono';
+  if (s.includes('times') || s.includes('cambria') || s.includes('georgia') || s.includes('garamond') || s.includes('serif')) {
+    return 'serif';
+  }
+  return 'sans';
+}
+
+function normalizeCssColorToHex(raw: string): string | undefined {
+  const c = raw.trim();
+  if (/^#[0-9a-f]{3,6}$/i.test(c)) return c;
+  const m = c.match(/^rgb\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*\)$/i);
+  if (m) {
+    const toHex = (n: string) => Math.max(0, Math.min(255, Number(n))).toString(16).padStart(2, '0');
+    return `#${toHex(m[1])}${toHex(m[2])}${toHex(m[3])}`;
+  }
+  return undefined;
+}
+
 /**
- * Renders rich HTML (English + Bengali Unicode, tables, lists, images, borders, headers, footers)
- * into clean paginated multi-page PDF bytes with exact paper size, orientation, and genuine editable vector PDF text.
+ * Renders rich HTML (English + Bengali Unicode, tables with dynamic wrapped rows, ordered/unordered lists,
+ * font families, colors, images, borders, headers, footers) into clean paginated multi-page PDF bytes.
  */
 export async function htmlDocumentToPdf(
   htmlContent: string,
@@ -448,7 +711,6 @@ export async function htmlDocumentToPdf(
   const contentW = Math.max(100, pageWidthPt - mLeftPt - mRightPt);
   const contentH = Math.max(100, pageHeightPt - mTopPt - mBotPt);
 
-  // Parse HTML into structured blocks
   const parser = new DOMParser();
   const parsed = parser.parseFromString(`<div>${htmlContent}</div>`, 'text/html');
   const rootEl = parsed.body.firstElementChild || parsed.body;
@@ -457,8 +719,10 @@ export async function htmlDocumentToPdf(
     kind: 'heading' | 'paragraph' | 'list-item' | 'table' | 'image' | 'page-break';
     text?: string;
     fontSize?: number;
+    fontTone?: 'sans' | 'serif' | 'mono';
     bold?: boolean;
     italic?: boolean;
+    underline?: boolean;
     color?: string;
     align?: 'left' | 'center' | 'right';
     rows?: string[][];
@@ -466,6 +730,19 @@ export async function htmlDocumentToPdf(
   }
 
   const blocks: RenderBlock[] = [];
+  const extractMetaFromEl = (node: Element) => {
+    const styleAttr = node.getAttribute('style') || '';
+    const alignMatch = styleAttr.match(/text-align:\s*(left|center|right)/i);
+    const fontMatch = styleAttr.match(/font-family:\s*([^;]+)/i);
+    const colorMatch = styleAttr.match(/(?:^|;)\s*color:\s*([^;]+)/i);
+    const attrColor = node.getAttribute('color');
+    return {
+      align: (alignMatch?.[1]?.toLowerCase() as 'left' | 'center' | 'right') || 'left',
+      fontTone: inferFontFamilyFromStyle(fontMatch?.[1] || styleAttr),
+      color: normalizeCssColorToHex(colorMatch?.[1] || attrColor || ''),
+    };
+  };
+
   const walkChildNodes = (parent: Node) => {
     parent.childNodes.forEach((child) => {
       if (child.nodeType === Node.TEXT_NODE) {
@@ -494,31 +771,52 @@ export async function htmlDocumentToPdf(
       const rows: string[][] = [];
       node.querySelectorAll('tr').forEach((tr) => {
         const cols: string[] = [];
-        tr.querySelectorAll('th,td').forEach((cell) => cols.push((cell.textContent || '').trim()));
+        tr.querySelectorAll('th,td').forEach((cell) =>
+          cols.push((cell.textContent || '').replace(/\s+/g, ' ').trim())
+        );
         if (cols.length) rows.push(cols);
       });
       if (rows.length) blocks.push({ kind: 'table', rows });
       return;
     }
+    if (tag === 'ul' || tag === 'ol') {
+      const items = Array.from(node.children).filter((c) => c.tagName.toLowerCase() === 'li');
+      items.forEach((li, idx) => {
+        const txt = (li.textContent || '').replace(/\s+/g, ' ').trim();
+        if (!txt) return;
+        const prefix = tag === 'ol' ? `${idx + 1}. ` : '• ';
+        const meta = extractMetaFromEl(li);
+        blocks.push({
+          kind: 'list-item',
+          text: `${prefix}${txt}`,
+          fontSize: 11.5,
+          fontTone: meta.fontTone,
+          color: meta.color,
+          bold: Boolean(li.querySelector('b,strong')),
+          italic: Boolean(li.querySelector('i,em')),
+        });
+      });
+      return;
+    }
+    if (tag === 'li') {
+      const txt = (node.textContent || '').replace(/\s+/g, ' ').trim();
+      if (txt) blocks.push({ kind: 'list-item', text: `• ${txt}`, fontSize: 11.5 });
+      return;
+    }
     if (tag === 'h1' || tag === 'h2' || tag === 'h3') {
-      const txt = (node.textContent || '').trim();
+      const txt = (node.textContent || '').replace(/\s+/g, ' ').trim();
       if (txt) {
-        const styleAttr = node.getAttribute('style') || '';
-        const alignMatch = styleAttr.match(/text-align:\s*(left|center|right)/i);
+        const meta = extractMetaFromEl(node);
         blocks.push({
           kind: 'heading',
           text: txt,
           fontSize: tag === 'h1' ? 20 : tag === 'h2' ? 15.5 : 13.5,
+          fontTone: meta.fontTone,
           bold: true,
-          color: '#142B4A',
-          align: (alignMatch?.[1]?.toLowerCase() as 'left' | 'center' | 'right') || 'left',
+          color: meta.color || '#142B4A',
+          align: meta.align,
         });
       }
-      return;
-    }
-    if (tag === 'li') {
-      const txt = (node.textContent || '').trim();
-      if (txt) blocks.push({ kind: 'list-item', text: `- ${txt}`, fontSize: 11.5 });
       return;
     }
     if (tag === 'p' || tag === 'div' || tag === 'blockquote') {
@@ -534,36 +832,42 @@ export async function htmlDocumentToPdf(
           .split(/<br\s*\/?>/i)
           .map((frag) => {
             const tmp = parser.parseFromString(`<span>${frag}</span>`, 'text/html');
-            return (tmp.body.textContent || '').trim();
+            return (tmp.body.textContent || '').replace(/\s+/g, ' ').trim();
           })
           .filter(Boolean);
-        const styleAttr = node.getAttribute('style') || '';
-        const alignMatch = styleAttr.match(/text-align:\s*(left|center|right)/i);
-        const align = (alignMatch?.[1]?.toLowerCase() as 'left' | 'center' | 'right') || 'left';
+        const meta = extractMetaFromEl(node);
         const bold = Boolean(node.querySelector('b,strong'));
         const italic = Boolean(node.querySelector('i,em'));
+        const underline = Boolean(node.querySelector('u'));
         for (const txt of lines) {
           blocks.push({
             kind: 'paragraph',
             text: txt,
             fontSize: 11.5,
+            fontTone: meta.fontTone,
+            color: meta.color,
             bold,
             italic,
-            align,
+            underline,
+            align: meta.align,
           });
         }
       }
       return;
     }
     if (['span', 'b', 'strong', 'i', 'em', 'u', 'a', 'font', 'sub', 'sup'].includes(tag)) {
-      const txt = (node.textContent || '').trim();
+      const txt = (node.textContent || '').replace(/\s+/g, ' ').trim();
       if (txt) {
+        const meta = extractMetaFromEl(node);
         blocks.push({
           kind: 'paragraph',
           text: txt,
           fontSize: 11.5,
+          fontTone: meta.fontTone,
+          color: meta.color,
           bold: tag === 'b' || tag === 'strong' || Boolean(node.querySelector('b,strong')),
           italic: tag === 'i' || tag === 'em' || Boolean(node.querySelector('i,em')),
+          underline: tag === 'u' || Boolean(node.querySelector('u')),
         });
       }
       return;
@@ -577,16 +881,37 @@ export async function htmlDocumentToPdf(
   }
 
   const pdfDoc = await PDFDocument.create();
-  const fontReg = await pdfDoc.embedFont(StandardFonts.Helvetica);
-  const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
-  const fontItalic = await pdfDoc.embedFont(StandardFonts.HelveticaOblique);
-  const fontBoldItalic = await pdfDoc.embedFont(StandardFonts.HelveticaBoldOblique);
+  const fonts = {
+    sans: {
+      reg: await pdfDoc.embedFont(StandardFonts.Helvetica),
+      bold: await pdfDoc.embedFont(StandardFonts.HelveticaBold),
+      italic: await pdfDoc.embedFont(StandardFonts.HelveticaOblique),
+      boldItalic: await pdfDoc.embedFont(StandardFonts.HelveticaBoldOblique),
+    },
+    serif: {
+      reg: await pdfDoc.embedFont(StandardFonts.TimesRoman),
+      bold: await pdfDoc.embedFont(StandardFonts.TimesRomanBold),
+      italic: await pdfDoc.embedFont(StandardFonts.TimesRomanItalic),
+      boldItalic: await pdfDoc.embedFont(StandardFonts.TimesRomanBoldItalic),
+    },
+    mono: {
+      reg: await pdfDoc.embedFont(StandardFonts.Courier),
+      bold: await pdfDoc.embedFont(StandardFonts.CourierBold),
+      italic: await pdfDoc.embedFont(StandardFonts.CourierOblique),
+      boldItalic: await pdfDoc.embedFont(StandardFonts.CourierBoldOblique),
+    },
+  };
 
-  const pickFont = (bold?: boolean, italic?: boolean): PDFFont => {
-    if (bold && italic) return fontBoldItalic;
-    if (bold) return fontBold;
-    if (italic) return fontItalic;
-    return fontReg;
+  const pickFont = (
+    tone: 'sans' | 'serif' | 'mono' = 'sans',
+    bold?: boolean,
+    italic?: boolean
+  ): PDFFont => {
+    const f = fonts[tone];
+    if (bold && italic) return f.boldItalic;
+    if (bold) return f.bold;
+    if (italic) return f.italic;
+    return f.reg;
   };
 
   const isWinAnsiSafe = (font: PDFFont, text: string): boolean => {
@@ -602,12 +927,72 @@ export async function htmlDocumentToPdf(
   const measureCanvas = document.createElement('canvas');
   const mCtx = measureCanvas.getContext('2d')!;
 
-  const measureWidth = (text: string, font: PDFFont, fontSize: number, bold?: boolean, italic?: boolean) => {
+  const measureWidth = (
+    text: string,
+    font: PDFFont,
+    fontSize: number,
+    tone: 'sans' | 'serif' | 'mono',
+    bold?: boolean,
+    italic?: boolean
+  ) => {
     if (isWinAnsiSafe(font, text)) {
       return font.widthOfTextAtSize(text, fontSize);
     }
-    mCtx.font = `${italic ? 'italic ' : ''}${bold ? '700 ' : '400 '}${fontSize}px 'DM Sans', 'Noto Sans Bengali', sans-serif`;
+    const familyCss =
+      tone === 'serif'
+        ? "'Times New Roman', Georgia, 'Noto Sans Bengali', serif"
+        : tone === 'mono'
+        ? "'Courier New', monospace"
+        : "'DM Sans', Arial, 'Noto Sans Bengali', sans-serif";
+    mCtx.font = `${italic ? 'italic ' : ''}${bold ? '700 ' : '400 '}${fontSize}px ${familyCss}`;
     return mCtx.measureText(text).width;
+  };
+
+  const wrapWordsToWidth = (
+    text: string,
+    maxW: number,
+    font: PDFFont,
+    fontSize: number,
+    tone: 'sans' | 'serif' | 'mono',
+    bold?: boolean,
+    italic?: boolean
+  ): string[] => {
+    const out: string[] = [];
+    const words = text.split(/\s+/).filter(Boolean);
+    let cur = '';
+
+    const pushTokenChars = (tok: string) => {
+      let chunk = '';
+      for (const ch of tok) {
+        const test = chunk + ch;
+        if (measureWidth(test, font, fontSize, tone, bold, italic) > maxW && chunk) {
+          out.push(chunk);
+          chunk = ch;
+        } else {
+          chunk = test;
+        }
+      }
+      cur = chunk;
+    };
+
+    for (const w of words) {
+      const test = cur ? `${cur} ${w}` : w;
+      if (measureWidth(test, font, fontSize, tone, bold, italic) > maxW) {
+        if (cur) {
+          out.push(cur);
+          cur = '';
+        }
+        if (measureWidth(w, font, fontSize, tone, bold, italic) > maxW) {
+          pushTokenChars(w);
+        } else {
+          cur = w;
+        }
+      } else {
+        cur = test;
+      }
+    }
+    if (cur) out.push(cur);
+    return out.length ? out : [''];
   };
 
   const createdPages: ReturnType<typeof pdfDoc.addPage>[] = [];
@@ -632,7 +1017,7 @@ export async function htmlDocumentToPdf(
   };
 
   let currentPage = addNewPage();
-  let cursorTopOffset = mTopPt; // distance from top of page
+  let cursorTopOffset = mTopPt;
 
   const ensureSpace = (neededH: number) => {
     if (cursorTopOffset + neededH > mTopPt + contentH) {
@@ -685,11 +1070,22 @@ export async function htmlDocumentToPdf(
     if (blk.kind === 'table' && blk.rows) {
       const colCount = Math.max(...blk.rows.map((r) => r.length));
       const colW = contentW / Math.max(1, colCount);
-      const rowH = 24;
+      const cellFs = 9.5;
+      const cellLineH = 12.5;
+      const innerCellW = Math.max(20, colW - 10);
+
       for (let rIdx = 0; rIdx < blk.rows.length; rIdx++) {
-        ensureSpace(rowH);
         const row = blk.rows[rIdx];
-        const fillHex = rIdx === 0 ? '#EFF6FF' : rIdx % 2 === 0 ? '#F8FAFC' : '#FFFFFF';
+        const isHeader = rIdx === 0;
+        const cellFont = pickFont('sans', isHeader, false);
+        const wrappedCells = row.map((rawCell) =>
+          wrapWordsToWidth(rawCell, innerCellW, cellFont, cellFs, 'sans', isHeader, false)
+        );
+        const maxLines = Math.max(...wrappedCells.map((lines) => lines.length), 1);
+        const rowH = Math.max(22, maxLines * cellLineH + 10);
+        ensureSpace(rowH);
+
+        const fillHex = isHeader ? '#EFF6FF' : rIdx % 2 === 0 ? '#F8FAFC' : '#FFFFFF';
         const rowBottomY = pageHeightPt - cursorTopOffset - rowH;
         currentPage.drawRectangle({
           x: mLeftPt,
@@ -701,36 +1097,54 @@ export async function htmlDocumentToPdf(
           borderWidth: 0.75,
         });
 
-        const cellFont = pickFont(rIdx === 0, false);
         for (let cIdx = 0; cIdx < row.length; cIdx++) {
-          const cellText = row[cIdx].slice(0, 42);
-          const cellX = mLeftPt + cIdx * colW + 6;
-          if (isWinAnsiSafe(cellFont, cellText)) {
-            currentPage.drawText(cellText, {
-              x: cellX,
-              y: rowBottomY + 8,
-              size: 10,
-              font: cellFont,
-              color: hexToRgb('#1E293B'),
+          if (cIdx > 0) {
+            currentPage.drawLine({
+              start: { x: mLeftPt + cIdx * colW, y: rowBottomY },
+              end: { x: mLeftPt + cIdx * colW, y: rowBottomY + rowH },
+              thickness: 0.5,
+              color: hexToRgb('#CBD5E1'),
             });
-          } else if (cellText) {
+          }
+          const cellText = row[cIdx];
+          const cellX = mLeftPt + cIdx * colW + 5;
+          if (!cellText) continue;
+
+          if (isWinAnsiSafe(cellFont, cellText)) {
+            wrappedCells[cIdx].forEach((lineStr, lIdx) => {
+              if (!lineStr) return;
+              const y = rowBottomY + rowH - 5 - cellFs * 0.85 - lIdx * cellLineH;
+              currentPage.drawText(lineStr, {
+                x: cellX,
+                y,
+                size: cellFs,
+                font: cellFont,
+                color: hexToRgb('#1E293B'),
+              });
+            });
+          } else {
             const rendered = await renderUnicodeTextPng({
               text: cellText,
-              fontSize: 10,
+              fontSize: cellFs,
               fontFamily: 'sans',
               color: '#1E293B',
-              bold: rIdx === 0,
+              bold: isHeader,
               italic: false,
               underline: false,
               align: 'left',
-              maxWidth: Math.max(40, colW - 12),
+              maxWidth: innerCellW,
             });
             const img = await pdfDoc.embedPng(rendered.pngBytes);
+            const drawH = Math.min(rowH - 4, rendered.heightPt);
+            const drawW =
+              rendered.heightPt > rowH - 4
+                ? Math.min(innerCellW, rendered.widthPt * (drawH / rendered.heightPt))
+                : Math.min(innerCellW, rendered.widthPt);
             currentPage.drawImage(img, {
-              x: cellX - 2,
-              y: rowBottomY + (rowH - rendered.heightPt) / 2,
-              width: Math.min(colW - 8, rendered.widthPt),
-              height: rendered.heightPt,
+              x: cellX - 1,
+              y: rowBottomY + rowH - 3 - drawH,
+              width: drawW,
+              height: drawH,
             });
           }
         }
@@ -741,24 +1155,23 @@ export async function htmlDocumentToPdf(
     }
 
     const fontSize = blk.fontSize || 11.5;
+    const tone = blk.fontTone || 'sans';
     const lineH = fontSize * 1.48;
-    const font = pickFont(blk.bold, blk.italic);
-    const words = (blk.text || '').split(/\s+/);
-    const lines: string[] = [];
-    let curLine = '';
-
-    for (const w of words) {
-      const test = curLine ? `${curLine} ${w}` : w;
-      if (measureWidth(test, font, fontSize, blk.bold, blk.italic) > contentW && curLine) {
-        lines.push(curLine);
-        curLine = w;
-      } else {
-        curLine = test;
-      }
-    }
-    if (curLine) lines.push(curLine);
+    const font = pickFont(tone, blk.bold, blk.italic);
+    const lines = wrapWordsToWidth(
+      blk.text || '',
+      contentW,
+      font,
+      fontSize,
+      tone,
+      blk.bold,
+      blk.italic
+    );
 
     if (blk.kind === 'heading') cursorTopOffset += 6;
+
+    const unicodeFontFamily: PdfFontFamily =
+      tone === 'serif' ? 'times' : tone === 'mono' ? 'courier' : 'arial';
 
     for (const line of lines) {
       ensureSpace(lineH);
@@ -768,22 +1181,31 @@ export async function htmlDocumentToPdf(
         let x = mLeftPt;
         if (blk.align === 'center') x = mLeftPt + Math.max(0, (contentW - lw) / 2);
         if (blk.align === 'right') x = mLeftPt + Math.max(0, contentW - lw);
+        const baselineY = pageHeightPt - cursorTopOffset - fontSize * 0.9;
         currentPage.drawText(line, {
           x,
-          y: pageHeightPt - cursorTopOffset - fontSize * 0.9,
+          y: baselineY,
           size: fontSize,
           font,
           color: hexToRgb(colorHex),
         });
+        if (blk.underline && lw > 0) {
+          currentPage.drawLine({
+            start: { x, y: baselineY - 2 },
+            end: { x: x + lw, y: baselineY - 2 },
+            thickness: Math.max(0.7, fontSize * 0.06),
+            color: hexToRgb(colorHex),
+          });
+        }
       } else {
         const rendered = await renderUnicodeTextPng({
           text: line,
           fontSize,
-          fontFamily: 'sans',
+          fontFamily: unicodeFontFamily,
           color: colorHex,
           bold: Boolean(blk.bold),
           italic: Boolean(blk.italic),
-          underline: false,
+          underline: Boolean(blk.underline),
           align: blk.align || 'left',
           maxWidth: contentW,
         });
@@ -806,6 +1228,7 @@ export async function htmlDocumentToPdf(
 
   // Draw Header, Footer & Page Numbers
   const totalPages = createdPages.length;
+  const fontReg = fonts.sans.reg;
   for (let i = 0; i < totalPages; i++) {
     const page = createdPages[i];
     const headerStr = settings.headerText.trim();

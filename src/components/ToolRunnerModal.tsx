@@ -6,10 +6,14 @@ import {
   Check,
   Clock,
   Download,
+  Edit3,
+  Eye,
+  EyeOff,
   FolderOpen,
   Lock,
   Plus,
   Search,
+  Share2,
   ShieldCheck,
   Unlock,
   X,
@@ -17,6 +21,7 @@ import {
 import type { AppLanguage, DocumentRecord, PaperSizeKey } from '../types';
 import {
   PAPER_DIMENSIONS,
+  type PageNumberPosition,
   addHeaderFooterToPdf,
   addPageNumbersToPdf,
   addWatermarkToPdf,
@@ -36,6 +41,7 @@ import {
   updatePdfMetadata,
 } from '../services/pdfEngine';
 import {
+  type ImageToPdfFitMode,
   docxFileToPdf,
   htmlDocumentToPdf,
   imagesToPdf,
@@ -44,10 +50,11 @@ import {
   pdfToPptxBytes,
   pdfToXlsxBytes,
   pptxFileToPdf,
+  splitPdfPagesAsZip,
   xlsxFileToPdf,
 } from '../services/conversionService';
 import { formatBytes, formatRelativeTime } from '../services/storageService';
-import { saveBufferToDeviceStorage } from '../services/deviceFileActions';
+import { saveBufferToDeviceStorage, shareBufferNativeOrWeb } from '../services/deviceFileActions';
 import { PdfSourcePicker } from './PdfSourcePicker';
 
 interface ToolRunnerModalProps {
@@ -58,6 +65,7 @@ interface ToolRunnerModalProps {
   onClose: () => void;
   onSaveResultDoc: (newDoc: DocumentRecord) => Promise<void>;
   onUpdateExistingDoc: (updated: DocumentRecord) => Promise<void>;
+  onOpenResultDoc?: (doc: DocumentRecord, target: 'viewer' | 'editor') => void;
 }
 
 const TOOL_TITLES: Record<string, { en: string; bn: string }> = {
@@ -99,6 +107,61 @@ interface MergeSourceItem {
   source: 'recent' | 'device';
 }
 
+function parsePageRanges(input: string, maxPages: number): number[] {
+  const pages: number[] = [];
+  const seen = new Set<number>();
+  input.split(',').forEach((part) => {
+    const trimmed = part.trim();
+    if (!trimmed) return;
+    if (trimmed.includes('-')) {
+      const [s, e] = trimmed.split('-').map((n) => parseInt(n, 10));
+      if (Number.isFinite(s) && Number.isFinite(e)) {
+        const step = s <= e ? 1 : -1;
+        for (let p = s; step > 0 ? p <= e : p >= e; p += step) {
+          if (p >= 1 && p <= maxPages && !seen.has(p)) {
+            seen.add(p);
+            pages.push(p);
+          }
+        }
+      }
+    } else {
+      const n = parseInt(trimmed, 10);
+      if (Number.isFinite(n) && n >= 1 && n <= maxPages && !seen.has(n)) {
+        seen.add(n);
+        pages.push(n);
+      }
+    }
+  });
+  return pages;
+}
+
+function formatPagesListAsRange(pages: number[]): string {
+  const sorted = [...new Set(pages)].sort((a, b) => a - b);
+  if (sorted.length === 0) return '';
+  const ranges: string[] = [];
+  let start = sorted[0];
+  let prev = sorted[0];
+  for (let i = 1; i < sorted.length; i++) {
+    if (sorted[i] === prev + 1) {
+      prev = sorted[i];
+    } else {
+      ranges.push(start === prev ? `${start}` : `${start}-${prev}`);
+      start = sorted[i];
+      prev = sorted[i];
+    }
+  }
+  ranges.push(start === prev ? `${start}` : `${start}-${prev}`);
+  return ranges.join(', ');
+}
+
+function dataUrlToArrayBuffer(dataUrl: string): ArrayBuffer {
+  const b64 = dataUrl.split(',')[1] || '';
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes.buffer;
+}
+
 export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
   toolId,
   language,
@@ -107,6 +170,7 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
   onClose,
   onSaveResultDoc,
   onUpdateExistingDoc,
+  onOpenResultDoc,
 }) => {
   const available = docs.filter((d) => !d.isTrashed && !d.isVaultLocked);
   const recentSorted = [...available].sort(
@@ -134,10 +198,8 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
     return [];
   });
   const [mergeSearch, setMergeSearch] = useState('');
-  const [lastMergedResult, setLastMergedResult] = useState<{
-    bytes: ArrayBuffer;
-    name: string;
-  } | null>(null);
+  const [resultDoc, setResultDoc] = useState<DocumentRecord | null>(null);
+  const [resultZip, setResultZip] = useState<{ bytes: ArrayBuffer; name: string } | null>(null);
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
   const [running, setRunning] = useState(false);
   const [resultMsg, setResultMsg] = useState<string | null>(null);
@@ -145,11 +207,14 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
 
   // Tool parameters
   const [splitRange, setSplitRange] = useState('1');
+  const [splitMode, setSplitMode] = useState<'custom' | 'odd' | 'even' | 'each-zip'>('custom');
   const [compressMode, setCompressMode] = useState<'object-streams' | 'raster-medium' | 'raster-compact' | 'target-size'>('raster-medium');
   const [targetKb, setTargetKb] = useState(500);
   const [exportImgFormat, setExportImgFormat] = useState<'image/png' | 'image/jpeg'>('image/png');
   const [exportDpi, setExportDpi] = useState<150 | 300>(150);
   const [rotateAngle, setRotateAngle] = useState(90);
+  const [rotateScope, setRotateScope] = useState<'all' | 'specific'>('all');
+  const [rotatePagesInput, setRotatePagesInput] = useState('1');
   const [targetPaperSize, setTargetPaperSize] = useState<PaperSizeKey>('A4');
   const [targetOrientation, setTargetOrientation] = useState<'portrait' | 'landscape'>('portrait');
   const [customWidthMm, setCustomWidthMm] = useState(210);
@@ -157,10 +222,21 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
   const [watermarkText, setWatermarkText] = useState('CONFIDENTIAL');
   const [watermarkOpacity, setWatermarkOpacity] = useState(0.25);
   const [watermarkColor, setWatermarkColor] = useState('#2563EB');
-  const [pageNumPos, setPageNumPos] = useState<'bottom-center' | 'bottom-right' | 'top-right'>('bottom-center');
+  const [watermarkFontSize, setWatermarkFontSize] = useState(46);
+  const [watermarkAngle, setWatermarkAngle] = useState(45);
+  const [pageNumPos, setPageNumPos] = useState<PageNumberPosition>('bottom-center');
+  const [pageNumFormat, setPageNumFormat] = useState<'pageOfTotal' | 'slash' | 'number'>('pageOfTotal');
+  const [pageNumStart, setPageNumStart] = useState(1);
+  const [pageNumFontSize, setPageNumFontSize] = useState(10);
+  const [pageNumSkipFirst, setPageNumSkipFirst] = useState(false);
   const [headerTxt, setHeaderTxt] = useState('');
   const [footerTxt, setFooterTxt] = useState('PDF MASTER Document');
+  const [headerFooterAlign, setHeaderFooterAlign] = useState<'left' | 'center' | 'right'>('left');
+  const [headerFooterFontSize, setHeaderFooterFontSize] = useState(9.5);
+  const [headerFooterColor, setHeaderFooterColor] = useState('#475569');
+  const [imageFitMode, setImageFitMode] = useState<ImageToPdfFitMode>('a4-fit');
   const [passwordInput, setPasswordInput] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
   const [metaTitle, setMetaTitle] = useState('');
   const [metaAuthor, setMetaAuthor] = useState('');
   const [metaSubject, setMetaSubject] = useState('');
@@ -248,16 +324,26 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
     });
   };
 
+  const moveUploadedFile = (idx: number, dir: -1 | 1) => {
+    const target = idx + dir;
+    if (target < 0 || target >= uploadedFiles.length) return;
+    setUploadedFiles((prev) => {
+      const next = [...prev];
+      [next[idx], next[target]] = [next[target], next[idx]];
+      return next;
+    });
+  };
+
   const saveNewPdf = async (
     bytes: ArrayBuffer,
     name: string,
     origin: DocumentRecord['origin'],
     note: string
-  ) => {
+  ): Promise<DocumentRecord> => {
     const info = await getPdfDocumentInfo(bytes).catch(() => ({ pageCount: 1 }));
     const thumb = await renderPageThumbnail(bytes, 1, 200).catch(() => undefined);
     const now = Date.now();
-    await onSaveResultDoc({
+    const record: DocumentRecord = {
       id: `doc_${now}_${Math.random().toString(36).slice(2, 6)}`,
       name,
       origin,
@@ -281,14 +367,18 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           pdfBytes: cloneBuffer(bytes),
         },
       ],
-    });
+    };
+    await onSaveResultDoc(record);
+    setResultDoc(record);
+    return record;
   };
 
   const handleRun = async () => {
     setRunning(true);
     setErrorMsg(null);
     setResultMsg(null);
-    setLastMergedResult(null);
+    setResultDoc(null);
+    setResultZip(null);
     setPreviewUrls([]);
 
     try {
@@ -304,7 +394,6 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         const merged = await mergePdfs(buffers);
         const outName = `Merged_${Date.now().toString().slice(-4)}.pdf`;
         await saveNewPdf(merged, outName, 'edited', `Merged ${buffers.length} PDFs`);
-        setLastMergedResult({ bytes: merged, name: outName });
         const totalPages = mergeQueue.reduce((acc, m) => acc + m.pageCount, 0);
         setResultMsg(
           language === 'bn'
@@ -312,41 +401,53 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
             : `Merged ${buffers.length} PDFs (${totalPages} pages) successfully (${formatBytes(merged.byteLength)}).`
         );
       } else if (toolId === 'split') {
-        if (!primaryDoc) throw new Error('Select a PDF to split.');
-        const pagesToKeep: number[] = [];
-        const seen = new Set<number>();
-        splitRange.split(',').forEach((part) => {
-          const trimmed = part.trim();
-          if (!trimmed) return;
-          if (trimmed.includes('-')) {
-            const [s, e] = trimmed.split('-').map((n) => parseInt(n, 10));
-            if (Number.isFinite(s) && Number.isFinite(e)) {
-              for (let p = Math.min(s, e); p <= Math.max(s, e); p++) {
-                if (p >= 1 && p <= primaryDoc.pageCount && !seen.has(p)) {
-                  seen.add(p);
-                  pagesToKeep.push(p);
-                }
-              }
-            }
-          } else {
-            const n = parseInt(trimmed, 10);
-            if (Number.isFinite(n) && n >= 1 && n <= primaryDoc.pageCount && !seen.has(n)) {
-              seen.add(n);
-              pagesToKeep.push(n);
-            }
-          }
-        });
-        if (!pagesToKeep.length) {
-          throw new Error(`Enter valid page numbers between 1 and ${primaryDoc.pageCount}.`);
+        if (!primaryDoc) {
+          throw new Error(language === 'bn' ? 'স্প্লিট করতে একটি পিডিএফ বাছুন।' : 'Select a PDF to split.');
         }
-        const splitBytes = await splitPdfByRanges(primaryDoc.pdfBytes, pagesToKeep);
-        await saveNewPdf(
-          splitBytes,
-          primaryDoc.name.replace(/\.pdf$/i, `_pages_${splitRange.replace(/\s+/g, '')}.pdf`),
-          'edited',
-          `Split pages: ${splitRange}`
-        );
-        setResultMsg(`Created split PDF with ${pagesToKeep.length} page(s).`);
+        if (splitMode === 'each-zip') {
+          const allPages = Array.from({ length: primaryDoc.pageCount }, (_, i) => i + 1);
+          const zipBytes = await splitPdfPagesAsZip(primaryDoc.pdfBytes, allPages, primaryDoc.name);
+          const zipName = primaryDoc.name.replace(/\.pdf$/i, '_split_pages.zip');
+          await saveBufferToDeviceStorage(zipBytes, zipName, 'application/zip');
+          setResultZip({ bytes: zipBytes, name: zipName });
+          setResultMsg(
+            language === 'bn'
+              ? `${primaryDoc.pageCount}টি আলাদা পিডিএফ পৃষ্ঠা ZIP হিসেবে তৈরি ও সেভ হয়েছে।`
+              : `Split all ${primaryDoc.pageCount} page(s) into individual PDFs inside ${zipName}.`
+          );
+        } else {
+          const pagesToKeep =
+            splitMode === 'odd'
+              ? Array.from({ length: primaryDoc.pageCount }, (_, i) => i + 1).filter((p) => p % 2 === 1)
+              : splitMode === 'even'
+              ? Array.from({ length: primaryDoc.pageCount }, (_, i) => i + 1).filter((p) => p % 2 === 0)
+              : parsePageRanges(splitRange, primaryDoc.pageCount);
+          if (!pagesToKeep.length) {
+            throw new Error(
+              language === 'bn'
+                ? `1 থেকে ${primaryDoc.pageCount} এর মধ্যে সঠিক পৃষ্ঠা নম্বর লিখুন।`
+                : `Enter valid page numbers between 1 and ${primaryDoc.pageCount}.`
+            );
+          }
+          const splitBytes = await splitPdfByRanges(primaryDoc.pdfBytes, pagesToKeep);
+          const suffix =
+            splitMode === 'odd'
+              ? '_odd_pages.pdf'
+              : splitMode === 'even'
+              ? '_even_pages.pdf'
+              : `_pages_${splitRange.replace(/\s+/g, '')}.pdf`;
+          await saveNewPdf(
+            splitBytes,
+            primaryDoc.name.replace(/\.pdf$/i, suffix),
+            'edited',
+            `Split ${pagesToKeep.length} page(s)`
+          );
+          setResultMsg(
+            language === 'bn'
+              ? `${pagesToKeep.length}টি পৃষ্ঠা আলাদা করে নতুন পিডিএফ সেভ হয়েছে।`
+              : `Created split PDF with ${pagesToKeep.length} page(s).`
+          );
+        }
       } else if (toolId === 'compress') {
         if (!primaryDoc) {
           throw new Error(language === 'bn' ? 'কমপ্রেস করতে একটি পিডিএফ বাছুন।' : 'Select a PDF to compress.');
@@ -381,10 +482,34 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           );
         }
       } else if (toolId === 'rotate') {
-        if (!primaryDoc) throw new Error('Select a PDF to rotate.');
-        const out = await rotateAllPages(primaryDoc.pdfBytes, rotateAngle);
-        await saveNewPdf(out, primaryDoc.name.replace(/\.pdf$/i, `_rot${rotateAngle}.pdf`), 'edited', `Rotated ${rotateAngle}°`);
-        setResultMsg(`Saved rotated PDF (${rotateAngle}°).`);
+        if (!primaryDoc) {
+          throw new Error(language === 'bn' ? 'ঘোরাতে একটি পিডিএফ বাছুন।' : 'Select a PDF to rotate.');
+        }
+        const targetPages =
+          rotateScope === 'specific'
+            ? parsePageRanges(rotatePagesInput, primaryDoc.pageCount)
+            : undefined;
+        if (rotateScope === 'specific' && (!targetPages || targetPages.length === 0)) {
+          throw new Error(
+            language === 'bn'
+              ? `1 থেকে ${primaryDoc.pageCount} এর মধ্যে সঠিক পৃষ্ঠা নম্বর লিখুন।`
+              : `Enter valid page numbers between 1 and ${primaryDoc.pageCount}.`
+          );
+        }
+        const out = await rotateAllPages(primaryDoc.pdfBytes, rotateAngle, targetPages);
+        await saveNewPdf(
+          out,
+          primaryDoc.name.replace(/\.pdf$/i, `_rot${rotateAngle}.pdf`),
+          'edited',
+          targetPages
+            ? `Rotated ${targetPages.length} page(s) by ${rotateAngle}°`
+            : `Rotated all pages ${rotateAngle}°`
+        );
+        setResultMsg(
+          language === 'bn'
+            ? `${targetPages ? `${targetPages.length}টি পৃষ্ঠা` : 'সব পৃষ্ঠা'} ${rotateAngle}° ঘোরানো ও সেভ হয়েছে।`
+            : `Saved rotated PDF (${rotateAngle}°${targetPages ? `, ${targetPages.length} page(s)` : ''}).`
+        );
       } else if (toolId === 'pageSetup') {
         if (!primaryDoc) throw new Error('Select a PDF to resize.');
         const out = await resizePdfPages(
@@ -406,22 +531,42 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         const out = await addWatermarkToPdf(primaryDoc.pdfBytes, {
           text: watermarkText,
           opacity: watermarkOpacity,
-          fontSize: 46,
+          fontSize: watermarkFontSize,
           color: watermarkColor,
-          angle: 42,
+          angle: watermarkAngle,
         });
         await saveNewPdf(out, primaryDoc.name.replace(/\.pdf$/i, '_watermarked.pdf'), 'edited', 'Added watermark');
-        setResultMsg('Watermark applied and saved as new PDF.');
+        setResultMsg(
+          language === 'bn'
+            ? 'ওয়াটারমার্ক যোগ করে নতুন পিডিএফ সেভ হয়েছে।'
+            : 'Watermark applied and saved as new PDF.'
+        );
       } else if (toolId === 'pageNumbers') {
         if (!primaryDoc) throw new Error('Select a PDF.');
-        const out = await addPageNumbersToPdf(primaryDoc.pdfBytes, pageNumPos, 'pageOfTotal');
+        const out = await addPageNumbersToPdf(primaryDoc.pdfBytes, pageNumPos, pageNumFormat, {
+          startNumber: pageNumStart,
+          skipFirstPage: pageNumSkipFirst,
+          fontSize: pageNumFontSize,
+        });
         await saveNewPdf(out, primaryDoc.name.replace(/\.pdf$/i, '_numbered.pdf'), 'edited', 'Added page numbers');
-        setResultMsg('Page numbers added.');
+        setResultMsg(
+          language === 'bn'
+            ? 'পৃষ্ঠা নম্বর সফলভাবে যোগ ও সেভ হয়েছে।'
+            : 'Page numbers added and saved.'
+        );
       } else if (toolId === 'headerFooter') {
         if (!primaryDoc) throw new Error('Select a PDF.');
-        const out = await addHeaderFooterToPdf(primaryDoc.pdfBytes, headerTxt, footerTxt);
+        const out = await addHeaderFooterToPdf(primaryDoc.pdfBytes, headerTxt, footerTxt, {
+          align: headerFooterAlign,
+          fontSize: headerFooterFontSize,
+          color: headerFooterColor,
+        });
         await saveNewPdf(out, primaryDoc.name.replace(/\.pdf$/i, '_headers.pdf'), 'edited', 'Added header/footer');
-        setResultMsg('Header and footer applied.');
+        setResultMsg(
+          language === 'bn'
+            ? 'হেডার ও ফুটার সফলভাবে যোগ ও সেভ হয়েছে।'
+            : 'Header and footer applied and saved.'
+        );
       } else if (toolId === 'protectVault') {
         if (!primaryDoc) throw new Error('Select a PDF.');
         if (passwordInput.length < 4) throw new Error('Enter a password (min 4 characters).');
@@ -470,10 +615,12 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           exportImgFormat,
           renderScale
         );
+        const zipName = primaryDoc.name.replace(/\.pdf$/i, '_pages.zip');
         setPreviewUrls(previewImages);
+        setResultZip({ bytes: zipBuffer, name: zipName });
         await saveBufferToDeviceStorage(
           zipBuffer,
-          primaryDoc.name.replace(/\.pdf$/i, '_pages.zip'),
+          zipName,
           'application/zip'
         );
         const fmtLabel = exportImgFormat === 'image/jpeg' ? 'JPG' : 'PNG';
@@ -522,7 +669,7 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         setResultMsg('PDF structure & cross-reference table rebuilt cleanly.');
       } else if (toolId === 'imagesToPdf') {
         if (uploadedFiles.length > 0) {
-          const pdfBytes = await imagesToPdf(uploadedFiles);
+          const pdfBytes = await imagesToPdf(uploadedFiles, { fitMode: imageFitMode });
           await saveNewPdf(pdfBytes, `Images_${Date.now().toString().slice(-4)}.pdf`, 'converted', 'Converted from images');
           setResultMsg(`Converted ${uploadedFiles.length} image(s) into a PDF.`);
         } else if (recentExternalDocId) {
@@ -535,7 +682,7 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
             const blob = await fetch(url).then((r) => r.blob());
             imgFiles.push(new File([blob], `page_${p}.jpg`, { type: 'image/jpeg' }));
           }
-          const pdfBytes = await imagesToPdf(imgFiles);
+          const pdfBytes = await imagesToPdf(imgFiles, { fitMode: imageFitMode });
           await saveNewPdf(
             pdfBytes,
             rDoc.name.replace(/\.pdf$/i, '_images.pdf'),
@@ -656,7 +803,7 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
             const thumb = await renderPageThumbnail(pdfBytes, 1, 200).catch(() => undefined);
             const info = await getPdfDocumentInfo(pdfBytes).catch(() => ({ pageCount: 1 }));
             const now = Date.now();
-            await onSaveResultDoc({
+            const record: DocumentRecord = {
               id: `doc_${now}`,
               name: file.name.replace(/\.docx?$/i, '.pdf'),
               origin: 'converted',
@@ -681,7 +828,9 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                   pdfBytes: cloneBuffer(pdfBytes),
                 },
               ],
-            });
+            };
+            await onSaveResultDoc(record);
+            setResultDoc(record);
             setResultMsg('Converted Word document to PDF and saved to Vault.');
           }
         }
@@ -769,7 +918,7 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
               </label>
 
               {uploadedFiles.length > 0 && (
-                <div className="space-y-1.5 max-h-36 overflow-y-auto">
+                <div className="space-y-1.5 max-h-40 overflow-y-auto">
                   {uploadedFiles.map((f, idx) => (
                     <div
                       key={`${f.name}_${idx}`}
@@ -778,17 +927,72 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                       <span className="truncate font-medium">
                         {idx + 1}. {f.name} ({formatBytes(f.size)})
                       </span>
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setUploadedFiles((prev) => prev.filter((_, i) => i !== idx))
-                        }
-                        className="p-1 rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/50"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
+                      <div className="flex items-center gap-1 shrink-0">
+                        {toolId === 'imagesToPdf' && uploadedFiles.length > 1 && (
+                          <>
+                            <button
+                              type="button"
+                              disabled={idx === 0}
+                              onClick={() => moveUploadedFile(idx, -1)}
+                              aria-label="Move image up"
+                              className="p-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-30"
+                            >
+                              <ArrowUp className="w-3 h-3" />
+                            </button>
+                            <button
+                              type="button"
+                              disabled={idx === uploadedFiles.length - 1}
+                              onClick={() => moveUploadedFile(idx, 1)}
+                              aria-label="Move image down"
+                              className="p-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 disabled:opacity-30"
+                            >
+                              <ArrowDown className="w-3 h-3" />
+                            </button>
+                          </>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setUploadedFiles((prev) => prev.filter((_, i) => i !== idx))
+                          }
+                          aria-label="Remove file"
+                          className="p-1 rounded-lg text-rose-500 hover:bg-rose-50 dark:hover:bg-rose-950/50"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
                     </div>
                   ))}
+                </div>
+              )}
+
+              {toolId === 'imagesToPdf' && (
+                <div className="space-y-1.5 pt-1">
+                  <label className="block text-[11px] font-bold text-slate-600 dark:text-slate-300">
+                    {language === 'bn' ? 'পেজ ফিট ও লেআউট' : 'Page Fit & Layout'}
+                  </label>
+                  <div className="grid grid-cols-3 gap-1.5 text-xs">
+                    {(
+                      [
+                        { id: 'a4-fit', label: language === 'bn' ? 'A4 মার্জিনসহ' : 'A4 Fit (Margin)' },
+                        { id: 'a4-fill', label: language === 'bn' ? 'A4 ফুল পেজ' : 'A4 Fill Page' },
+                        { id: 'auto', label: language === 'bn' ? 'ছবির মাপ' : 'Match Image' },
+                      ] as const
+                    ).map((opt) => (
+                      <button
+                        key={opt.id}
+                        type="button"
+                        onClick={() => setImageFitMode(opt.id)}
+                        className={`min-h-[38px] px-2 rounded-xl font-semibold border ${
+                          imageFitMode === opt.id
+                            ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                            : 'border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-300'
+                        }`}
+                      >
+                        {opt.label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
 
@@ -1117,29 +1321,103 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
 
           {/* Tool-specific controls */}
           {toolId === 'split' && (
-            <div>
-              <div className="flex items-center justify-between gap-2 mb-1">
-                <label className="block text-xs font-semibold text-slate-500">
-                  {language === 'bn'
-                    ? `আলাদা করার পৃষ্ঠা নম্বর (যেমন 1-2, 4${primaryDoc ? ` · সর্বোচ্চ ${primaryDoc.pageCount}` : ''})`
-                    : `Pages to Extract (e.g. 1-2, 4${primaryDoc ? ` · max ${primaryDoc.pageCount}` : ''})`}
-                </label>
-                {primaryDoc && (
+            <div className="space-y-2.5 text-xs">
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                {(
+                  [
+                    { id: 'custom', label: language === 'bn' ? 'কাস্টম রেঞ্জ' : 'Custom Range' },
+                    { id: 'odd', label: language === 'bn' ? 'বিজোড় পৃষ্ঠা' : 'Odd Pages' },
+                    { id: 'even', label: language === 'bn' ? 'জোড় পৃষ্ঠা' : 'Even Pages' },
+                    { id: 'each-zip', label: language === 'bn' ? 'প্রতি পৃষ্ঠা ZIP' : 'Each Page ZIP' },
+                  ] as const
+                ).map((m) => (
                   <button
+                    key={m.id}
                     type="button"
-                    onClick={() => setSplitRange(`1-${primaryDoc.pageCount}`)}
-                    className="px-2 py-0.5 rounded-md bg-[#2563EB]/10 text-[#2563EB] text-[11px] font-bold shrink-0"
+                    onClick={() => setSplitMode(m.id)}
+                    className={`min-h-[38px] px-2 rounded-xl font-semibold border ${
+                      splitMode === m.id
+                        ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                        : 'border-slate-200 dark:border-slate-700'
+                    }`}
                   >
-                    {language === 'bn' ? 'সব পৃষ্ঠা' : 'Select All Pages'}
+                    {m.label}
                   </button>
-                )}
+                ))}
               </div>
-              <input
-                type="text"
-                value={splitRange}
-                onChange={(e) => setSplitRange(e.target.value)}
-                className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm font-mono-nums"
-              />
+
+              {splitMode === 'custom' && (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between gap-2">
+                    <label className="block font-semibold text-slate-500">
+                      {language === 'bn'
+                        ? `পৃষ্ঠা নম্বর (যেমন 1-2, 4${primaryDoc ? ` · সর্বোচ্চ ${primaryDoc.pageCount}` : ''})`
+                        : `Pages to Extract (e.g. 1-2, 4${primaryDoc ? ` · max ${primaryDoc.pageCount}` : ''})`}
+                    </label>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {primaryDoc && (
+                        <span className="px-2 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800 text-[11px] font-mono-nums font-bold text-slate-600 dark:text-slate-300">
+                          {parsePageRanges(splitRange, primaryDoc.pageCount).length}/{primaryDoc.pageCount}
+                        </span>
+                      )}
+                      {primaryDoc && (
+                        <button
+                          type="button"
+                          onClick={() => setSplitRange(`1-${primaryDoc.pageCount}`)}
+                          className="px-2 py-0.5 rounded-md bg-[#2563EB]/10 text-[#2563EB] text-[11px] font-bold"
+                        >
+                          {language === 'bn' ? 'সব' : 'All'}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <input
+                    type="text"
+                    value={splitRange}
+                    onChange={(e) => setSplitRange(e.target.value)}
+                    placeholder="1-3, 5"
+                    className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm font-mono-nums"
+                  />
+                  {primaryDoc && primaryDoc.pageCount <= 36 && (
+                    <div className="flex flex-wrap gap-1 pt-0.5 max-h-28 overflow-y-auto">
+                      {Array.from({ length: primaryDoc.pageCount }, (_, i) => i + 1).map((pNum) => {
+                        const selected = parsePageRanges(splitRange, primaryDoc.pageCount);
+                        const isSel = selected.includes(pNum);
+                        return (
+                          <button
+                            key={pNum}
+                            type="button"
+                            onClick={() => {
+                              const next = isSel
+                                ? selected.filter((x) => x !== pNum)
+                                : [...selected, pNum];
+                              setSplitRange(formatPagesListAsRange(next));
+                            }}
+                            className={`min-w-[32px] h-7 px-1.5 rounded-lg text-[11px] font-mono-nums font-bold border transition-colors ${
+                              isSel
+                                ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                                : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300'
+                            }`}
+                          >
+                            {pNum}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              )}
+              {splitMode !== 'custom' && primaryDoc && (
+                <p className="text-[11px] text-slate-500">
+                  {splitMode === 'each-zip'
+                    ? language === 'bn'
+                      ? `মোট ${primaryDoc.pageCount}টি পৃষ্ঠা আলাদা PDF হয়ে একটি ZIP ফাইলে সংরক্ষিত হবে।`
+                      : `Exports all ${primaryDoc.pageCount} page(s) as separate PDFs inside a single ZIP file.`
+                    : language === 'bn'
+                    ? `${splitMode === 'odd' ? 'বিজোড়' : 'জোড়'} পৃষ্ঠাগুলো নিয়ে নতুন পিডিএফ তৈরি হবে।`
+                    : `Extracts all ${splitMode} page numbers from 1 to ${primaryDoc.pageCount}.`}
+                </p>
+              )}
             </div>
           )}
 
@@ -1168,6 +1446,23 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                   </button>
                 ))}
               </div>
+              <p className="text-[11px] text-slate-500">
+                {compressMode === 'object-streams'
+                  ? language === 'bn'
+                    ? 'টেক্সট ও ভেক্টর কোয়ালিটি ১০০% ঠিক রেখে ফাইল হালকা করে।'
+                    : 'Keeps crisp vector text & lossless structure while trimming overhead.'
+                  : compressMode === 'raster-medium'
+                  ? language === 'bn'
+                    ? 'ছবিযুক্ত ও স্ক্যান পিডিএফের জন্য ভারসাম্যপূর্ণ সাইজ ও স্পষ্টতা।'
+                    : 'Balances clarity and strong size reduction; never bloats clean vector PDFs.'
+                  : compressMode === 'raster-compact'
+                  ? language === 'bn'
+                    ? 'সর্বোচ্চ মেমোরি সাশ্রয়ের জন্য ছোট ফাইল সাইজ।'
+                    : 'Aggressive size reduction ideal for email or portal uploads.'
+                  : language === 'bn'
+                  ? 'নির্দিষ্ট কিলোবাইট সীমার কাছাকাছি আনতে স্বয়ংক্রিয়ভাবে প্রিসেট চেষ্টা করে।'
+                  : 'Automatically searches quality presets to fit under your KB limit.'}
+              </p>
 
               {compressMode === 'target-size' && (
                 <div className="p-3 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700 space-y-2.5 text-xs">
@@ -1258,27 +1553,73 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           )}
 
           {toolId === 'rotate' && (
-            <div className="grid grid-cols-3 gap-1.5">
-              {[90, 180, 270].map((deg) => (
+            <div className="space-y-2.5 text-xs">
+              <div className="grid grid-cols-3 gap-1.5">
+                {[
+                  { deg: 90, label: language === 'bn' ? '৯০° ডান ↻' : '90° Right ↻' },
+                  { deg: 180, label: language === 'bn' ? '১৮০° উল্টো ⇅' : '180° Flip ⇅' },
+                  { deg: 270, label: language === 'bn' ? '২৭০° বাম ↺' : '270° Left ↺' },
+                ].map((opt) => (
+                  <button
+                    key={opt.deg}
+                    type="button"
+                    onClick={() => setRotateAngle(opt.deg)}
+                    className={`min-h-[42px] rounded-xl font-semibold border ${
+                      rotateAngle === opt.deg
+                        ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                        : 'border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+              <div className="grid grid-cols-2 gap-1.5">
                 <button
-                  key={deg}
-                  onClick={() => setRotateAngle(deg)}
-                  className={`min-h-[42px] rounded-xl text-xs font-semibold border font-mono-nums ${
-                    rotateAngle === deg
-                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                  type="button"
+                  onClick={() => setRotateScope('all')}
+                  className={`min-h-[38px] rounded-xl font-semibold border ${
+                    rotateScope === 'all'
+                      ? 'bg-[#2563EB]/10 text-[#2563EB] border-[#2563EB]'
                       : 'border-slate-200 dark:border-slate-700'
                   }`}
                 >
-                  {deg}°
+                  {language === 'bn' ? 'সব পৃষ্ঠা' : 'All Pages'}
                 </button>
-              ))}
+                <button
+                  type="button"
+                  onClick={() => setRotateScope('specific')}
+                  className={`min-h-[38px] rounded-xl font-semibold border ${
+                    rotateScope === 'specific'
+                      ? 'bg-[#2563EB]/10 text-[#2563EB] border-[#2563EB]'
+                      : 'border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {language === 'bn' ? 'নির্দিষ্ট পৃষ্ঠা' : 'Specific Pages'}
+                </button>
+              </div>
+              {rotateScope === 'specific' && (
+                <input
+                  type="text"
+                  value={rotatePagesInput}
+                  onChange={(e) => setRotatePagesInput(e.target.value)}
+                  placeholder={
+                    primaryDoc
+                      ? `e.g. 1, 3-5 (max ${primaryDoc.pageCount})`
+                      : 'e.g. 1, 3-5'
+                  }
+                  className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm font-mono-nums"
+                />
+              )}
             </div>
           )}
 
           {toolId === 'pageSetup' && (
             <div className="space-y-3 text-xs">
               <div>
-                <label className="block font-semibold text-slate-500 mb-1">Paper Size</label>
+                <label className="block font-semibold text-slate-500 mb-1">
+                  {language === 'bn' ? 'পেজের মাপ' : 'Paper Size'}
+                </label>
                 <select
                   value={targetPaperSize}
                   onChange={(e) => setTargetPaperSize(e.target.value as PaperSizeKey)}
@@ -1316,7 +1657,9 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                 </div>
               )}
               <div>
-                <label className="block font-semibold text-slate-500 mb-1">Orientation</label>
+                <label className="block font-semibold text-slate-500 mb-1">
+                  {language === 'bn' ? 'দিক (ওরিয়েন্টেশন)' : 'Orientation'}
+                </label>
                 <div className="grid grid-cols-2 gap-2">
                   {(['portrait', 'landscape'] as const).map((ori) => (
                     <button
@@ -1338,17 +1681,33 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           )}
 
           {toolId === 'watermark' && (
-            <div className="space-y-2.5 text-xs">
+            <div className="space-y-3 text-xs">
+              <div className="flex flex-wrap gap-1.5">
+                {['CONFIDENTIAL', 'DRAFT', 'COPY', 'URGENT'].map((preset) => (
+                  <button
+                    key={preset}
+                    type="button"
+                    onClick={() => setWatermarkText(preset)}
+                    className={`px-2.5 py-1 rounded-lg font-bold border ${
+                      watermarkText === preset
+                        ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                        : 'bg-slate-50 dark:bg-slate-800 border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    {preset}
+                  </button>
+                ))}
+              </div>
               <input
                 type="text"
                 value={watermarkText}
                 onChange={(e) => setWatermarkText(e.target.value)}
-                placeholder="Watermark text (English or বাংলা)"
+                placeholder={language === 'bn' ? 'ওয়াটারমার্ক টেক্সট (English বা বাংলা)' : 'Watermark text (English or বাংলা)'}
                 className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
               />
-              <div className="flex items-center justify-between gap-3">
-                <label className="flex-1">
-                  Opacity ({Math.round(watermarkOpacity * 100)}%)
+              <div className="grid grid-cols-2 gap-3">
+                <label className="block">
+                  {language === 'bn' ? 'স্বচ্ছতা' : 'Opacity'} ({Math.round(watermarkOpacity * 100)}%)
                   <input
                     type="range"
                     min={0.1}
@@ -1359,62 +1718,257 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                     className="w-full accent-[#2563EB]"
                   />
                 </label>
+                <label className="block">
+                  {language === 'bn' ? 'ফন্ট সাইজ' : 'Font Size'} ({watermarkFontSize}pt)
+                  <input
+                    type="range"
+                    min={20}
+                    max={84}
+                    step={2}
+                    value={watermarkFontSize}
+                    onChange={(e) => setWatermarkFontSize(Number(e.target.value))}
+                    className="w-full accent-[#2563EB]"
+                  />
+                </label>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex flex-wrap gap-1">
+                  {[-45, 0, 30, 45, 90].map((ang) => (
+                    <button
+                      key={ang}
+                      type="button"
+                      onClick={() => setWatermarkAngle(ang)}
+                      className={`px-2 py-1 rounded-lg font-mono-nums font-semibold border ${
+                        watermarkAngle === ang
+                          ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                          : 'border-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      {ang}°
+                    </button>
+                  ))}
+                </div>
                 <input
                   type="color"
                   value={watermarkColor}
                   onChange={(e) => setWatermarkColor(e.target.value)}
-                  className="w-10 h-10 rounded-xl"
+                  className="w-10 h-9 rounded-xl shrink-0"
                 />
+              </div>
+              {/* Compact Live Watermark Preview */}
+              <div className="h-24 rounded-xl bg-white dark:bg-slate-950 border border-slate-200 dark:border-slate-800 flex items-center justify-center overflow-hidden relative">
+                <span
+                  style={{
+                    color: watermarkColor,
+                    opacity: watermarkOpacity,
+                    fontSize: Math.max(12, Math.min(28, watermarkFontSize * 0.45)),
+                    transform: `rotate(${-watermarkAngle}deg)`,
+                  }}
+                  className="font-bold tracking-wider select-none pointer-events-none whitespace-nowrap"
+                >
+                  {watermarkText.trim() || 'CONFIDENTIAL'}
+                </span>
               </div>
             </div>
           )}
 
           {toolId === 'pageNumbers' && (
-            <select
-              value={pageNumPos}
-              onChange={(e) =>
-                setPageNumPos(e.target.value as 'bottom-center' | 'bottom-right' | 'top-right')
-              }
-              className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
-            >
-              <option value="bottom-center">Bottom Center</option>
-              <option value="bottom-right">Bottom Right</option>
-              <option value="top-right">Top Right</option>
-            </select>
+            <div className="space-y-3 text-xs">
+              <div>
+                <label className="block font-semibold text-slate-500 mb-1.5">
+                  {language === 'bn' ? 'অবস্থান (Position)' : 'Position'}
+                </label>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(
+                    [
+                      { id: 'top-left', label: language === 'bn' ? 'উপরে বাম' : 'Top Left' },
+                      { id: 'top-center', label: language === 'bn' ? 'উপরে মাঝ' : 'Top Center' },
+                      { id: 'top-right', label: language === 'bn' ? 'উপরে ডান' : 'Top Right' },
+                      { id: 'bottom-left', label: language === 'bn' ? 'নিচে বাম' : 'Bottom Left' },
+                      { id: 'bottom-center', label: language === 'bn' ? 'নিচে মাঝ' : 'Bottom Center' },
+                      { id: 'bottom-right', label: language === 'bn' ? 'নিচে ডান' : 'Bottom Right' },
+                    ] as const
+                  ).map((pos) => (
+                    <button
+                      key={pos.id}
+                      type="button"
+                      onClick={() => setPageNumPos(pos.id)}
+                      className={`min-h-[38px] px-2 rounded-xl font-semibold border ${
+                        pageNumPos === pos.id
+                          ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                          : 'border-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      {pos.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <label className="block font-semibold text-slate-500 mb-1.5">
+                  {language === 'bn' ? 'নম্বর ফরম্যাট' : 'Number Format'}
+                </label>
+                <div className="grid grid-cols-3 gap-1.5">
+                  {(
+                    [
+                      { id: 'pageOfTotal', label: 'Page 1 of N' },
+                      { id: 'slash', label: '1 / N' },
+                      { id: 'number', label: '1, 2, 3' },
+                    ] as const
+                  ).map((fmt) => (
+                    <button
+                      key={fmt.id}
+                      type="button"
+                      onClick={() => setPageNumFormat(fmt.id)}
+                      className={`min-h-[38px] px-2 rounded-xl font-mono-nums font-semibold border ${
+                        pageNumFormat === fmt.id
+                          ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                          : 'border-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      {fmt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2.5">
+                <label className="block">
+                  <span className="block font-semibold text-slate-500 mb-1">
+                    {language === 'bn' ? 'শুরুর নম্বর' : 'Start Number'}
+                  </span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={9999}
+                    value={pageNumStart}
+                    onChange={(e) => setPageNumStart(Math.max(1, Number(e.target.value) || 1))}
+                    className="w-full min-h-[38px] px-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 font-mono-nums"
+                  />
+                </label>
+                <label className="block">
+                  <span className="block font-semibold text-slate-500 mb-1">
+                    {language === 'bn' ? 'ফন্ট সাইজ (pt)' : 'Font Size (pt)'}
+                  </span>
+                  <input
+                    type="number"
+                    min={7}
+                    max={20}
+                    value={pageNumFontSize}
+                    onChange={(e) =>
+                      setPageNumFontSize(Math.max(7, Math.min(20, Number(e.target.value) || 10)))
+                    }
+                    className="w-full min-h-[38px] px-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 font-mono-nums"
+                  />
+                </label>
+              </div>
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={pageNumSkipFirst}
+                  onChange={(e) => setPageNumSkipFirst(e.target.checked)}
+                  className="w-4 h-4 accent-[#2563EB] rounded"
+                />
+                <span className="font-semibold text-slate-600 dark:text-slate-300">
+                  {language === 'bn'
+                    ? 'প্রথম পৃষ্ঠায় (কভার পেজ) নম্বর বাদ দিন'
+                    : 'Skip first page (Cover page)'}
+                </span>
+              </label>
+            </div>
           )}
 
           {toolId === 'headerFooter' && (
-            <div className="space-y-2">
+            <div className="space-y-2.5 text-xs">
               <input
                 type="text"
                 value={headerTxt}
                 onChange={(e) => setHeaderTxt(e.target.value)}
-                placeholder="Header text"
+                placeholder={language === 'bn' ? 'হেডার টেক্সট (English বা বাংলা)' : 'Header text (English or বাংলা)'}
                 className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
               />
               <input
                 type="text"
                 value={footerTxt}
                 onChange={(e) => setFooterTxt(e.target.value)}
-                placeholder="Footer text"
+                placeholder={language === 'bn' ? 'ফুটার টেক্সট (English বা বাংলা)' : 'Footer text (English or বাংলা)'}
                 className="w-full min-h-[42px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
               />
+              <div className="flex items-center gap-2">
+                <div className="grid grid-cols-3 gap-1 flex-1">
+                  {(['left', 'center', 'right'] as const).map((al) => (
+                    <button
+                      key={al}
+                      type="button"
+                      onClick={() => setHeaderFooterAlign(al)}
+                      className={`min-h-[38px] rounded-xl font-semibold capitalize border ${
+                        headerFooterAlign === al
+                          ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                          : 'border-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      {al}
+                    </button>
+                  ))}
+                </div>
+                <input
+                  type="number"
+                  min={7}
+                  max={18}
+                  step={0.5}
+                  value={headerFooterFontSize}
+                  onChange={(e) =>
+                    setHeaderFooterFontSize(Math.max(7, Math.min(18, Number(e.target.value) || 9.5)))
+                  }
+                  aria-label="Header Footer Font Size"
+                  className="w-16 min-h-[38px] px-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 font-mono-nums text-center"
+                />
+                <input
+                  type="color"
+                  value={headerFooterColor}
+                  onChange={(e) => setHeaderFooterColor(e.target.value)}
+                  className="w-10 h-9 rounded-xl shrink-0"
+                />
+              </div>
+              <p className="text-[11px] text-slate-500">
+                {language === 'bn'
+                  ? 'ইংরেজি ও বাংলা ইউনিকোড টেক্সট সঠিকভাবে যুক্ত হয়।'
+                  : 'Supports both English and Unicode (Bengali/other scripts).'}
+              </p>
             </div>
           )}
 
           {(toolId === 'protectVault' || toolId === 'unlockPdf') && (
             <div className="space-y-2">
-              <input
-                type="password"
-                value={passwordInput}
-                onChange={(e) => setPasswordInput(e.target.value)}
-                placeholder={
-                  toolId === 'protectVault'
-                    ? 'Enter Vault encryption password...'
-                    : 'Enter current PDF password...'
-                }
-                className="w-full min-h-[44px] px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
-              />
+              <div className="relative">
+                <input
+                  type={showPassword ? 'text' : 'password'}
+                  value={passwordInput}
+                  onChange={(e) => setPasswordInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !running) {
+                      void handleRun();
+                    }
+                  }}
+                  placeholder={
+                    toolId === 'protectVault'
+                      ? language === 'bn'
+                        ? 'ভল্ট এনক্রিপশন পাসওয়ার্ড দিন (সর্বনিম্ন ৪ অক্ষর)...'
+                        : 'Enter Vault encryption password (min 4 chars)...'
+                      : language === 'bn'
+                      ? 'বর্তমান পিডিএফ পাসওয়ার্ড দিন...'
+                      : 'Enter current PDF password...'
+                  }
+                  className="w-full min-h-[44px] pl-3 pr-11 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowPassword((v) => !v)}
+                  aria-label={showPassword ? 'Hide password' : 'Show password'}
+                  className="absolute right-1.5 top-1/2 -translate-y-1/2 min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg text-slate-500 hover:text-slate-800 dark:hover:text-white"
+                >
+                  {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                </button>
+              </div>
               {toolId === 'protectVault' && (
                 <p className="text-[11px] text-slate-500 flex items-start gap-1.5 leading-relaxed">
                   <Lock className="w-3.5 h-3.5 shrink-0 mt-0.5 text-[#2563EB]" />
@@ -1482,33 +2036,105 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                 ? language === 'bn'
                   ? 'কাজ চলছে...'
                   : 'Processing...'
+                : toolId === 'merge' && mergeQueue.length >= 2
+                ? `${language === 'bn' ? 'মার্জ করুন:' : 'Merge'} ${mergeQueue.length} ${
+                    language === 'bn' ? 'ফাইল' : 'PDFs'
+                  } (${mergeQueue.reduce((s, m) => s + m.pageCount, 0)}p · ${formatBytes(
+                    mergeQueue.reduce((s, m) => s + m.sizeBytes, 0)
+                  )})`
                 : `${language === 'bn' ? 'চালান:' : 'Run'} ${getToolTitle(toolId, language)}`}
             </span>
           </button>
 
           {resultMsg && (
-            <div className="p-3 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-800 dark:text-emerald-200 space-y-2">
-              <div className="flex items-center gap-2">
+            <div className="p-3.5 rounded-xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 text-xs text-emerald-800 dark:text-emerald-200 space-y-2.5">
+              <div className="flex items-center gap-2 font-semibold">
                 <ShieldCheck className="w-4 h-4 shrink-0" />
                 <span>{resultMsg}</span>
               </div>
-              {lastMergedResult && (
-                <button
-                  type="button"
-                  onClick={() =>
-                    void saveBufferToDeviceStorage(
-                      lastMergedResult.bytes,
-                      lastMergedResult.name,
-                      'application/pdf'
-                    )
-                  }
-                  className="w-full min-h-[40px] rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold flex items-center justify-center gap-1.5"
-                >
-                  <Download className="w-4 h-4" />
-                  <span>
-                    {language === 'bn' ? 'মার্জ করা পিডিএফ ডাউনলোড করুন' : 'Download Merged PDF'}
-                  </span>
-                </button>
+              {resultDoc && (
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-1.5">
+                  {onOpenResultDoc && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => onOpenResultDoc(resultDoc, 'viewer')}
+                        className="min-h-[38px] px-2 rounded-xl bg-[#2563EB] text-white font-semibold flex items-center justify-center gap-1"
+                      >
+                        <Eye className="w-3.5 h-3.5" />
+                        <span>{language === 'bn' ? 'ভিউ' : 'View'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onOpenResultDoc(resultDoc, 'editor')}
+                        className="min-h-[38px] px-2 rounded-xl bg-white dark:bg-slate-900 border border-emerald-300 dark:border-emerald-700 text-[#142B4A] dark:text-white font-semibold flex items-center justify-center gap-1"
+                      >
+                        <Edit3 className="w-3.5 h-3.5 text-[#2563EB]" />
+                        <span>{language === 'bn' ? 'এডিট' : 'Edit'}</span>
+                      </button>
+                    </>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void saveBufferToDeviceStorage(
+                        resultDoc.pdfBytes,
+                        resultDoc.name,
+                        'application/pdf'
+                      )
+                    }
+                    className="min-h-[38px] px-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold flex items-center justify-center gap-1"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>{language === 'bn' ? 'ডাউনলোড' : 'Download'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void shareBufferNativeOrWeb(
+                        resultDoc.pdfBytes,
+                        resultDoc.name,
+                        'application/pdf'
+                      )
+                    }
+                    className="min-h-[38px] px-2 rounded-xl bg-white dark:bg-slate-900 border border-emerald-300 dark:border-emerald-700 text-[#142B4A] dark:text-white font-semibold flex items-center justify-center gap-1"
+                  >
+                    <Share2 className="w-3.5 h-3.5 text-[#06B6D4]" />
+                    <span>{language === 'bn' ? 'শেয়ার' : 'Share'}</span>
+                  </button>
+                </div>
+              )}
+              {resultZip && (
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void saveBufferToDeviceStorage(
+                        resultZip.bytes,
+                        resultZip.name,
+                        'application/zip'
+                      )
+                    }
+                    className="min-h-[38px] px-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold flex items-center justify-center gap-1"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>{language === 'bn' ? 'ZIP ডাউনলোড' : 'Download ZIP'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void shareBufferNativeOrWeb(
+                        resultZip.bytes,
+                        resultZip.name,
+                        'application/zip'
+                      )
+                    }
+                    className="min-h-[38px] px-2 rounded-xl bg-white dark:bg-slate-900 border border-emerald-300 dark:border-emerald-700 text-[#142B4A] dark:text-white font-semibold flex items-center justify-center gap-1"
+                  >
+                    <Share2 className="w-3.5 h-3.5 text-[#06B6D4]" />
+                    <span>{language === 'bn' ? 'শেয়ার ZIP' : 'Share ZIP'}</span>
+                  </button>
+                </div>
               )}
             </div>
           )}
@@ -1521,11 +2147,36 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
 
         {previewUrls.length > 0 && (
           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-            {previewUrls.map((url, idx) => (
-              <div key={idx} className="rounded-xl bg-white dark:bg-slate-900 p-2 border border-slate-200 dark:border-slate-800">
-                <img src={url} alt={`Page ${idx + 1}`} className="w-full rounded-lg" />
-              </div>
-            ))}
+            {previewUrls.map((url, idx) => {
+              const ext = exportImgFormat === 'image/jpeg' ? 'jpg' : 'png';
+              const base = primaryDoc?.name.replace(/\.pdf$/i, '') || 'page';
+              return (
+                <div
+                  key={idx}
+                  className="rounded-xl bg-white dark:bg-slate-900 p-2 border border-slate-200 dark:border-slate-800 space-y-1.5"
+                >
+                  <img src={url} alt={`Page ${idx + 1}`} className="w-full rounded-lg" />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void saveBufferToDeviceStorage(
+                        dataUrlToArrayBuffer(url),
+                        `${base}_page_${idx + 1}.${ext}`,
+                        exportImgFormat
+                      )
+                    }
+                    className="w-full min-h-[34px] rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-[#2563EB] hover:text-white text-[11px] font-semibold flex items-center justify-center gap-1 transition-colors"
+                  >
+                    <Download className="w-3 h-3" />
+                    <span>
+                      {language === 'bn'
+                        ? `পৃষ্ঠা ${idx + 1} ডাউনলোড`
+                        : `Save Page ${idx + 1}`}
+                    </span>
+                  </button>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

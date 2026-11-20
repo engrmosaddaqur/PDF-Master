@@ -89,11 +89,11 @@ export function comparePdfPagesText(
     const textB = pagesB[p - 1]?.text || '';
     const linesA = textA
       .split('\n')
-      .map((l) => l.trim())
+      .map((l) => l.replace(/\s+/g, ' ').trim())
       .filter(Boolean);
     const linesB = textB
       .split('\n')
-      .map((l) => l.trim())
+      .map((l) => l.replace(/\s+/g, ' ').trim())
       .filter(Boolean);
 
     const diff = lcsDiffLines(linesA, linesB);
@@ -133,3 +133,42 @@ export function comparePdfPagesText(
     totalUnchanged,
   };
 }
+
+export function formatDiffReportText(
+  nameA: string,
+  nameB: string,
+  summary: {
+    pages: PageComparisonResult[];
+    totalAdded: number;
+    totalDeleted: number;
+    totalUnchanged: number;
+  }
+): string {
+  const header = [
+    'PDF MASTER - Document Comparison Report',
+    `Generated: ${new Date().toISOString()}`,
+    `Document A: ${nameA}`,
+    `Document B: ${nameB}`,
+    `Summary: +${summary.totalAdded} added, -${summary.totalDeleted} deleted, ${summary.totalUnchanged} unchanged`,
+    '============================================================',
+  ].join('\n');
+
+  const body = summary.pages
+    .map((pg) => {
+      const changed = pg.addedCount > 0 || pg.deletedCount > 0;
+      const lines = pg.lines
+        .map((l) => {
+          const prefix = l.type === 'added' ? '+ ' : l.type === 'deleted' ? '- ' : '  ';
+          return `${prefix}${l.text}`;
+        })
+        .join('\n');
+      return [
+        `--- Page ${pg.pageNumber} (+${pg.addedCount} / -${pg.deletedCount}${changed ? '' : ' · identical'}) ---`,
+        lines || '(no selectable text on this page)',
+      ].join('\n');
+    })
+    .join('\n\n');
+
+  return `${header}\n\n${body}\n`;
+}
+

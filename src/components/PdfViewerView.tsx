@@ -1137,25 +1137,59 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
           />
           {searchQuery && (
             <span className="text-xs font-mono-nums text-slate-500 whitespace-nowrap">
+              {searchMatches.length > 0 && searchMatches.includes(currentPage)
+                ? `${searchMatches.indexOf(currentPage) + 1}/`
+                : ''}
               {searchMatches.length}{' '}
               {language === 'bn' ? 'পৃষ্ঠায়' : searchMatches.length === 1 ? 'page' : 'pages'}
             </span>
           )}
           {searchMatches.length > 0 && (
-            <div className="flex items-center gap-1">
-              {searchMatches.slice(0, 5).map((p) => (
-                <button
-                  key={p}
-                  onClick={() => jumpToPage(p)}
-                  className={`px-2 py-1 rounded-md text-xs font-mono-nums font-semibold ${
-                    currentPage === p
-                      ? 'bg-[#2563EB] text-white'
-                      : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
-                  }`}
-                >
-                  P{p}
-                </button>
-              ))}
+            <div className="flex items-center gap-1 shrink-0">
+              {searchMatches.length > 1 && (
+                <>
+                  <button
+                    type="button"
+                    aria-label="Previous search match"
+                    onClick={() => {
+                      const idx = searchMatches.indexOf(currentPage);
+                      const prevIdx =
+                        idx <= 0 ? searchMatches.length - 1 : idx - 1;
+                      jumpToPage(searchMatches[prevIdx]);
+                    }}
+                    className="min-h-[34px] min-w-[34px] rounded-lg bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-700 dark:text-slate-200"
+                  >
+                    <ChevronLeft className="w-4 h-4" />
+                  </button>
+                  <button
+                    type="button"
+                    aria-label="Next search match"
+                    onClick={() => {
+                      const idx = searchMatches.indexOf(currentPage);
+                      const nextIdx =
+                        idx === -1 || idx >= searchMatches.length - 1 ? 0 : idx + 1;
+                      jumpToPage(searchMatches[nextIdx]);
+                    }}
+                    className="min-h-[34px] min-w-[34px] rounded-lg bg-slate-100 dark:bg-slate-800 flex items-center justify-center text-slate-700 dark:text-slate-200"
+                  >
+                    <ChevronRight className="w-4 h-4" />
+                  </button>
+                </>
+              )}
+              {searchMatches.length <= 4 &&
+                searchMatches.map((p) => (
+                  <button
+                    key={p}
+                    onClick={() => jumpToPage(p)}
+                    className={`px-2 py-1 rounded-md text-xs font-mono-nums font-semibold ${
+                      currentPage === p
+                        ? 'bg-[#2563EB] text-white'
+                        : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300'
+                    }`}
+                  >
+                    P{p}
+                  </button>
+                ))}
             </div>
           )}
           <button
