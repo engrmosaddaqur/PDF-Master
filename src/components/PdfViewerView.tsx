@@ -469,6 +469,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
   const viewerRootRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const scrollContentRef = useRef<HTMLDivElement | null>(null);
+  const textModalAreaRef = useRef<HTMLTextAreaElement | null>(null);
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const latestDocRef = useRef(doc);
   latestDocRef.current = doc;
@@ -1695,6 +1696,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
               </button>
             </div>
             <textarea
+              ref={textModalAreaRef}
               readOnly
               value={
                 currentPageText ||
@@ -1704,21 +1706,34 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
               }
               className="flex-1 min-h-[220px] p-3 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm text-slate-800 dark:text-slate-200 focus:outline-none"
             />
-            <button
-              onClick={() => {
-                navigator.clipboard.writeText(currentPageText);
-                setCopiedNotice(true);
-                setTimeout(() => setCopiedNotice(false), 1800);
-              }}
-              disabled={!currentPageText}
-              className="mt-3 w-full min-h-[46px] rounded-xl bg-[#2563EB] disabled:opacity-40 text-white text-sm font-semibold"
-            >
-              {copiedNotice
-                ? language === 'bn'
-                  ? 'কপি হয়েছে'
-                  : 'Copied to Clipboard'
-                : t.viewer.copyText}
-            </button>
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  textModalAreaRef.current?.focus();
+                  textModalAreaRef.current?.select();
+                }}
+                disabled={!currentPageText}
+                className="min-h-[46px] rounded-xl bg-slate-100 dark:bg-slate-800 disabled:opacity-40 text-slate-800 dark:text-slate-100 text-sm font-semibold"
+              >
+                {language === 'bn' ? 'সব সিলেক্ট' : 'Select All'}
+              </button>
+              <button
+                onClick={() => {
+                  navigator.clipboard.writeText(currentPageText);
+                  setCopiedNotice(true);
+                  setTimeout(() => setCopiedNotice(false), 1800);
+                }}
+                disabled={!currentPageText}
+                className="min-h-[46px] rounded-xl bg-[#2563EB] disabled:opacity-40 text-white text-sm font-semibold"
+              >
+                {copiedNotice
+                  ? language === 'bn'
+                    ? 'কপি হয়েছে'
+                    : 'Copied to Clipboard'
+                  : t.viewer.copyText}
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -227,6 +227,17 @@ export const FilesTab: React.FC<FilesTabProps> = ({
     });
   };
 
+  const allFilteredSelected =
+    filteredDocs.length > 0 && filteredDocs.every((d) => selectedIds.has(d.id));
+
+  const toggleSelectAllDocs = () => {
+    if (allFilteredSelected) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(filteredDocs.map((d) => d.id)));
+    }
+  };
+
   const exitSelectionMode = () => {
     setSelectionMode(false);
     setSelectedIds(new Set());
@@ -440,6 +451,20 @@ export const FilesTab: React.FC<FilesTabProps> = ({
           {filteredDocs.length} {language === 'bn' ? 'টি ডকুমেন্ট' : 'shown'}
         </span>
         <div className="flex items-center gap-1.5">
+          {filteredDocs.length > 0 && selectionMode && (
+            <button
+              type="button"
+              onClick={toggleSelectAllDocs}
+              className={`min-h-[36px] px-3 rounded-xl text-xs font-bold flex items-center gap-1.5 border transition-colors ${
+                allFilteredSelected
+                  ? 'bg-emerald-600 text-white border-emerald-600'
+                  : 'bg-white dark:bg-[#121929] border-slate-200 dark:border-[#1E293B] text-[#2563EB] dark:text-[#60A5FA]'
+              }`}
+            >
+              <CheckSquare className="w-3.5 h-3.5" />
+              <span>{allFilteredSelected ? t.files.deselectAll : t.files.selectAll}</span>
+            </button>
+          )}
           {filteredDocs.length > 0 && (
             <button
               type="button"
@@ -473,9 +498,18 @@ export const FilesTab: React.FC<FilesTabProps> = ({
       {/* Batch Actions Bar when items are selected */}
       {selectionMode && selectedIds.size > 0 && (
         <div className="sticky top-2 z-20 rounded-2xl bg-[#142B4A] text-white p-2.5 shadow-xl border border-white/15 flex flex-wrap items-center justify-between gap-2">
-          <span className="text-xs font-bold px-2 font-mono-nums">
-            {selectedIds.size} {t.files.selectedCount}
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-bold px-2 font-mono-nums">
+              {selectedIds.size} {t.files.selectedCount}
+            </span>
+            <button
+              type="button"
+              onClick={toggleSelectAllDocs}
+              className="px-2.5 py-1 rounded-lg bg-white/15 hover:bg-white/25 text-[11px] font-bold"
+            >
+              {allFilteredSelected ? t.files.deselectAll : t.files.selectAll}
+            </button>
+          </div>
           <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar">
             {category !== 'trash' &&
               onSaveNewDoc &&

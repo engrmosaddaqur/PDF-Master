@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Copy,
@@ -62,6 +62,7 @@ export const OcrView: React.FC<OcrViewProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const ocrTextAreaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const vaultDocs = docs.filter((d) => !d.isTrashed && !d.isVaultLocked);
   const selectedDoc = vaultDocs.find((d) => d.id === selectedDocId);
@@ -516,12 +517,22 @@ export const OcrView: React.FC<OcrViewProps> = ({
                 )}
               </div>
               <button
+                type="button"
+                onClick={() => {
+                  ocrTextAreaRef.current?.focus();
+                  ocrTextAreaRef.current?.select();
+                }}
+                className="min-h-[40px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold whitespace-nowrap shrink-0"
+              >
+                {language === 'bn' ? 'সব সিলেক্ট' : 'Select All'}
+              </button>
+              <button
                 onClick={() => {
                   navigator.clipboard.writeText(combinedText);
                   setCopied(true);
                   setTimeout(() => setCopied(false), 1800);
                 }}
-                className="min-h-[40px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center gap-1.5"
+                className="min-h-[40px] px-3 rounded-xl bg-slate-100 dark:bg-slate-800 text-xs font-semibold flex items-center gap-1.5 whitespace-nowrap shrink-0"
               >
                 <Copy className="w-3.5 h-3.5" />
                 {copied ? 'Copied' : t.ocr.copyAll}
@@ -529,6 +540,7 @@ export const OcrView: React.FC<OcrViewProps> = ({
             </div>
 
             <textarea
+              ref={ocrTextAreaRef}
               value={combinedText}
               onChange={(e) => setCombinedText(e.target.value)}
               rows={10}

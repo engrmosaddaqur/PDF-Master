@@ -3,6 +3,7 @@
   "version": "1.1.0",
   "description": "PDF MASTER Desktop Application for Windows",
   "author": "Mosaddaq",
+  "license": "MIT",
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
@@ -10,7 +11,8 @@
   },
   "devDependencies": {
     "electron": "^35.0.0",
-    "electron-builder": "^25.1.8"
+    "electron-builder": "^25.1.8",
+    "png-to-ico": "^2.1.8"
   },
   "build": {
     "appId": "com.engrmosaddaqur.pdfmaster",
@@ -23,6 +25,7 @@
       "main.cjs",
       "preload.cjs",
       "icon.png",
+      "icon.ico",
       "dist/**/*"
     ],
     "fileAssociations": [
@@ -35,7 +38,7 @@
       }
     ],
     "win": {
-      "icon": "icon.png",
+      "icon": "icon.ico",
       "requestedExecutionLevel": "asInvoker",
       "target": [
         {
@@ -57,6 +60,8 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
+      "installerIcon": "icon.ico",
+      "uninstallerIcon": "icon.ico",
       "shortcutName": "PDF MASTER",
       "artifactName": "PDF-MASTER-Setup-v1.1.exe"
     },

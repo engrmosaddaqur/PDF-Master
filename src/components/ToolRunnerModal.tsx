@@ -944,12 +944,63 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
 
               {/* 3. Recent Files Section */}
               <div className="space-y-2 pt-1 border-t border-slate-100 dark:border-slate-800">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-xs font-bold text-slate-600 dark:text-slate-300 flex items-center gap-1.5">
-                    <Clock className="w-3.5 h-3.5 text-[#06B6D4]" />
-                    {language === 'bn' ? 'রিসেন্ট ফাইলস' : 'Recent Files'}
-                  </span>
-                  <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 flex-1 max-w-[200px]">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs font-bold text-slate-600 dark:text-slate-300 flex items-center gap-1.5">
+                      <Clock className="w-3.5 h-3.5 text-[#06B6D4]" />
+                      {language === 'bn' ? 'রিসেন্ট ফাইলস' : 'Recent Files'}
+                    </span>
+                    {(() => {
+                      const filteredRecent = recentSorted.filter((d) =>
+                        mergeSearch.trim()
+                          ? d.name.toLowerCase().includes(mergeSearch.toLowerCase())
+                          : true
+                      );
+                      const allRecentAdded =
+                        filteredRecent.length > 0 &&
+                        filteredRecent.every((d) => mergeQueue.some((item) => item.id === d.id));
+                      return filteredRecent.length > 0 ? (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (allRecentAdded) {
+                              const ids = new Set(filteredRecent.map((d) => d.id));
+                              setMergeQueue((prev) => prev.filter((item) => !ids.has(item.id)));
+                            } else {
+                              setMergeQueue((prev) => {
+                                const existingIds = new Set(prev.map((x) => x.id));
+                                const toAdd = filteredRecent
+                                  .filter((d) => !existingIds.has(d.id))
+                                  .map((d) => ({
+                                    id: d.id,
+                                    name: d.name,
+                                    pageCount: d.pageCount,
+                                    sizeBytes: d.sizeBytes,
+                                    pdfBytes: d.pdfBytes,
+                                    source: 'recent' as const,
+                                  }));
+                                return [...prev, ...toAdd];
+                              });
+                            }
+                          }}
+                          className={`px-2 py-1 rounded-lg text-[11px] font-bold transition-colors ${
+                            allRecentAdded
+                              ? 'bg-emerald-600 text-white'
+                              : 'bg-[#2563EB]/10 text-[#2563EB] hover:bg-[#2563EB]/20'
+                          }`}
+                        >
+                          {allRecentAdded
+                            ? language === 'bn'
+                              ? 'সব বাদ দিন'
+                              : 'Deselect All'
+                            : language === 'bn'
+                            ? 'সব নির্বাচন'
+                            : 'Select All'}
+                        </button>
+                      ) : null;
+                    })()}
+                  </div>
+                  <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 flex-1 max-w-[180px]">
                     <Search className="w-3.5 h-3.5 text-slate-400 shrink-0" />
                     <input
                       type="text"
@@ -1067,11 +1118,22 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           {/* Tool-specific controls */}
           {toolId === 'split' && (
             <div>
-              <label className="block text-xs font-semibold text-slate-500 mb-1">
-                {language === 'bn'
-                  ? `আলাদা করার পৃষ্ঠা নম্বর (যেমন 1-2, 4${primaryDoc ? ` · সর্বোচ্চ ${primaryDoc.pageCount}` : ''})`
-                  : `Pages to Extract (e.g. 1-2, 4${primaryDoc ? ` · max ${primaryDoc.pageCount}` : ''})`}
-              </label>
+              <div className="flex items-center justify-between gap-2 mb-1">
+                <label className="block text-xs font-semibold text-slate-500">
+                  {language === 'bn'
+                    ? `আলাদা করার পৃষ্ঠা নম্বর (যেমন 1-2, 4${primaryDoc ? ` · সর্বোচ্চ ${primaryDoc.pageCount}` : ''})`
+                    : `Pages to Extract (e.g. 1-2, 4${primaryDoc ? ` · max ${primaryDoc.pageCount}` : ''})`}
+                </label>
+                {primaryDoc && (
+                  <button
+                    type="button"
+                    onClick={() => setSplitRange(`1-${primaryDoc.pageCount}`)}
+                    className="px-2 py-0.5 rounded-md bg-[#2563EB]/10 text-[#2563EB] text-[11px] font-bold shrink-0"
+                  >
+                    {language === 'bn' ? 'সব পৃষ্ঠা' : 'Select All Pages'}
+                  </button>
+                )}
+              </div>
               <input
                 type="text"
                 value={splitRange}

@@ -4,6 +4,7 @@ import {
   ArrowUp,
   ArrowDown,
   Check,
+  CheckSquare,
   CopyPlus,
   FilePlus2,
   FolderPlus,
@@ -88,10 +89,17 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
     .map((t, idx) => (t.selected ? idx : -1))
     .filter((i) => i !== -1);
 
+  const allPagesSelected = tiles.length > 0 && selectedIndices.length === tiles.length;
+
   const toggleSelect = (idx: number) => {
     setTiles((prev) =>
       prev.map((t, i) => (i === idx ? { ...t, selected: !t.selected } : t))
     );
+  };
+
+  const toggleSelectAll = () => {
+    const nextVal = !allPagesSelected;
+    setTiles((prev) => prev.map((t) => ({ ...t, selected: nextVal })));
   };
 
   const handleAddBlank = () => {
@@ -290,14 +298,29 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
           </div>
         </div>
 
-        <button
-          onClick={handleSaveOrder}
-          disabled={saving || tiles.length === 0}
-          className="min-h-[44px] px-4 rounded-xl bg-[#2563EB] disabled:opacity-40 text-white text-xs font-semibold flex items-center gap-1.5"
-        >
-          <Save className="w-4 h-4" />
-          <span>{saving ? t.organizer.applying : t.organizer.saveChanges}</span>
-        </button>
+        <div className="flex items-center gap-1.5 shrink-0">
+          <button
+            type="button"
+            onClick={toggleSelectAll}
+            disabled={tiles.length === 0}
+            className={`min-h-[44px] px-3 rounded-xl text-xs font-semibold flex items-center gap-1.5 border transition-colors disabled:opacity-40 ${
+              allPagesSelected
+                ? 'bg-emerald-600 text-white border-emerald-600'
+                : 'bg-slate-100 dark:bg-slate-800 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
+            }`}
+          >
+            <CheckSquare className="w-4 h-4" />
+            <span>{allPagesSelected ? t.organizer.deselectAll : t.organizer.selectAll}</span>
+          </button>
+          <button
+            onClick={handleSaveOrder}
+            disabled={saving || tiles.length === 0}
+            className="min-h-[44px] px-4 rounded-xl bg-[#2563EB] disabled:opacity-40 text-white text-xs font-semibold flex items-center gap-1.5"
+          >
+            <Save className="w-4 h-4" />
+            <span>{saving ? t.organizer.applying : t.organizer.saveChanges}</span>
+          </button>
+        </div>
       </header>
 
       <div className="flex-1 overflow-y-auto p-4">

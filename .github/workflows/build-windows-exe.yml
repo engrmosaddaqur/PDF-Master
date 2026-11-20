@@ -31,7 +31,7 @@ jobs:
           VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
         run: npm run build
 
-      - name: Prepare desktop bundle and icon
+      - name: Prepare desktop bundle
         shell: pwsh
         run: |
           if (Test-Path "desktop/dist") { Remove-Item -Recurse -Force "desktop/dist" }
@@ -39,10 +39,42 @@ jobs:
           Copy-Item -Force "public/pwa-512x512.png" "desktop/icon.png"
 
       - name: Install desktop Electron dependencies
-        run: npm --prefix desktop install
+        working-directory: desktop
+        run: npm install
+
+      - name: Generate Windows icon.ico and prepare winCodeSign cache
+        shell: pwsh
+        run: |
+          node -e '
+            const fs = require("fs");
+            const ptiMod = require("./desktop/node_modules/png-to-ico");
+            const pngToIco = ptiMod.default || ptiMod;
+            pngToIco("public/pwa-512x512.png").then((buf) => {
+              fs.writeFileSync("desktop/icon.ico", buf);
+              console.log("Generated desktop/icon.ico:", buf.length, "bytes");
+            }).catch((err) => {
+              console.error(err);
+              process.exit(1);
+            });
+          '
+          $cacheDir = Join-Path $env:LOCALAPPDATA "electron-builder\Cache\winCodeSign\winCodeSign-2.6.0"
+          if (-not (Test-Path (Join-Path $cacheDir "rcedit-x64.exe"))) {
+            New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+            $archive = Join-Path $env:TEMP "winCodeSign-2.6.0.7z"
+            Invoke-WebRequest -Uri "https://github.com/electron-userland/electron-builder-binaries/releases/download/winCodeSign-2.6.0/winCodeSign-2.6.0.7z" -OutFile $archive
+            $sevenZipCmd = Get-Command 7z -ErrorAction SilentlyContinue
+            $sevenZip = if ($sevenZipCmd) { $sevenZipCmd.Source } else { "C:\Program Files\7-Zip\7z.exe" }
+            if (Test-Path $sevenZip) {
+              & $sevenZip x $archive "-o$cacheDir" -y | Out-Null
+            }
+            $global:LASTEXITCODE = 0
+          }
 
       - name: Build Windows Installer & Portable EXE (v1.1)
-        run: npx --prefix desktop electron-builder --win nsis portable --x64 --publish never
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+        run: npm run dist:win
 
       - name: Verify Windows EXE outputs
         shell: pwsh
