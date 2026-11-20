@@ -171,6 +171,9 @@ export interface AddedTextBox {
   fontSize: number;
   fontFamily: 'sans' | 'serif' | 'mono';
   color: string;
+  backgroundColor?: string;
+  borderColor?: string;
+  rotation?: number;
   bold: boolean;
   italic: boolean;
   underline: boolean;
@@ -200,6 +203,7 @@ export interface AnnotationOverlay {
     | 'rect'
     | 'circle'
     | 'arrow'
+    | 'whiteout'
     | 'sticky'
     | 'signature'
     | 'stamp';
@@ -209,9 +213,26 @@ export interface AnnotationOverlay {
   height: number;
   color: string;
   strokeWidth?: number;
+  opacity?: number;
+  fillColor?: string;
+  fontSize?: number;
+  lineStyle?: 'solid' | 'dashed';
+  arrowStyle?: 'single' | 'double' | 'line';
+  rotation?: number;
   points?: Array<{ x: number; y: number }>;
   comment?: string;
-  stickyArrow?: 'left' | 'right' | 'top' | 'bottom';
+  stickyArrow?:
+    | 'left'
+    | 'right'
+    | 'top'
+    | 'bottom'
+    | 'top-left'
+    | 'top-right'
+    | 'bottom-left'
+    | 'bottom-right'
+    | 'none';
+  stickyTipX?: number;
+  stickyTipY?: number;
   author?: string;
   dateStr?: string;
   signatureDataUrl?: string;

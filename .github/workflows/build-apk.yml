@@ -81,11 +81,18 @@ jobs:
             }
             fs.writeFileSync(manifestPath, xml, "utf8");
           '
+          mkdir -p android/app/src/main/res/values
+          cat > android/app/src/main/res/values/ic_launcher_background.xml << 'EOF'
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="ic_launcher_background">#020A24</color>
+</resources>
+EOF
           for dir in android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi; do
             if [ -d "$dir" ]; then
-              cp public/pwa-192x192.png "$dir/ic_launcher.png"
-              cp public/pwa-192x192.png "$dir/ic_launcher_round.png"
-              cp public/pwa-512x512.png "$dir/ic_launcher_foreground.png"
+              cp public/pwa-512x512.png "$dir/ic_launcher.png"
+              cp public/pwa-512x512.png "$dir/ic_launcher_round.png"
+              cp public/pwa-maskable-512x512.png "$dir/ic_launcher_foreground.png"
             fi
           done
 

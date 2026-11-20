@@ -5,6 +5,7 @@ import {
   StandardFonts,
   rgb,
   degrees,
+  LineCapStyle,
   PageSizes,
   PDFTextField,
   PDFCheckBox,
@@ -67,6 +68,83 @@ export function hasNonWinAnsiChars(text: string): boolean {
     if (code > 255) return true;
   }
   return false;
+}
+
+export interface StickyArrowGeometry {
+  hasArrow: boolean;
+  startX: number;
+  startY: number;
+  tipX: number;
+  tipY: number;
+  angleDeg: number;
+  length: number;
+}
+
+export function computeStickyArrowGeometry(ann: AnnotationOverlay): StickyArrowGeometry {
+  const boxW = Math.max(84, ann.width || 165);
+  const boxH = Math.max(44, ann.height || 76);
+  const side = ann.stickyArrow || 'top-left';
+
+  if (side === 'none' && (ann.stickyTipX === undefined || ann.stickyTipY === undefined)) {
+    return { hasArrow: false, startX: ann.x, startY: ann.y, tipX: ann.x, tipY: ann.y, angleDeg: 0, length: 0 };
+  }
+
+  let tipX = ann.stickyTipX;
+  let tipY = ann.stickyTipY;
+
+  if (tipX === undefined || tipY === undefined) {
+    const defaultLen = 40;
+    const diag = Math.round(defaultLen / Math.SQRT2);
+    switch (side) {
+      case 'top-left':
+        tipX = ann.x - diag;
+        tipY = ann.y - diag;
+        break;
+      case 'top-right':
+        tipX = ann.x + boxW + diag;
+        tipY = ann.y - diag;
+        break;
+      case 'bottom-left':
+        tipX = ann.x - diag;
+        tipY = ann.y + boxH + diag;
+        break;
+      case 'bottom-right':
+        tipX = ann.x + boxW + diag;
+        tipY = ann.y + boxH + diag;
+        break;
+      case 'left':
+        tipX = ann.x - defaultLen;
+        tipY = ann.y + boxH / 2;
+        break;
+      case 'right':
+        tipX = ann.x + boxW + defaultLen;
+        tipY = ann.y + boxH / 2;
+        break;
+      case 'top':
+        tipX = ann.x + boxW / 2;
+        tipY = ann.y - defaultLen;
+        break;
+      case 'bottom':
+        tipX = ann.x + boxW / 2;
+        tipY = ann.y + boxH + defaultLen;
+        break;
+      default:
+        return { hasArrow: false, startX: ann.x, startY: ann.y, tipX: ann.x, tipY: ann.y, angleDeg: 0, length: 0 };
+    }
+  }
+
+  const startX = Math.max(ann.x, Math.min(ann.x + boxW, tipX));
+  const startY = Math.max(ann.y, Math.min(ann.y + boxH, tipY));
+  const dx = tipX - startX;
+  const dy = tipY - startY;
+  const length = Math.hypot(dx, dy);
+
+  if (length < 2) {
+    return { hasArrow: false, startX, startY, tipX, tipY, angleDeg: 0, length: 0 };
+  }
+
+  const angleDeg = Math.round((Math.atan2(dy, dx) * 180) / Math.PI);
+  return { hasArrow: true, startX, startY, tipX, tipY, angleDeg, length };
 }
 
 /**
@@ -811,11 +889,18 @@ export async function applyPdfEditsToBytes(
     }
   }
 
-  // 2. Added text boxes
+  // 2. Added text boxes (supports optional fill, border, and rotation around box center)
   for (const tb of edits.addedTexts) {
     const page = pages[tb.pageNumber - 1];
     if (!page || !tb.text.trim()) continue;
     const { height: pageH } = page.getSize();
+    const boxW = Math.max(80, tb.width || 260);
+    const rotDeg = -(tb.rotation || 0);
+    const rad = (rotDeg * Math.PI) / 180;
+    const rotateAround = (px: number, py: number, cx: number, cy: number) => ({
+      x: cx + (px - cx) * Math.cos(rad) - (py - cy) * Math.sin(rad),
+      y: cy + (px - cx) * Math.sin(rad) + (py - cy) * Math.cos(rad),
+    });
 
     if (hasNonWinAnsiChars(tb.text) || (tb.letterSpacing || 0) !== 0) {
       const rendered = await renderUnicodeTextPng({
@@ -828,21 +913,46 @@ export async function applyPdfEditsToBytes(
         underline: tb.underline,
         align: tb.align,
         letterSpacing: tb.letterSpacing,
-        maxWidth: tb.width,
+        maxWidth: boxW,
       });
+      const drawW = Math.max(boxW, rendered.widthPt);
+      const drawH = rendered.heightPt + 6;
+      const cx = tb.x + drawW / 2;
+      const cy = pageH - tb.y - drawH / 2;
+      const ox = (drawW / 2) * Math.cos(rad) - (drawH / 2) * Math.sin(rad);
+      const oy = (drawW / 2) * Math.sin(rad) + (drawH / 2) * Math.cos(rad);
+
+      if ((tb.backgroundColor && tb.backgroundColor !== 'transparent') || tb.borderColor) {
+        page.drawRectangle({
+          x: cx - ox,
+          y: cy - oy,
+          width: drawW,
+          height: drawH,
+          ...(tb.backgroundColor && tb.backgroundColor !== 'transparent'
+            ? { color: hexToRgb(tb.backgroundColor), opacity: 0.96 }
+            : {}),
+          ...(tb.borderColor
+            ? { borderColor: hexToRgb(tb.borderColor), borderWidth: 1 }
+            : {}),
+          ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
+        });
+      }
+
       const img = await doc.embedPng(rendered.pngBytes);
+      const imgOx = (rendered.widthPt / 2) * Math.cos(rad) - (rendered.heightPt / 2) * Math.sin(rad);
+      const imgOy = (rendered.widthPt / 2) * Math.sin(rad) + (rendered.heightPt / 2) * Math.cos(rad);
       page.drawImage(img, {
-        x: tb.x,
-        y: pageH - tb.y - rendered.heightPt,
+        x: cx - imgOx,
+        y: cy - imgOy,
         width: rendered.widthPt,
         height: rendered.heightPt,
+        ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
       });
     } else {
-      // Emit genuine editable vector PDF text for WinAnsi added text boxes (even multiline/aligned/underlined)
+      // Emit genuine editable vector PDF text for WinAnsi added text boxes (even multiline/aligned/underlined/rotated)
       const font = pickStandardFont(tb.fontFamily, tb.bold, tb.italic);
       const col = hexToRgb(tb.color);
       const lineStep = tb.fontSize * 1.32;
-      const boxW = Math.max(80, tb.width || 260);
       const outLines: string[] = [];
 
       for (const rawLine of tb.text.split('\n')) {
@@ -854,7 +964,7 @@ export async function applyPdfEditsToBytes(
         let cur = '';
         for (const w of words) {
           const test = cur ? `${cur} ${w}` : w;
-          if (font.widthOfTextAtSize(test, tb.fontSize) > boxW && cur) {
+          if (font.widthOfTextAtSize(test, tb.fontSize) > boxW - 8 && cur) {
             outLines.push(cur);
             cur = w;
           } else {
@@ -864,24 +974,50 @@ export async function applyPdfEditsToBytes(
         if (cur) outLines.push(cur);
       }
 
+      const boxH = Math.max(tb.fontSize * 1.5 + 6, outLines.length * lineStep + 8);
+      const cx = tb.x + boxW / 2;
+      const cy = pageH - tb.y - boxH / 2;
+      const ox = (boxW / 2) * Math.cos(rad) - (boxH / 2) * Math.sin(rad);
+      const oy = (boxW / 2) * Math.sin(rad) + (boxH / 2) * Math.cos(rad);
+
+      if ((tb.backgroundColor && tb.backgroundColor !== 'transparent') || tb.borderColor) {
+        page.drawRectangle({
+          x: cx - ox,
+          y: cy - oy,
+          width: boxW,
+          height: boxH,
+          ...(tb.backgroundColor && tb.backgroundColor !== 'transparent'
+            ? { color: hexToRgb(tb.backgroundColor), opacity: 0.96 }
+            : {}),
+          ...(tb.borderColor
+            ? { borderColor: hexToRgb(tb.borderColor), borderWidth: 1 }
+            : {}),
+          ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
+        });
+      }
+
       outLines.forEach((line, idx) => {
         if (!line) return;
         const tw = font.widthOfTextAtSize(line, tb.fontSize);
-        let drawX = tb.x;
-        if (tb.align === 'center') drawX = tb.x + Math.max(0, (boxW - tw) / 2);
-        if (tb.align === 'right') drawX = tb.x + Math.max(0, boxW - tw);
-        const baselineY = pageH - tb.y - tb.fontSize - idx * lineStep;
+        let drawX = tb.x + 4;
+        if (tb.align === 'center') drawX = tb.x + Math.max(4, (boxW - tw) / 2);
+        if (tb.align === 'right') drawX = tb.x + Math.max(4, boxW - tw - 4);
+        const baselineY = pageH - tb.y - tb.fontSize - 3 - idx * lineStep;
+        const textPt = rotDeg !== 0 ? rotateAround(drawX, baselineY, cx, cy) : { x: drawX, y: baselineY };
         page.drawText(line, {
-          x: drawX,
-          y: baselineY,
+          x: textPt.x,
+          y: textPt.y,
           size: tb.fontSize,
           font,
           color: col,
+          ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
         });
         if (tb.underline && tw > 0) {
+          const u1 = rotDeg !== 0 ? rotateAround(drawX, baselineY - 2, cx, cy) : { x: drawX, y: baselineY - 2 };
+          const u2 = rotDeg !== 0 ? rotateAround(drawX + tw, baselineY - 2, cx, cy) : { x: drawX + tw, y: baselineY - 2 };
           page.drawLine({
-            start: { x: drawX, y: baselineY - 2 },
-            end: { x: drawX + tw, y: baselineY - 2 },
+            start: u1,
+            end: u2,
             thickness: Math.max(0.8, tb.fontSize * 0.07),
             color: col,
           });
@@ -933,21 +1069,34 @@ export async function applyPdfEditsToBytes(
         width: ann.width,
         height: ann.height,
         color,
-        opacity: 0.32,
+        opacity: ann.opacity ?? 0.34,
+      });
+    } else if (ann.kind === 'whiteout') {
+      page.drawRectangle({
+        x: ann.x,
+        y: pageH - ann.y - ann.height,
+        width: ann.width,
+        height: ann.height,
+        color: hexToRgb(ann.fillColor || ann.color || '#FFFFFF'),
+        opacity: ann.opacity ?? 1,
       });
     } else if (ann.kind === 'underline') {
       page.drawLine({
-        start: { x: ann.x, y: pageH - ann.y - ann.height },
-        end: { x: ann.x + ann.width, y: pageH - ann.y - ann.height },
-        thickness: 2,
+        start: { x: ann.x, y: pageH - (ann.y + ann.height) },
+        end: { x: ann.x + ann.width, y: pageH - (ann.y + ann.height) },
+        thickness: ann.strokeWidth || 2,
         color,
+        lineCap: LineCapStyle.Round,
+        opacity: ann.opacity ?? 1,
       });
     } else if (ann.kind === 'strikethrough') {
       page.drawLine({
-        start: { x: ann.x, y: pageH - ann.y - ann.height / 2 },
-        end: { x: ann.x + ann.width, y: pageH - ann.y - ann.height / 2 },
-        thickness: 2,
+        start: { x: ann.x, y: pageH - (ann.y + ann.height / 2) },
+        end: { x: ann.x + ann.width, y: pageH - (ann.y + ann.height / 2) },
+        thickness: ann.strokeWidth || 2,
         color,
+        lineCap: LineCapStyle.Round,
+        opacity: ann.opacity ?? 1,
       });
     } else if (ann.kind === 'rect') {
       page.drawRectangle({
@@ -957,146 +1106,279 @@ export async function applyPdfEditsToBytes(
         height: ann.height,
         borderColor: color,
         borderWidth: ann.strokeWidth || 2,
+        ...(ann.lineStyle === 'dashed' ? { borderDashArray: [6, 4] } : {}),
+        ...(ann.fillColor
+          ? { color: hexToRgb(ann.fillColor), opacity: 0.18, borderOpacity: ann.opacity ?? 1 }
+          : { borderOpacity: ann.opacity ?? 1 }),
       });
     } else if (ann.kind === 'circle') {
       page.drawEllipse({
         x: ann.x + ann.width / 2,
         y: pageH - ann.y - ann.height / 2,
-        xScale: ann.width / 2,
-        yScale: ann.height / 2,
+        xScale: Math.max(1, ann.width / 2),
+        yScale: Math.max(1, ann.height / 2),
         borderColor: color,
         borderWidth: ann.strokeWidth || 2,
+        ...(ann.lineStyle === 'dashed' ? { borderDashArray: [6, 4] } : {}),
+        ...(ann.fillColor
+          ? { color: hexToRgb(ann.fillColor), opacity: 0.18, borderOpacity: ann.opacity ?? 1 }
+          : { borderOpacity: ann.opacity ?? 1 }),
       });
     } else if (ann.kind === 'arrow') {
       const startX = ann.x;
       const startY = pageH - ann.y;
       const endX = ann.x + ann.width;
       const endY = pageH - (ann.y + ann.height);
+      const thick = ann.strokeWidth || 2.5;
+      const op = ann.opacity ?? 1;
+      const arrowStyle = ann.arrowStyle || 'single';
       page.drawLine({
         start: { x: startX, y: startY },
         end: { x: endX, y: endY },
-        thickness: ann.strokeWidth || 2.5,
+        thickness: thick,
         color,
+        lineCap: LineCapStyle.Round,
+        opacity: op,
+        ...(ann.lineStyle === 'dashed' ? { dashArray: [6, 4] } : {}),
       });
       const angle = Math.atan2(endY - startY, endX - startX);
-      const headLen = 10;
-      page.drawLine({
-        start: { x: endX, y: endY },
-        end: { x: endX - headLen * Math.cos(angle - Math.PI / 6), y: endY - headLen * Math.sin(angle - Math.PI / 6) },
-        thickness: ann.strokeWidth || 2.5,
-        color,
-      });
-      page.drawLine({
-        start: { x: endX, y: endY },
-        end: { x: endX - headLen * Math.cos(angle + Math.PI / 6), y: endY - headLen * Math.sin(angle + Math.PI / 6) },
-        thickness: ann.strokeWidth || 2.5,
-        color,
-      });
+      const headLen = Math.max(9, thick * 3.4);
+      if (arrowStyle !== 'line') {
+        page.drawLine({
+          start: { x: endX, y: endY },
+          end: { x: endX - headLen * Math.cos(angle - Math.PI / 6), y: endY - headLen * Math.sin(angle - Math.PI / 6) },
+          thickness: thick,
+          color,
+          lineCap: LineCapStyle.Round,
+          opacity: op,
+        });
+        page.drawLine({
+          start: { x: endX, y: endY },
+          end: { x: endX - headLen * Math.cos(angle + Math.PI / 6), y: endY - headLen * Math.sin(angle + Math.PI / 6) },
+          thickness: thick,
+          color,
+          lineCap: LineCapStyle.Round,
+          opacity: op,
+        });
+      }
+      if (arrowStyle === 'double') {
+        const revAngle = angle + Math.PI;
+        page.drawLine({
+          start: { x: startX, y: startY },
+          end: { x: startX - headLen * Math.cos(revAngle - Math.PI / 6), y: startY - headLen * Math.sin(revAngle - Math.PI / 6) },
+          thickness: thick,
+          color,
+          lineCap: LineCapStyle.Round,
+          opacity: op,
+        });
+        page.drawLine({
+          start: { x: startX, y: startY },
+          end: { x: startX - headLen * Math.cos(revAngle + Math.PI / 6), y: startY - headLen * Math.sin(revAngle + Math.PI / 6) },
+          thickness: thick,
+          color,
+          lineCap: LineCapStyle.Round,
+          opacity: op,
+        });
+      }
     } else if (ann.kind === 'freehand' && ann.points && ann.points.length > 1) {
-      for (let i = 1; i < ann.points.length; i++) {
-        const p1 = ann.points[i - 1];
-        const p2 = ann.points[i];
+      const pts = ann.points;
+      const thick = ann.strokeWidth || 2.5;
+      const op = ann.opacity ?? 1;
+      // Subdivide quadratic midpoint Bezier curves into smooth dense segments with round caps
+      const smoothPts: Array<{ x: number; y: number }> = [pts[0]];
+      if (pts.length === 2) {
+        smoothPts.push(pts[1]);
+      } else {
+        for (let i = 1; i < pts.length - 1; i++) {
+          const prev = smoothPts[smoothPts.length - 1];
+          const ctrl = pts[i];
+          const nextMid = {
+            x: (pts[i].x + pts[i + 1].x) / 2,
+            y: (pts[i].y + pts[i + 1].y) / 2,
+          };
+          for (let s = 1; s <= 4; s++) {
+            const t = s / 4;
+            const mt = 1 - t;
+            smoothPts.push({
+              x: mt * mt * prev.x + 2 * mt * t * ctrl.x + t * t * nextMid.x,
+              y: mt * mt * prev.y + 2 * mt * t * ctrl.y + t * t * nextMid.y,
+            });
+          }
+        }
+        smoothPts.push(pts[pts.length - 1]);
+      }
+      for (let i = 1; i < smoothPts.length; i++) {
+        const p1 = smoothPts[i - 1];
+        const p2 = smoothPts[i];
         page.drawLine({
           start: { x: p1.x, y: pageH - p1.y },
           end: { x: p2.x, y: pageH - p2.y },
-          thickness: ann.strokeWidth || 2.5,
+          thickness: thick,
           color,
+          lineCap: LineCapStyle.Round,
+          opacity: op,
         });
       }
     } else if (ann.kind === 'sticky') {
-      const boxW = 150;
-      const boxH = 54;
+      const boxW = Math.max(84, ann.width || 165);
+      const boxH = Math.max(44, ann.height || 76);
       const boxY = pageH - ann.y - boxH;
-      const borderAmber = rgb(0.92, 0.62, 0.08);
+      const noteBg = hexToRgb(ann.fillColor || '#FEF3C7');
+      const noteAccent = hexToRgb(ann.color && ann.color !== '#FACC15' ? ann.color : '#D97706');
+      const fontSize = Math.max(7, Math.min(24, ann.fontSize || 9.5));
+
       page.drawRectangle({
         x: ann.x,
         y: boxY,
         width: boxW,
         height: boxH,
-        color: rgb(1, 0.96, 0.72),
-        borderColor: borderAmber,
-        borderWidth: 1.2,
+        color: noteBg,
+        borderColor: noteAccent,
+        borderWidth: 1.4,
       });
 
-      // Draw callout pointer arrow indicator
-      const arrowSide = ann.stickyArrow || 'left';
-      let stemStart = { x: ann.x, y: boxY + boxH / 2 };
-      let stemEnd = { x: ann.x - 16, y: boxY + boxH / 2 };
-      if (arrowSide === 'right') {
-        stemStart = { x: ann.x + boxW, y: boxY + boxH / 2 };
-        stemEnd = { x: ann.x + boxW + 16, y: boxY + boxH / 2 };
-      } else if (arrowSide === 'top') {
-        stemStart = { x: ann.x + boxW / 2, y: boxY + boxH };
-        stemEnd = { x: ann.x + boxW / 2, y: boxY + boxH + 16 };
-      } else if (arrowSide === 'bottom') {
-        stemStart = { x: ann.x + boxW / 2, y: boxY };
-        stemEnd = { x: ann.x + boxW / 2, y: boxY - 16 };
+      // Draw free-angle / corner / directional callout arrow indicator
+      const arrowGeo = computeStickyArrowGeometry(ann);
+      if (arrowGeo.hasArrow) {
+        const stemStart = { x: arrowGeo.startX, y: pageH - arrowGeo.startY };
+        const stemEnd = { x: arrowGeo.tipX, y: pageH - arrowGeo.tipY };
+        const thick = Math.max(1.8, ann.strokeWidth || 2.1);
+        page.drawLine({
+          start: stemStart,
+          end: stemEnd,
+          thickness: thick,
+          color: noteAccent,
+          lineCap: LineCapStyle.Round,
+        });
+        const ang = Math.atan2(stemEnd.y - stemStart.y, stemEnd.x - stemStart.x);
+        const headLen = Math.max(7, Math.min(13, thick * 3.6));
+        page.drawLine({
+          start: stemEnd,
+          end: { x: stemEnd.x - headLen * Math.cos(ang - Math.PI / 6), y: stemEnd.y - headLen * Math.sin(ang - Math.PI / 6) },
+          thickness: thick,
+          color: noteAccent,
+          lineCap: LineCapStyle.Round,
+        });
+        page.drawLine({
+          start: stemEnd,
+          end: { x: stemEnd.x - headLen * Math.cos(ang + Math.PI / 6), y: stemEnd.y - headLen * Math.sin(ang + Math.PI / 6) },
+          thickness: thick,
+          color: noteAccent,
+          lineCap: LineCapStyle.Round,
+        });
       }
-      page.drawLine({ start: stemStart, end: stemEnd, thickness: 2, color: borderAmber });
-      const ang = Math.atan2(stemEnd.y - stemStart.y, stemEnd.x - stemStart.x);
-      page.drawLine({
-        start: stemEnd,
-        end: { x: stemEnd.x - 6 * Math.cos(ang - Math.PI / 5), y: stemEnd.y - 6 * Math.sin(ang - Math.PI / 5) },
-        thickness: 2,
-        color: borderAmber,
-      });
-      page.drawLine({
-        start: stemEnd,
-        end: { x: stemEnd.x - 6 * Math.cos(ang + Math.PI / 5), y: stemEnd.y - 6 * Math.sin(ang + Math.PI / 5) },
-        thickness: 2,
-        color: borderAmber,
-      });
 
-      const noteText = (ann.comment || 'Note').slice(0, 80);
+      const noteText = (ann.comment || 'Note').slice(0, 800);
+      const innerW = Math.max(40, boxW - 12);
       if (hasNonWinAnsiChars(noteText)) {
         const rendered = await renderUnicodeTextPng({
           text: noteText,
-          fontSize: 9,
+          fontSize,
           fontFamily: 'sans',
           color: '#1E293B',
           bold: false,
           italic: false,
           underline: false,
           align: 'left',
-          maxWidth: 138,
+          maxWidth: innerW,
         });
         const img = await doc.embedPng(rendered.pngBytes);
+        const drawH = Math.min(boxH - 8, rendered.heightPt);
+        const drawW = rendered.heightPt > boxH - 8 ? rendered.widthPt * (drawH / rendered.heightPt) : rendered.widthPt;
         page.drawImage(img, {
-          x: ann.x + 5,
-          y: pageH - ann.y - 6 - rendered.heightPt,
-          width: rendered.widthPt,
-          height: rendered.heightPt,
+          x: ann.x + 6,
+          y: pageH - ann.y - 5 - drawH,
+          width: Math.min(innerW, drawW),
+          height: drawH,
         });
       } else {
-        page.drawText(noteText, {
-          x: ann.x + 6,
-          y: pageH - ann.y - 16,
-          size: 9,
-          font: fontHelv,
-          color: rgb(0.12, 0.16, 0.23),
-          maxWidth: 138,
-          lineHeight: 11,
+        const lineHeight = fontSize * 1.28;
+        const maxLines = Math.max(1, Math.floor((boxH - 10) / lineHeight));
+        const wrapped: string[] = [];
+        for (const rawLine of noteText.split('\n')) {
+          const words = rawLine.split(/\s+/);
+          let cur = '';
+          for (const w of words) {
+            const test = cur ? `${cur} ${w}` : w;
+            if (fontHelv.widthOfTextAtSize(test, fontSize) > innerW && cur) {
+              wrapped.push(cur);
+              cur = w;
+            } else {
+              cur = test;
+            }
+          }
+          wrapped.push(cur);
+        }
+        wrapped.slice(0, maxLines).forEach((ln, idx) => {
+          if (!ln) return;
+          page.drawText(ln, {
+            x: ann.x + 6,
+            y: pageH - ann.y - fontSize - 5 - idx * lineHeight,
+            size: fontSize,
+            font: fontHelv,
+            color: rgb(0.12, 0.16, 0.23),
+          });
         });
       }
     } else if (ann.kind === 'stamp') {
-      const label = ann.dateStr || new Date().toLocaleDateString();
+      const label = (ann.comment || ann.dateStr || new Date().toLocaleDateString()).trim();
+      const stampFont = Math.max(8, Math.min(26, ann.fontSize || 10));
+      const stampW = Math.max(96, ann.width || label.length * stampFont * 0.72 + 20);
+      const stampH = Math.max(24, ann.height || stampFont * 2.4);
+      const rotDeg = -(ann.rotation || 0);
+      const rad = (rotDeg * Math.PI) / 180;
+      const cx = ann.x + stampW / 2;
+      const cy = pageH - ann.y - stampH / 2;
+      const ox = (stampW / 2) * Math.cos(rad) - (stampH / 2) * Math.sin(rad);
+      const oy = (stampW / 2) * Math.sin(rad) + (stampH / 2) * Math.cos(rad);
       page.drawRectangle({
-        x: ann.x,
-        y: pageH - ann.y - 26,
-        width: Math.max(105, label.length * 6.5 + 16),
-        height: 26,
+        x: cx - ox,
+        y: cy - oy,
+        width: stampW,
+        height: stampH,
         borderColor: color,
-        borderWidth: 1.5,
-        color: rgb(0.97, 0.98, 1),
-        opacity: 0.9,
+        borderWidth: 1.8,
+        color: rgb(0.98, 0.99, 1),
+        opacity: 0.92,
+        ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
       });
-      page.drawText(label, {
-        x: ann.x + 8,
-        y: pageH - ann.y - 17,
-        size: 10,
-        font: fontHelvBold,
-        color,
-      });
+      if (hasNonWinAnsiChars(label)) {
+        const rendered = await renderUnicodeTextPng({
+          text: label,
+          fontSize: stampFont,
+          fontFamily: 'sans',
+          color: ann.color || '#2563EB',
+          bold: true,
+          italic: false,
+          underline: false,
+          align: 'center',
+          maxWidth: stampW - 8,
+        });
+        const img = await doc.embedPng(rendered.pngBytes);
+        const iox = (rendered.widthPt / 2) * Math.cos(rad) - (rendered.heightPt / 2) * Math.sin(rad);
+        const ioy = (rendered.widthPt / 2) * Math.sin(rad) + (rendered.heightPt / 2) * Math.cos(rad);
+        page.drawImage(img, {
+          x: cx - iox,
+          y: cy - ioy,
+          width: rendered.widthPt,
+          height: rendered.heightPt,
+          ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
+        });
+      } else {
+        const tw = fontHelvBold.widthOfTextAtSize(label, stampFont);
+        const rawTx = ann.x + Math.max(8, (stampW - tw) / 2);
+        const rawTy = pageH - ann.y - stampH / 2 - stampFont * 0.35;
+        const tx = rotDeg !== 0 ? cx + (rawTx - cx) * Math.cos(rad) - (rawTy - cy) * Math.sin(rad) : rawTx;
+        const ty = rotDeg !== 0 ? cy + (rawTx - cx) * Math.sin(rad) + (rawTy - cy) * Math.cos(rad) : rawTy;
+        page.drawText(label, {
+          x: tx,
+          y: ty,
+          size: stampFont,
+          font: fontHelvBold,
+          color,
+          ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
+        });
+      }
     } else if (ann.kind === 'signature' && ann.signatureDataUrl) {
       const base64 = ann.signatureDataUrl.split(',')[1];
       if (base64) {
