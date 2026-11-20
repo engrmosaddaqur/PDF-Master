@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlignCenter,
   AlignLeft,
@@ -19,6 +19,7 @@ import {
   ImagePlus,
   Italic,
   Layers,
+  Loader2,
   MessageSquare,
   MousePointer,
   MousePointer2,
@@ -29,6 +30,7 @@ import {
   Redo2,
   RotateCw,
   Save,
+  ScanText,
   Square,
   Strikethrough,
   Trash2,
@@ -46,18 +48,23 @@ import type {
   AppLanguage,
   DocumentRecord,
   ExtractedTextRun,
+  PdfFontFamily,
   TextReplacementEdit,
 } from '../types';
 import { getT } from '../i18n/translations';
 import {
+  OFFICIAL_FONT_OPTIONS,
   applyPdfEditsToBytes,
   cloneBuffer,
   computeSha256Hex,
   computeStickyArrowGeometry,
   extractPageTextRuns,
+  getFontCssStack,
+  inferOfficialFontFromPdfName,
   renderPageThumbnail,
   renderPageToCanvas,
 } from '../services/pdfEngine';
+import { detectOcrLineRuns } from '../services/ocrService';
 import { saveBufferToDeviceStorage } from '../services/deviceFileActions';
 import { SignatureModal } from './SignatureModal';
 import { usePdfPinchZoom } from '../hooks/usePdfPinchZoom';
@@ -299,6 +306,58 @@ function doesEraserHitAnnotation(
   return px >= minX && px <= maxX && py >= minY && py <= maxY;
 }
 
+interface EditTextRunsLayerProps {
+  runs: ExtractedTextRun[];
+  replacedRunIds: Set<string>;
+  scale: number;
+  onSelectRun: (run: ExtractedTextRun) => void;
+}
+
+const EditTextRunsLayer = React.memo<EditTextRunsLayerProps>(
+  ({ runs, replacedRunIds, scale, onSelectRun }) => {
+    const untouched = useMemo(
+      () => runs.filter((r) => !replacedRunIds.has(r.id)),
+      [runs, replacedRunIds]
+    );
+    const runById = useMemo(() => {
+      const m = new Map<string, ExtractedTextRun>();
+      for (const r of untouched) m.set(r.id, r);
+      return m;
+    }, [untouched]);
+
+    if (untouched.length === 0) return null;
+
+    return (
+      <div
+        onClick={(e) => {
+          const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-run-id]');
+          if (!btn) return;
+          e.stopPropagation();
+          const run = runById.get(btn.dataset.runId || '');
+          if (run) onSelectRun(run);
+        }}
+        className="pointer-events-none absolute inset-0"
+      >
+        {untouched.map((run) => (
+          <button
+            key={run.id}
+            type="button"
+            data-run-id={run.id}
+            style={{
+              left: run.x * scale,
+              top: run.y * scale,
+              minWidth: Math.max(14, run.width * scale),
+              minHeight: Math.max(12, run.height * scale),
+              pointerEvents: 'auto',
+            }}
+            className="absolute text-left rounded bg-[#2563EB]/[0.03] active:bg-[#2563EB]/20 border border-dashed border-[#2563EB]/35"
+          />
+        ))}
+      </div>
+    );
+  }
+);
+
 export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   doc,
   language,
@@ -314,6 +373,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   });
   const [pageSize, setPageSize] = useState({ width: 595, height: 842 });
   const [textRuns, setTextRuns] = useState<ExtractedTextRun[]>([]);
+  const [ocrScannedPages, setOcrScannedPages] = useState<Record<number, ExtractedTextRun[]>>({});
+  const [ocrScanning, setOcrScanning] = useState(false);
+  const [editBoxDrawMode, setEditBoxDrawMode] = useState(false);
   const [activeTool, setActiveTool] = useState<EditorTool>('editText');
   const [activeColor, setActiveColor] = useState('#2563EB');
 
@@ -344,7 +406,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   const [runDraft, setRunDraft] = useState({
     text: '',
     fontSize: 12,
-    fontFamily: 'sans' as 'sans' | 'serif' | 'mono',
+    fontFamily: 'arial' as PdfFontFamily,
     color: '#1E293B',
     backgroundColor: '#FFFFFF',
     bold: false,
@@ -360,7 +422,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   const [newBoxDraft, setNewBoxDraft] = useState({
     text: '',
     fontSize: 14,
-    fontFamily: 'sans' as 'sans' | 'serif' | 'mono',
+    fontFamily: 'arial' as PdfFontFamily,
     color: '#142B4A',
     backgroundColor: 'transparent',
     rotation: 0,
@@ -705,7 +767,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       setNewBoxDraft({
         text: '',
         fontSize: 14,
-        fontFamily: 'sans',
+        fontFamily: 'arial',
         color: activeColor,
         backgroundColor: 'transparent',
         rotation: 0,
@@ -802,6 +864,23 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       const pt = toUnscaledCoords(e.clientX, e.clientY);
       setEraserCursor(pt);
       eraseAtPoint(pt);
+      return;
+    }
+
+    if (
+      activeTool === 'editText' &&
+      e.target === overlayRef.current &&
+      (editBoxDrawMode || e.pointerType === 'mouse')
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
+      setSelectedElement(null);
+      const pt = toUnscaledCoords(e.clientX, e.clientY);
+      e.currentTarget.setPointerCapture(e.pointerId);
+      dragStartRef.current = pt;
+      const initialBox = { x: pt.x, y: pt.y, w: 0, h: 0 };
+      liveBoxRef.current = initialBox;
+      setLiveBox(initialBox);
       return;
     }
 
@@ -1173,6 +1252,31 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     const finalPts = liveFreehandRef.current;
     const finalBox = liveBoxRef.current;
 
+    if (activeTool === 'editText' && finalBox && Math.abs(finalBox.w) > 8 && Math.abs(finalBox.h) > 6) {
+      const bx = Math.min(finalBox.x, finalBox.x + finalBox.w);
+      const by = Math.min(finalBox.y, finalBox.y + finalBox.h);
+      const bw = Math.abs(finalBox.w);
+      const bh = Math.abs(finalBox.h);
+      const customRun: ExtractedTextRun = {
+        id: `custom_run_${pageNumber}_${Date.now()}`,
+        pageNumber,
+        str: '',
+        x: bx,
+        y: by,
+        width: Math.max(14, bw),
+        height: Math.max(10, bh),
+        fontSize: Math.max(6, Math.min(44, Math.round(bh * 0.78))),
+        fontName: 'Arial',
+      };
+      dragStartRef.current = null;
+      liveFreehandRef.current = [];
+      liveBoxRef.current = null;
+      setLiveFreehand([]);
+      setLiveBox(null);
+      handleOpenTextRunEditor(customRun);
+      return;
+    }
+
     if (activeTool === 'draw' && finalPts.length >= 1) {
       const strokePts =
         finalPts.length === 1
@@ -1299,7 +1403,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     setRunDraft({
       text: existing ? existing.newText : run.str,
       fontSize: existing ? existing.fontSize : Math.round(run.fontSize),
-      fontFamily: existing?.fontFamily || 'sans',
+      fontFamily: existing?.fontFamily || inferOfficialFontFromPdfName(run.fontName),
       color: existing?.color || '#1E293B',
       backgroundColor: existing?.backgroundColor || sampleCanvasBgHex(run),
       bold: existing?.bold || false,
@@ -1308,6 +1412,56 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       align: existing?.align || 'left',
       letterSpacing: existing?.letterSpacing || 0,
     });
+  };
+
+  const openRunEditorRef = useRef(handleOpenTextRunEditor);
+  openRunEditorRef.current = handleOpenTextRunEditor;
+  const handleSelectRunStable = useCallback((run: ExtractedTextRun) => {
+    openRunEditorRef.current(run);
+  }, []);
+
+  const handleScanMissingTextOcr = async () => {
+    if (ocrScanning) return;
+    setOcrScanning(true);
+    setStatusMessage(
+      language === 'bn' ? 'অদৃশ্য/ইমেজ টেক্সট স্ক্যান হচ্ছে...' : 'Scanning missing text...'
+    );
+    try {
+      const offscreen = document.createElement('canvas');
+      const res = await renderPageToCanvas(doc.pdfBytes, pageNumber, offscreen, 2.0);
+      const existingAll = [...textRuns, ...(ocrScannedPages[pageNumber] || [])];
+      const found = await detectOcrLineRuns(
+        offscreen,
+        pageNumber,
+        res.unscaledWidth,
+        res.unscaledHeight,
+        existingAll,
+        'eng+ben'
+      );
+      if (found.length > 0) {
+        setOcrScannedPages((prev) => ({
+          ...prev,
+          [pageNumber]: [...(prev[pageNumber] || []), ...found],
+        }));
+        setStatusMessage(
+          language === 'bn'
+            ? `আরও ${found.length}টি টেক্সট লাইন পাওয়া গেছে`
+            : `Found ${found.length} more editable lines`
+        );
+      } else {
+        setStatusMessage(
+          language === 'bn'
+            ? 'সব টেক্সট চিহ্নিত আছে — প্রয়োজনে "বক্স এঁকে এডিট" ব্যবহার করুন'
+            : 'All text detected — use Box Select for any custom area'
+        );
+      }
+      setTimeout(() => setStatusMessage(null), 3200);
+    } catch {
+      setStatusMessage(language === 'bn' ? 'টেক্সট স্ক্যান ব্যর্থ হয়েছে' : 'OCR scan failed');
+      setTimeout(() => setStatusMessage(null), 2500);
+    } finally {
+      setOcrScanning(false);
+    }
   };
 
   const handleApplyRunReplacement = (deleted: boolean) => {
@@ -1471,7 +1625,18 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     }
   };
 
-  const pageReplacements = state.replacements.filter((r) => r.pageNumber === pageNumber);
+  const pageReplacements = useMemo(
+    () => state.replacements.filter((r) => r.pageNumber === pageNumber),
+    [state.replacements, pageNumber]
+  );
+  const replacedRunIds = useMemo(
+    () => new Set(pageReplacements.map((r) => r.runId)),
+    [pageReplacements]
+  );
+  const displayedTextRuns = useMemo(
+    () => [...textRuns, ...(ocrScannedPages[pageNumber] || [])],
+    [textRuns, ocrScannedPages, pageNumber]
+  );
   const pageAddedTexts = state.addedTexts.filter((tb) => tb.pageNumber === pageNumber);
   const pageAddedImages = state.addedImages.filter((im) => im.pageNumber === pageNumber);
   const pageAnnotations = state.annotations.filter((an) => an.pageNumber === pageNumber);
@@ -1511,6 +1676,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   const lockExistingElements = isDragStrokeTool || activeTool === 'eraser';
 
   const showContextualSubBar =
+    activeTool === 'editText' ||
     activeTool === 'draw' ||
     activeTool === 'eraser' ||
     activeTool === 'rect' ||
@@ -2173,12 +2339,17 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 }}
                 style={{
                   touchAction:
-                    activeTool === 'pan' || isDragStrokeTool || activeTool === 'eraser'
+                    activeTool === 'pan' ||
+                    isDragStrokeTool ||
+                    activeTool === 'eraser' ||
+                    (activeTool === 'editText' && editBoxDrawMode)
                       ? 'none'
                       : 'pan-x pan-y',
                   pointerEvents: activeTool === 'pan' ? 'none' : 'auto',
                   cursor:
-                    isDragStrokeTool || activeTool === 'eraser'
+                    isDragStrokeTool ||
+                    activeTool === 'eraser' ||
+                    (activeTool === 'editText' && editBoxDrawMode)
                       ? 'crosshair'
                       : activeTool === 'addText' || activeTool === 'sticky' || activeTool === 'stamp' || activeTool === 'signature'
                       ? 'copy'
@@ -2188,7 +2359,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               >
                 {/* Always render committed native text replacements across all tools */}
                 {pageReplacements.map((rep) => {
-                  const runMatch = textRuns.find((r) => r.id === rep.runId);
+                  const runMatch = displayedTextRuns.find((r) => r.id === rep.runId);
                   return (
                     <button
                       key={rep.id}
@@ -2207,7 +2378,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                             width: rep.width,
                             height: rep.height,
                             fontSize: rep.fontSize,
-                            fontName: 'Helvetica',
+                            fontName: 'Arial',
                           });
                         }
                       }}
@@ -2226,13 +2397,14 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                         <span
                           style={{
                             fontSize: rep.fontSize * scale,
+                            fontFamily: getFontCssStack(rep.fontFamily),
                             color: rep.color,
                             fontWeight: rep.bold ? 700 : 400,
                             fontStyle: rep.italic ? 'italic' : 'normal',
                             textDecoration: rep.underline ? 'underline' : 'none',
                             letterSpacing: `${(rep.letterSpacing || 0) * scale}px`,
                           }}
-                          className="block leading-tight whitespace-nowrap px-0.5"
+                          className="block leading-tight whitespace-pre-wrap px-0.5"
                         >
                           {rep.newText}
                         </span>
@@ -2241,28 +2413,15 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   );
                 })}
 
-                {/* Untouched native PDF text runs (visible dotted guides on mobile when editText is active) */}
-                {activeTool === 'editText' &&
-                  textRuns
-                    .filter((run) => !pageReplacements.some((r) => r.runId === run.id))
-                    .map((run) => (
-                      <button
-                        key={run.id}
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          handleOpenTextRunEditor(run);
-                        }}
-                        title="Tap to edit text"
-                        style={{
-                          left: run.x * scale,
-                          top: run.y * scale,
-                          minWidth: Math.max(16, run.width * scale),
-                          minHeight: Math.max(14, run.height * scale),
-                        }}
-                        className="absolute text-left rounded transition-colors bg-[#2563EB]/[0.03] hover:bg-[#2563EB]/15 border border-dashed border-[#2563EB]/25 hover:border-[#2563EB]/70"
-                      />
-                    ))}
+                {/* Merged, memoized native + OCR text lines */}
+                {activeTool === 'editText' && (
+                  <EditTextRunsLayer
+                    runs={displayedTextRuns}
+                    replacedRunIds={replacedRunIds}
+                    scale={scale}
+                    onSelectRun={handleSelectRunStable}
+                  />
+                )}
 
                 {/* Added text boxes */}
                 {pageAddedTexts.map((tb) => {
@@ -2295,6 +2454,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                         top: tb.y * scale,
                         width: tb.width * scale,
                         fontSize: tb.fontSize * scale,
+                        fontFamily: getFontCssStack(tb.fontFamily),
                         color: tb.color,
                         backgroundColor: bgStyle,
                         transform: tb.rotation ? `rotate(${tb.rotation}deg)` : undefined,
@@ -2806,6 +2966,19 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     />
                   )}
 
+                  {liveBox && activeTool === 'editText' && (
+                    <rect
+                      x={liveBox.x}
+                      y={liveBox.y}
+                      width={Math.abs(liveBox.w)}
+                      height={Math.abs(liveBox.h)}
+                      fill="rgba(37,99,235,0.12)"
+                      stroke="#2563EB"
+                      strokeWidth={1.5}
+                      strokeDasharray="4 3"
+                    />
+                  )}
+
                   {/* Eraser cursor circle */}
                   {activeTool === 'eraser' && eraserCursor && (
                     <circle
@@ -3265,6 +3438,40 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       <div className="bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 pb-safe shrink-0">
         {showContextualSubBar && (
           <div className="flex items-center justify-between gap-2 px-3 py-1.5 bg-slate-50 dark:bg-slate-800/70 border-b border-slate-200 dark:border-slate-800 overflow-x-auto no-scrollbar text-xs">
+            {activeTool === 'editText' && (
+              <div className="flex items-center justify-between gap-2 w-full">
+                <span className="text-[11px] font-mono-nums font-semibold text-slate-600 dark:text-slate-300 whitespace-nowrap">
+                  {displayedTextRuns.length} {language === 'bn' ? 'লাইন' : 'lines'}
+                </span>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setEditBoxDrawMode((v) => !v)}
+                    className={`px-2.5 py-1 rounded-lg font-semibold whitespace-nowrap border flex items-center gap-1 ${
+                      editBoxDrawMode
+                        ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                        : 'bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    <Square className="w-3 h-3" />
+                    {language === 'bn' ? 'বক্স এঁকে এডিট' : 'Box Select'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={ocrScanning}
+                    onClick={handleScanMissingTextOcr}
+                    className="px-2.5 py-1 rounded-lg font-semibold whitespace-nowrap bg-cyan-600 text-white disabled:opacity-60 flex items-center gap-1"
+                  >
+                    {ocrScanning ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <ScanText className="w-3.5 h-3.5" />
+                    )}
+                    {language === 'bn' ? 'সব টেক্সট ধরুন (OCR)' : 'Scan Missing Text'}
+                  </button>
+                </div>
+              </div>
+            )}
             {activeTool === 'draw' && (
               <div className="flex items-center gap-2 w-full justify-between">
                 <div className="flex items-center gap-1.5">
@@ -3640,24 +3847,29 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               </button>
             </div>
 
-            <input
-              type="text"
+            <textarea
+              rows={2}
               value={runDraft.text}
               onChange={(e) => setRunDraft((d) => ({ ...d, text: e.target.value }))}
-              className="w-full min-h-[46px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm text-slate-900 dark:text-white"
+              placeholder={t.editor.textPlaceholder}
+              style={{ fontFamily: getFontCssStack(runDraft.fontFamily) }}
+              className="w-full p-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm text-slate-900 dark:text-white"
             />
 
             <div className="flex flex-wrap items-center gap-2">
               <select
                 value={runDraft.fontFamily}
                 onChange={(e) =>
-                  setRunDraft((d) => ({ ...d, fontFamily: e.target.value as 'sans' | 'serif' | 'mono' }))
+                  setRunDraft((d) => ({ ...d, fontFamily: e.target.value as PdfFontFamily }))
                 }
+                style={{ fontFamily: getFontCssStack(runDraft.fontFamily) }}
                 className="h-10 px-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs"
               >
-                <option value="sans">Sans (Unicode/বাংলা)</option>
-                <option value="serif">Serif</option>
-                <option value="mono">Monospace</option>
+                {OFFICIAL_FONT_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value} style={{ fontFamily: opt.cssStack }}>
+                    {opt.label}
+                  </option>
+                ))}
               </select>
               <input
                 type="number"
@@ -3813,6 +4025,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               value={newBoxDraft.text}
               onChange={(e) => setNewBoxDraft((d) => ({ ...d, text: e.target.value }))}
               placeholder={t.editor.textPlaceholder}
+              style={{ fontFamily: getFontCssStack(newBoxDraft.fontFamily) }}
               autoFocus
               className="w-full p-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm"
             />
@@ -3820,13 +4033,16 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               <select
                 value={newBoxDraft.fontFamily}
                 onChange={(e) =>
-                  setNewBoxDraft((d) => ({ ...d, fontFamily: e.target.value as 'sans' | 'serif' | 'mono' }))
+                  setNewBoxDraft((d) => ({ ...d, fontFamily: e.target.value as PdfFontFamily }))
                 }
+                style={{ fontFamily: getFontCssStack(newBoxDraft.fontFamily) }}
                 className="h-10 px-2.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs"
               >
-                <option value="sans">Sans (English + বাংলা)</option>
-                <option value="serif">Serif</option>
-                <option value="mono">Monospace</option>
+                {OFFICIAL_FONT_OPTIONS.map((opt) => (
+                  <option key={opt.value} value={opt.value} style={{ fontFamily: opt.cssStack }}>
+                    {opt.label}
+                  </option>
+                ))}
               </select>
               <input
                 type="number"

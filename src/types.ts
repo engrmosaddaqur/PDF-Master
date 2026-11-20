@@ -125,6 +125,22 @@ export interface ExtractedTextRun {
   fontName: string;
 }
 
+export type PdfFontFamily =
+  | 'arial'
+  | 'calibri'
+  | 'cambria'
+  | 'times'
+  | 'georgia'
+  | 'verdana'
+  | 'tahoma'
+  | 'garamond'
+  | 'trebuchet'
+  | 'courier'
+  | 'bengali'
+  | 'sans'
+  | 'serif'
+  | 'mono';
+
 export interface TextReplacementEdit {
   id: string;
   runId: string;
@@ -137,7 +153,7 @@ export interface TextReplacementEdit {
   width: number;
   height: number;
   fontSize: number;
-  fontFamily: 'sans' | 'serif' | 'mono';
+  fontFamily: PdfFontFamily;
   color: string;
   bold: boolean;
   italic: boolean;
@@ -169,7 +185,7 @@ export interface AddedTextBox {
   y: number;
   width: number;
   fontSize: number;
-  fontFamily: 'sans' | 'serif' | 'mono';
+  fontFamily: PdfFontFamily;
   color: string;
   backgroundColor?: string;
   borderColor?: string;

@@ -20,6 +20,7 @@ import type {
   ExtractedTextRun,
   PaperDimension,
   PaperSizeKey,
+  PdfFontFamily,
   PdfFormFieldDescriptor,
   TextReplacementEdit,
 } from '../types';
@@ -147,6 +148,47 @@ export function computeStickyArrowGeometry(ann: AnnotationOverlay): StickyArrowG
   return { hasArrow: true, startX, startY, tipX, tipY, angleDeg, length };
 }
 
+export const OFFICIAL_FONT_OPTIONS: Array<{
+  value: PdfFontFamily;
+  label: string;
+  cssStack: string;
+}> = [
+  { value: 'arial', label: 'Arial', cssStack: "Arial, Helvetica, 'Noto Sans Bengali', sans-serif" },
+  { value: 'calibri', label: 'Calibri', cssStack: "Calibri, 'Segoe UI', 'DM Sans', 'Noto Sans Bengali', sans-serif" },
+  { value: 'cambria', label: 'Cambria', cssStack: "Cambria, Georgia, 'Times New Roman', 'Noto Sans Bengali', serif" },
+  { value: 'times', label: 'Times New Roman', cssStack: "'Times New Roman', Times, 'Noto Sans Bengali', serif" },
+  { value: 'georgia', label: 'Georgia', cssStack: "Georgia, 'Times New Roman', 'Noto Sans Bengali', serif" },
+  { value: 'verdana', label: 'Verdana', cssStack: "Verdana, Geneva, 'Noto Sans Bengali', sans-serif" },
+  { value: 'tahoma', label: 'Tahoma', cssStack: "Tahoma, Geneva, 'Noto Sans Bengali', sans-serif" },
+  { value: 'garamond', label: 'Garamond', cssStack: "Garamond, 'Times New Roman', 'Noto Sans Bengali', serif" },
+  { value: 'trebuchet', label: 'Trebuchet MS', cssStack: "'Trebuchet MS', Helvetica, 'Noto Sans Bengali', sans-serif" },
+  { value: 'courier', label: 'Courier New', cssStack: "'Courier New', Courier, monospace" },
+  { value: 'bengali', label: 'Noto Sans (বাংলা)', cssStack: "'Noto Sans Bengali', 'DM Sans', sans-serif" },
+];
+
+export function getFontCssStack(fontFamily: PdfFontFamily): string {
+  if (fontFamily === 'sans') return "'DM Sans', Arial, 'Noto Sans Bengali', sans-serif";
+  if (fontFamily === 'serif') return "'Times New Roman', Georgia, 'Noto Sans Bengali', serif";
+  if (fontFamily === 'mono') return "'Courier New', 'JetBrains Mono', monospace";
+  const found = OFFICIAL_FONT_OPTIONS.find((f) => f.value === fontFamily);
+  return found ? found.cssStack : "Arial, 'Noto Sans Bengali', sans-serif";
+}
+
+export function inferOfficialFontFromPdfName(rawFontName?: string): PdfFontFamily {
+  const n = (rawFontName || '').toLowerCase();
+  if (n.includes('cambria')) return 'cambria';
+  if (n.includes('calibri')) return 'calibri';
+  if (n.includes('georgia')) return 'georgia';
+  if (n.includes('garamond')) return 'garamond';
+  if (n.includes('verdana')) return 'verdana';
+  if (n.includes('tahoma')) return 'tahoma';
+  if (n.includes('trebuchet')) return 'trebuchet';
+  if (n.includes('courier') || n.includes('mono') || n.includes('consola')) return 'courier';
+  if (n.includes('times') || n.includes('roman') || n.includes('serif')) return 'times';
+  if (n.includes('bengali') || n.includes('noto') || n.includes('kalpurush') || n.includes('solaiman')) return 'bengali';
+  return 'arial';
+}
+
 /**
  * Renders text (including full Bengali & Unicode scripts, bold/italic/underline/spacing)
  * onto a transparent high-DPI canvas and returns PNG bytes so pdf-lib embeds any script crisply.
@@ -154,7 +196,7 @@ export function computeStickyArrowGeometry(ann: AnnotationOverlay): StickyArrowG
 export async function renderUnicodeTextPng(opts: {
   text: string;
   fontSize: number;
-  fontFamily: 'sans' | 'serif' | 'mono';
+  fontFamily: PdfFontFamily;
   color: string;
   bold: boolean;
   italic: boolean;
@@ -164,12 +206,8 @@ export async function renderUnicodeTextPng(opts: {
   maxWidth?: number;
 }): Promise<{ pngBytes: Uint8Array; widthPt: number; heightPt: number }> {
   const dpr = 3;
-  const familyMap = {
-    sans: "'DM Sans', 'Noto Sans Bengali', sans-serif",
-    serif: "Georgia, 'Noto Sans Bengali', serif",
-    mono: "'JetBrains Mono', monospace",
-  };
-  const fontSpec = `${opts.italic ? 'italic ' : ''}${opts.bold ? '700 ' : '400 '}${opts.fontSize}px ${familyMap[opts.fontFamily]}`;
+  const cssStack = getFontCssStack(opts.fontFamily);
+  const fontSpec = `${opts.italic ? 'italic ' : ''}${opts.bold ? '700 ' : '400 '}${opts.fontSize}px ${cssStack}`;
 
   const measureCanvas = document.createElement('canvas');
   const mCtx = measureCanvas.getContext('2d')!;
@@ -506,39 +544,154 @@ export async function extractDocumentPagesText(
   return results;
 }
 
+const pageEditorRunsCache = new WeakMap<
+  ArrayBuffer,
+  Map<number, { runs: ExtractedTextRun[]; pageWidth: number; pageHeight: number }>
+>();
+
+interface RawTextSpan {
+  str: string;
+  x: number;
+  y: number;
+  baselineY: number;
+  width: number;
+  height: number;
+  fontSize: number;
+  fontName: string;
+}
+
 export async function extractPageTextRuns(
   pdfBytes: ArrayBuffer,
   pageNumber: number
 ): Promise<{ runs: ExtractedTextRun[]; pageWidth: number; pageHeight: number }> {
+  let docMap = pageEditorRunsCache.get(pdfBytes);
+  if (!docMap) {
+    docMap = new Map();
+    pageEditorRunsCache.set(pdfBytes, docMap);
+  }
+  const cached = docMap.get(pageNumber);
+  if (cached) return cached;
+
   const pdf = await getSharedPdfDocument(pdfBytes);
-  const page = await pdf.getPage(Math.max(1, Math.min(pageNumber, pdf.numPages)));
+  const safePage = Math.max(1, Math.min(pageNumber, pdf.numPages));
+  const page = await pdf.getPage(safePage);
   const viewport = page.getViewport({ scale: 1 });
   const tc = await page.getTextContent();
-  const runs: ExtractedTextRun[] = [];
 
-  tc.items.forEach((item, index) => {
-    if (!('str' in item) || !item.str.trim()) return;
+  const rawSpans: RawTextSpan[] = [];
+  for (const item of tc.items) {
+    if (!('str' in item) || !item.str || !item.str.trim()) continue;
     const tx = pdfjsLib.Util.transform(viewport.transform, item.transform);
-    const fontSize = Math.max(8, Math.hypot(tx[0], tx[1]));
+    const scaleX = Math.hypot(tx[0], tx[1]);
+    const scaleY = Math.hypot(tx[2], tx[3]);
+    const fontSize = Math.max(5.5, Math.max(scaleX, scaleY));
+    const baselineY = tx[5];
     const x = tx[4];
-    const y = tx[5] - fontSize * 0.85;
-    const width = Math.max(12, item.width);
+    const width =
+      item.width && item.width > 0
+        ? item.width
+        : Math.max(4, item.str.length * fontSize * 0.48);
     const height = Math.max(fontSize * 1.15, item.height || fontSize * 1.15);
+    const y = baselineY - fontSize * 0.85;
 
-    runs.push({
-      id: `run_${pageNumber}_${index}`,
-      pageNumber,
+    rawSpans.push({
       str: item.str,
       x,
       y,
+      baselineY,
       width,
       height,
       fontSize,
       fontName: item.fontName || 'Helvetica',
     });
-  });
+  }
 
-  return { runs, pageWidth: viewport.width, pageHeight: viewport.height };
+  // Group spans onto same horizontal baseline rows, keeping separate columns cleanly divided
+  rawSpans.sort((a, b) => a.baselineY - b.baselineY || a.x - b.x);
+  const rowClusters: Array<{ avgBaselineY: number; avgFontSize: number; spans: RawTextSpan[] }> = [];
+
+  for (const sp of rawSpans) {
+    const lastCluster = rowClusters[rowClusters.length - 1];
+    if (
+      lastCluster &&
+      Math.abs(sp.baselineY - lastCluster.avgBaselineY) <=
+        Math.max(2.5, Math.min(sp.fontSize, lastCluster.avgFontSize) * 0.45)
+    ) {
+      const n = lastCluster.spans.length;
+      lastCluster.avgBaselineY = (lastCluster.avgBaselineY * n + sp.baselineY) / (n + 1);
+      lastCluster.avgFontSize = (lastCluster.avgFontSize * n + sp.fontSize) / (n + 1);
+      lastCluster.spans.push(sp);
+    } else {
+      rowClusters.push({ avgBaselineY: sp.baselineY, avgFontSize: sp.fontSize, spans: [sp] });
+    }
+  }
+
+  const mergedRuns: ExtractedTextRun[] = [];
+  let runSeq = 0;
+
+  const flushSpan = (span: RawTextSpan) => {
+    mergedRuns.push({
+      id: `run_${safePage}_${runSeq++}`,
+      pageNumber: safePage,
+      str: span.str.replace(/\s+/g, ' ').trim(),
+      x: span.x,
+      y: span.y,
+      width: Math.max(10, span.width),
+      height: Math.max(10, span.height),
+      fontSize: span.fontSize,
+      fontName: span.fontName,
+    });
+  };
+
+  for (const cluster of rowClusters) {
+    cluster.spans.sort((a, b) => a.x - b.x);
+    let current: RawTextSpan | null = null;
+
+    for (const sp of cluster.spans) {
+      if (!current) {
+        current = { ...sp };
+        continue;
+      }
+
+      const prev: RawTextSpan = current;
+      const curRight = prev.x + prev.width;
+      const gap = sp.x - curRight;
+      const maxFs = Math.max(prev.fontSize, sp.fontSize);
+      const minFs = Math.min(prev.fontSize, sp.fontSize);
+      const compatibleSize = maxFs <= minFs * 1.55;
+      const sameLineColumn = gap >= -Math.max(6, maxFs * 0.85) && gap <= maxFs * 2.1;
+
+      if (compatibleSize && sameLineColumn) {
+        const needsSpace: boolean =
+          gap > minFs * 0.16 && !prev.str.endsWith(' ') && !sp.str.startsWith(' ');
+        const nextStr: string = needsSpace ? `${prev.str} ${sp.str}` : `${prev.str}${sp.str}`;
+        const nextLeft = Math.min(prev.x, sp.x);
+        const nextRight = Math.max(curRight, sp.x + sp.width);
+        const nextTop = Math.min(prev.y, sp.y);
+        const nextBottom = Math.max(prev.y + prev.height, sp.y + sp.height);
+
+        current = {
+          str: nextStr,
+          x: nextLeft,
+          y: nextTop,
+          baselineY: (prev.baselineY + sp.baselineY) / 2,
+          width: nextRight - nextLeft,
+          height: nextBottom - nextTop,
+          fontSize: maxFs,
+          fontName: prev.fontName,
+        };
+      } else {
+        flushSpan(prev);
+        current = { ...sp };
+      }
+    }
+    if (current) flushSpan(current);
+  }
+
+  mergedRuns.sort((a, b) => a.y - b.y || a.x - b.x);
+  const result = { runs: mergedRuns, pageWidth: viewport.width, pageHeight: viewport.height };
+  docMap.set(pageNumber, result);
+  return result;
 }
 
 const pageTextBoxCache = new WeakMap<ArrayBuffer, Map<string, ExtractedTextRun[]>>();
@@ -810,13 +963,46 @@ export async function applyPdfEditsToBytes(
   const fontHelv = await doc.embedFont(StandardFonts.Helvetica);
   const fontHelvBold = await doc.embedFont(StandardFonts.HelveticaBold);
   const fontHelvItalic = await doc.embedFont(StandardFonts.HelveticaOblique);
+  const fontHelvBoldItalic = await doc.embedFont(StandardFonts.HelveticaBoldOblique);
   const fontTimes = await doc.embedFont(StandardFonts.TimesRoman);
   const fontTimesBold = await doc.embedFont(StandardFonts.TimesRomanBold);
+  const fontTimesItalic = await doc.embedFont(StandardFonts.TimesRomanItalic);
+  const fontTimesBoldItalic = await doc.embedFont(StandardFonts.TimesRomanBoldItalic);
   const fontCourier = await doc.embedFont(StandardFonts.Courier);
+  const fontCourierBold = await doc.embedFont(StandardFonts.CourierBold);
+  const fontCourierItalic = await doc.embedFont(StandardFonts.CourierOblique);
+  const fontCourierBoldItalic = await doc.embedFont(StandardFonts.CourierBoldOblique);
 
-  const pickStandardFont = (family: 'sans' | 'serif' | 'mono', bold: boolean, italic: boolean) => {
-    if (family === 'mono') return fontCourier;
-    if (family === 'serif') return bold ? fontTimesBold : fontTimes;
+  const isCustomDesktopFont = (family: PdfFontFamily) =>
+    family === 'calibri' ||
+    family === 'cambria' ||
+    family === 'georgia' ||
+    family === 'verdana' ||
+    family === 'tahoma' ||
+    family === 'garamond' ||
+    family === 'trebuchet' ||
+    family === 'bengali';
+
+  const pickStandardFont = (family: PdfFontFamily, bold: boolean, italic: boolean) => {
+    if (family === 'mono' || family === 'courier') {
+      if (bold && italic) return fontCourierBoldItalic;
+      if (bold) return fontCourierBold;
+      if (italic) return fontCourierItalic;
+      return fontCourier;
+    }
+    if (
+      family === 'serif' ||
+      family === 'times' ||
+      family === 'cambria' ||
+      family === 'georgia' ||
+      family === 'garamond'
+    ) {
+      if (bold && italic) return fontTimesBoldItalic;
+      if (bold) return fontTimesBold;
+      if (italic) return fontTimesItalic;
+      return fontTimes;
+    }
+    if (bold && italic) return fontHelvBoldItalic;
     if (bold) return fontHelvBold;
     if (italic) return fontHelvItalic;
     return fontHelv;
@@ -841,7 +1027,12 @@ export async function applyPdfEditsToBytes(
     });
 
     if (!rep.deleted && rep.newText.trim()) {
-      if (hasNonWinAnsiChars(rep.newText) || (rep.letterSpacing || 0) !== 0) {
+      if (
+        hasNonWinAnsiChars(rep.newText) ||
+        (rep.letterSpacing || 0) !== 0 ||
+        rep.newText.includes('\n') ||
+        isCustomDesktopFont(rep.fontFamily)
+      ) {
         const rendered = await renderUnicodeTextPng({
           text: rep.newText,
           fontSize: rep.fontSize,
@@ -902,7 +1093,11 @@ export async function applyPdfEditsToBytes(
       y: cy + (px - cx) * Math.sin(rad) + (py - cy) * Math.cos(rad),
     });
 
-    if (hasNonWinAnsiChars(tb.text) || (tb.letterSpacing || 0) !== 0) {
+    if (
+      hasNonWinAnsiChars(tb.text) ||
+      (tb.letterSpacing || 0) !== 0 ||
+      isCustomDesktopFont(tb.fontFamily)
+    ) {
       const rendered = await renderUnicodeTextPng({
         text: tb.text,
         fontSize: tb.fontSize,

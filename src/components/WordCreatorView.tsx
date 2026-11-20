@@ -358,9 +358,17 @@ export const WordCreatorView: React.FC<WordCreatorViewProps> = ({
           }}
           className="h-9 px-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs shrink-0"
         >
+          <option value="Arial, Helvetica, 'Noto Sans Bengali', sans-serif">Arial</option>
+          <option value="Calibri, 'Segoe UI', 'DM Sans', 'Noto Sans Bengali', sans-serif">Calibri</option>
+          <option value="Cambria, Georgia, 'Times New Roman', 'Noto Sans Bengali', serif">Cambria</option>
+          <option value="'Times New Roman', Times, 'Noto Sans Bengali', serif">Times New Roman</option>
+          <option value="Georgia, 'Times New Roman', 'Noto Sans Bengali', serif">Georgia</option>
+          <option value="Verdana, Geneva, 'Noto Sans Bengali', sans-serif">Verdana</option>
+          <option value="Tahoma, Geneva, 'Noto Sans Bengali', sans-serif">Tahoma</option>
+          <option value="Garamond, 'Times New Roman', 'Noto Sans Bengali', serif">Garamond</option>
+          <option value="'Trebuchet MS', Helvetica, 'Noto Sans Bengali', sans-serif">Trebuchet MS</option>
+          <option value="'Courier New', Courier, monospace">Courier New</option>
           <option value="'DM Sans', 'Noto Sans Bengali', sans-serif">DM Sans + বাংলা</option>
-          <option value="Georgia, 'Noto Sans Bengali', serif">Georgia Serif</option>
-          <option value="'JetBrains Mono', monospace">Monospace</option>
         </select>
 
         <select
