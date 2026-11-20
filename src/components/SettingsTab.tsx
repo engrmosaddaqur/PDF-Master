@@ -450,7 +450,7 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
             <strong className="font-semibold text-slate-900 dark:text-white">Mosaddaq</strong>
           </span>
           <span className="font-mono-nums text-slate-500 dark:text-slate-400">
-            Version 1.0
+            Version 1.1
           </span>
         </div>
       </section>

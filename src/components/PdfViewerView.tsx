@@ -10,11 +10,15 @@ import {
   Download,
   Edit3,
   FileCheck2,
+  FolderPlus,
+  HardDriveDownload,
+  Home,
   Layers,
   ListTree,
   Maximize2,
   Minimize2,
   Moon,
+  MoreVertical,
   RotateCw,
   Search,
   Share2,
@@ -57,8 +61,11 @@ interface PdfViewerViewProps {
   doc: DocumentRecord;
   language: AppLanguage;
   defaultViewMode: 'continuous' | 'single';
+  isExternalSession?: boolean;
   onClose: () => void;
   onUpdateDoc: (updated: DocumentRecord) => Promise<void>;
+  onSaveExternalToVault?: (doc: DocumentRecord) => Promise<void>;
+  onOpenFullApp?: () => void;
   onOpenEditor: () => void;
   onOpenOrganizer: () => void;
 }
@@ -409,8 +416,11 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
   doc,
   language,
   defaultViewMode,
+  isExternalSession = false,
   onClose,
   onUpdateDoc,
+  onSaveExternalToVault,
+  onOpenFullApp,
   onOpenEditor,
   onOpenOrganizer,
 }) => {
@@ -454,6 +464,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
   const [formValues, setFormValues] = useState<Record<string, { value: string; checked: boolean }>>({});
   const [showFormListModal, setShowFormListModal] = useState(false);
   const [savingForm, setSavingForm] = useState(false);
+  const [showMoreMenu, setShowMoreMenu] = useState(false);
 
   const viewerRootRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -937,18 +948,18 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
             </div>
           </div>
 
-          <div className="flex items-center gap-1 shrink-0">
+          <div className="flex items-center gap-0.5 shrink-0 relative">
             <button
               onClick={() => setShowNavDrawer(true)}
               aria-label={t.viewer.outline}
-              className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+              className="min-h-[42px] min-w-[40px] flex items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
             >
               <ListTree className="w-5 h-5" />
             </button>
             <button
               onClick={() => setShowSearch((v) => !v)}
               aria-label="Search PDF"
-              className={`min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl transition-colors ${
+              className={`min-h-[42px] min-w-[40px] flex items-center justify-center rounded-xl transition-colors ${
                 showSearch
                   ? 'bg-[#2563EB]/10 text-[#2563EB]'
                   : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
@@ -959,7 +970,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
             <button
               onClick={toggleBookmark}
               aria-label={t.viewer.bookmark}
-              className={`min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl transition-colors ${
+              className={`min-h-[42px] min-w-[40px] flex items-center justify-center rounded-xl transition-colors ${
                 isCurrentBookmarked
                   ? 'text-[#2563EB]'
                   : 'text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800'
@@ -968,19 +979,139 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
               <Bookmark className={`w-5 h-5 ${isCurrentBookmarked ? 'fill-current' : ''}`} />
             </button>
             <button
-              onClick={handleShare}
-              aria-label={t.viewer.share}
-              className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
-            >
-              <Share2 className="w-5 h-5" />
-            </button>
-            <button
               onClick={() => setIsFullscreen(true)}
               aria-label="Fullscreen"
-              className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+              className="min-h-[42px] min-w-[40px] flex items-center justify-center rounded-xl text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
             >
               <Maximize2 className="w-5 h-5" />
             </button>
+            <button
+              onClick={() => setShowMoreMenu((v) => !v)}
+              aria-label={t.viewer.moreOptions}
+              aria-expanded={showMoreMenu}
+              className={`min-h-[42px] min-w-[40px] flex items-center justify-center rounded-xl transition-colors ${
+                showMoreMenu
+                  ? 'bg-[#2563EB]/15 text-[#2563EB]'
+                  : 'text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800'
+              }`}
+            >
+              <MoreVertical className="w-5 h-5" />
+            </button>
+
+            {showMoreMenu && (
+              <>
+                <div
+                  className="fixed inset-0 z-40"
+                  onClick={() => setShowMoreMenu(false)}
+                />
+                <div className="absolute right-0 top-12 z-50 w-60 rounded-2xl bg-white dark:bg-[#121929] border border-slate-200 dark:border-[#1E293B] shadow-2xl py-1.5 overflow-hidden">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowMoreMenu(false);
+                      void saveBufferToDeviceStorage(doc.pdfBytes, doc.name, 'application/pdf');
+                    }}
+                    className="w-full px-3.5 py-2.5 text-left text-xs font-semibold text-[#2563EB] dark:text-cyan-400 hover:bg-slate-100 dark:hover:bg-[#1A243B] flex items-center gap-2.5"
+                  >
+                    <HardDriveDownload className="w-4 h-4 shrink-0" />
+                    <span>{t.viewer.saveToLocalStorage}</span>
+                  </button>
+
+                  {isExternalSession && onSaveExternalToVault && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setShowMoreMenu(false);
+                        void onSaveExternalToVault(doc);
+                      }}
+                      className="w-full px-3.5 py-2.5 text-left text-xs font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-[#1A243B] flex items-center gap-2.5"
+                    >
+                      <FolderPlus className="w-4 h-4 text-emerald-500 shrink-0" />
+                      <span>{t.viewer.saveToVault}</span>
+                    </button>
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowMoreMenu(false);
+                      onOpenEditor();
+                    }}
+                    className="w-full px-3.5 py-2.5 text-left text-xs font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-[#1A243B] flex items-center gap-2.5"
+                  >
+                    <Edit3 className="w-4 h-4 text-[#2563EB] shrink-0" />
+                    <span>{t.viewer.editMode}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowMoreMenu(false);
+                      onOpenOrganizer();
+                    }}
+                    className="w-full px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#1A243B] flex items-center gap-2.5"
+                  >
+                    <Layers className="w-4 h-4 text-slate-500 shrink-0" />
+                    <span>{t.viewer.organize}</span>
+                  </button>
+
+                  <div className="my-1 border-t border-slate-100 dark:border-slate-800" />
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowMoreMenu(false);
+                      void handleShare();
+                    }}
+                    className="w-full px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#1A243B] flex items-center gap-2.5"
+                  >
+                    <Share2 className="w-4 h-4 text-slate-500 shrink-0" />
+                    <span>{t.viewer.share}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowMoreMenu(false);
+                      void handleRotateSave();
+                    }}
+                    className="w-full px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#1A243B] flex items-center gap-2.5"
+                  >
+                    <RotateCw className="w-4 h-4 text-slate-500 shrink-0" />
+                    <span>{t.viewer.rotate}</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setShowMoreMenu(false);
+                      setShowTextModal(true);
+                    }}
+                    className="w-full px-3.5 py-2.5 text-left text-xs font-medium text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-[#1A243B] flex items-center gap-2.5"
+                  >
+                    <Copy className="w-4 h-4 text-slate-500 shrink-0" />
+                    <span>{t.viewer.copyText}</span>
+                  </button>
+
+                  {isExternalSession && onOpenFullApp && (
+                    <>
+                      <div className="my-1 border-t border-slate-100 dark:border-slate-800" />
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setShowMoreMenu(false);
+                          onOpenFullApp();
+                        }}
+                        className="w-full px-3.5 py-2.5 text-left text-xs font-semibold text-indigo-600 dark:text-indigo-400 hover:bg-slate-100 dark:hover:bg-[#1A243B] flex items-center gap-2.5"
+                      >
+                        <Home className="w-4 h-4 shrink-0" />
+                        <span>{t.viewer.openFullApp}</span>
+                      </button>
+                    </>
+                  )}
+                </div>
+              </>
+            )}
           </div>
         </header>
       )}

@@ -1,0 +1,67 @@
+{
+  "name": "pdf-master-desktop",
+  "version": "1.1.0",
+  "description": "PDF MASTER Desktop Application for Windows",
+  "author": "Mosaddaq",
+  "main": "main.cjs",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win nsis portable --x64 --publish never"
+  },
+  "devDependencies": {
+    "electron": "^35.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.engrmosaddaqur.pdfmaster",
+    "productName": "PDF MASTER",
+    "copyright": "Copyright © 2026 Mosaddaq",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.cjs",
+      "preload.cjs",
+      "icon.png",
+      "dist/**/*"
+    ],
+    "fileAssociations": [
+      {
+        "ext": "pdf",
+        "name": "PDF Document",
+        "description": "Portable Document Format",
+        "mimeType": "application/pdf",
+        "role": "Editor"
+      }
+    ],
+    "win": {
+      "icon": "icon.png",
+      "requestedExecutionLevel": "asInvoker",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "PDF MASTER",
+      "artifactName": "PDF-MASTER-Setup-v1.1.exe"
+    },
+    "portable": {
+      "artifactName": "PDF-MASTER-Portable-v1.1.exe"
+    }
+  }
+}

@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build-debug-apk:
-    name: Build app-debug.apk
+    name: Build app-debug.apk (v1.1)
     runs-on: ubuntu-latest
 
     steps:
@@ -54,7 +54,9 @@ jobs:
           fi
           npx cap sync android
 
-      - name: Configure Android permissions and launcher icons
+      - name: Configure Android permissions, PDF intent filters, version 1.1, and icons
+        env:
+          BUILD_NUM: ${{ github.run_number }}
         run: |
           node -e '
             const fs = require("fs");
@@ -79,7 +81,166 @@ jobs:
                 "    <uses-feature android:name=\"android.hardware.camera\" android:required=\"false\" />\n    <application"
               );
             }
+            if (!xml.includes("application/pdf")) {
+              const pdfFilters = [
+                "            <intent-filter>",
+                "                <action android:name=\"android.intent.action.VIEW\" />",
+                "                <category android:name=\"android.intent.category.DEFAULT\" />",
+                "                <category android:name=\"android.intent.category.BROWSABLE\" />",
+                "                <data android:scheme=\"content\" />",
+                "                <data android:scheme=\"file\" />",
+                "                <data android:mimeType=\"application/pdf\" />",
+                "            </intent-filter>",
+                "            <intent-filter>",
+                "                <action android:name=\"android.intent.action.SEND\" />",
+                "                <category android:name=\"android.intent.category.DEFAULT\" />",
+                "                <data android:mimeType=\"application/pdf\" />",
+                "            </intent-filter>"
+              ].join("\n");
+              xml = xml.replace("</activity>", pdfFilters + "\n        </activity>");
+            }
             fs.writeFileSync(manifestPath, xml, "utf8");
+
+            const gradlePath = "android/app/build.gradle";
+            let gradle = fs.readFileSync(gradlePath, "utf8");
+            const runNum = parseInt(process.env.BUILD_NUM || "1", 10) || 1;
+            gradle = gradle.replace(/versionCode\s+\d+/, "versionCode " + runNum);
+            gradle = gradle.replace(/versionName\s+"[^"]*"/, "versionName \"1.1\"");
+            fs.writeFileSync(gradlePath, gradle, "utf8");
+          '
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            const mainActPath = "android/app/src/main/java/com/engrmosaddaqur/pdfmaster/MainActivity.java";
+            fs.mkdirSync(path.dirname(mainActPath), { recursive: true });
+            const javaSrc = [
+              "package com.engrmosaddaqur.pdfmaster;",
+              "",
+              "import android.content.Intent;",
+              "import android.database.Cursor;",
+              "import android.net.Uri;",
+              "import android.os.Bundle;",
+              "import android.provider.OpenableColumns;",
+              "import android.webkit.JavascriptInterface;",
+              "import android.webkit.WebView;",
+              "import com.getcapacitor.BridgeActivity;",
+              "import java.io.File;",
+              "import java.io.FileOutputStream;",
+              "import java.io.InputStream;",
+              "import java.util.concurrent.ExecutorService;",
+              "import java.util.concurrent.Executors;",
+              "import org.json.JSONObject;",
+              "",
+              "public class MainActivity extends BridgeActivity {",
+              "    private final ExecutorService pdfExecutor = Executors.newSingleThreadExecutor();",
+              "    private final Object pendingLock = new Object();",
+              "    private String pendingPdfJson = null;",
+              "",
+              "    public class PdfIntentBridge {",
+              "        @JavascriptInterface",
+              "        public String consumePendingPdf() {",
+              "            synchronized (pendingLock) {",
+              "                String out = pendingPdfJson;",
+              "                pendingPdfJson = null;",
+              "                return out;",
+              "            }",
+              "        }",
+              "    }",
+              "",
+              "    @Override",
+              "    protected void onCreate(Bundle savedInstanceState) {",
+              "        super.onCreate(savedInstanceState);",
+              "        if (this.getBridge() != null && this.getBridge().getWebView() != null) {",
+              "            this.getBridge().getWebView().addJavascriptInterface(new PdfIntentBridge(), \"AndroidPdfBridge\");",
+              "        }",
+              "    }",
+              "",
+              "    @Override",
+              "    protected void onNewIntent(Intent intent) {",
+              "        super.onNewIntent(intent);",
+              "        handlePdfIntent(intent);",
+              "    }",
+              "",
+              "    private void handlePdfIntent(Intent intent) {",
+              "        if (intent == null) return;",
+              "        String action = intent.getAction();",
+              "        Uri uri = null;",
+              "        if (Intent.ACTION_VIEW.equals(action)) {",
+              "            uri = intent.getData();",
+              "        } else if (Intent.ACTION_SEND.equals(action)) {",
+              "            Bundle extras = intent.getExtras();",
+              "            if (extras != null) {",
+              "                Object streamObj = extras.get(Intent.EXTRA_STREAM);",
+              "                if (streamObj instanceof Uri) {",
+              "                    uri = (Uri) streamObj;",
+              "                }",
+              "            }",
+              "        }",
+              "        if (uri == null) return;",
+              "        final Uri targetUri = uri;",
+              "        pdfExecutor.execute(() -> {",
+              "            try {",
+              "                String fileName = resolveDisplayName(targetUri);",
+              "                File outFile = new File(getCacheDir(), \"incoming_open.pdf\");",
+              "                try (InputStream in = getContentResolver().openInputStream(targetUri);",
+              "                     FileOutputStream out = new FileOutputStream(outFile)) {",
+              "                    if (in == null) return;",
+              "                    byte[] buf = new byte[8192];",
+              "                    int read;",
+              "                    while ((read = in.read(buf)) != -1) {",
+              "                        out.write(buf, 0, read);",
+              "                    }",
+              "                    out.flush();",
+              "                }",
+              "                JSONObject payload = new JSONObject();",
+              "                payload.put(\"name\", fileName);",
+              "                payload.put(\"cacheFile\", \"incoming_open.pdf\");",
+              "                synchronized (pendingLock) {",
+              "                    pendingPdfJson = payload.toString();",
+              "                }",
+              "                runOnUiThread(() -> {",
+              "                    if (getBridge() != null) {",
+              "                        WebView wv = getBridge().getWebView();",
+              "                        if (wv != null) {",
+              "                            wv.evaluateJavascript(\"window.dispatchEvent(new CustomEvent(\x27pm-open-external-pdf\x27));\", null);",
+              "                        }",
+              "                    }",
+              "                });",
+              "            } catch (Exception ignored) {",
+              "            }",
+              "        });",
+              "    }",
+              "",
+              "    private String resolveDisplayName(Uri uri) {",
+              "        String result = null;",
+              "        if (\"content\".equals(uri.getScheme())) {",
+              "            try (Cursor cursor = getContentResolver().query(uri, null, null, null, null)) {",
+              "                if (cursor != null && cursor.moveToFirst()) {",
+              "                    int idx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);",
+              "                    if (idx >= 0) result = cursor.getString(idx);",
+              "                }",
+              "            } catch (Exception ignored) {",
+              "            }",
+              "        }",
+              "        if (result == null || result.trim().isEmpty()) {",
+              "            result = uri.getLastPathSegment();",
+              "        }",
+              "        if (result == null || result.trim().isEmpty()) {",
+              "            result = \"document.pdf\";",
+              "        }",
+              "        int slash = result.lastIndexOf(\x27/\x27);",
+              "        if (slash != -1 && slash + 1 < result.length()) {",
+              "            result = result.substring(slash + 1);",
+              "        }",
+              "        if (!result.toLowerCase().endsWith(\".pdf\")) {",
+              "            result = result + \".pdf\";",
+              "        }",
+              "        return result;",
+              "    }",
+              "}",
+              ""
+            ].join("\n");
+            fs.writeFileSync(mainActPath, javaSrc, "utf8");
           '
           node -e '
             const fs = require("fs");
@@ -109,19 +270,22 @@ jobs:
       - name: Upload Debug APK artifact
         uses: actions/upload-artifact@v7
         with:
-          name: app-debug
+          name: app-debug-v1.1
           path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
 
-      - name: Publish GitHub Release
+      - name: Publish GitHub Release (v1.1)
         uses: softprops/action-gh-release@v3
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: PDF MASTER v1.0.${{ github.run_number }}
+          tag_name: v1.1.${{ github.run_number }}
+          name: PDF MASTER v1.1.${{ github.run_number }}
           body: |
-            Automated debug APK build for **PDF MASTER**.
+            Automated Android APK build for **PDF MASTER v1.1** (by Mosaddaq).
+            - Opens PDF files directly from Phone Storage / File Manager into PDF Viewer mode
+            - Includes 3-dot (...) menu **Save to Local Storage** & **Edit Mode** full-app unlock
+            - Previous v1.0 releases remain preserved in Releases history
 
             ### Direct Download
             `https://github.com/${{ github.repository }}/releases/latest/download/app-debug.apk`

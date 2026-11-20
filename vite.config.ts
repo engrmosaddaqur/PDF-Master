@@ -43,6 +43,14 @@ export default defineConfig(() => {
               purpose: 'maskable',
             },
           ],
+          file_handlers: [
+            {
+              action: '/',
+              accept: {
+                'application/pdf': ['.pdf'],
+              },
+            },
+          ],
         },
         workbox: {
           maximumFileSizeToCacheInBytes: 6 * 1024 * 1024,

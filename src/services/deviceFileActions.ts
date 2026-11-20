@@ -33,6 +33,16 @@ export function bufferToBase64(buf: ArrayBuffer): string {
   return btoa(binary);
 }
 
+export function base64ToArrayBuffer(b64: string): ArrayBuffer {
+  const clean = b64.includes(',') ? b64.split(',')[1] : b64;
+  const binary = atob(clean);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
+}
+
 async function ensureNativeFilesystemPermissions(): Promise<void> {
   try {
     const status = await Filesystem.checkPermissions();
@@ -69,8 +79,8 @@ export async function syncFileToNativeDocuments(
 }
 
 /**
- * Saves/Downloads an ArrayBuffer cleanly on both Native Android/iOS (Capacitor)
- * and Desktop/Mobile Web browsers.
+ * Saves/Downloads an ArrayBuffer cleanly on Native Android/iOS (Capacitor),
+ * Windows Desktop (.exe), and Desktop/Mobile Web browsers.
  */
 export async function saveBufferToDeviceStorage(
   buf: ArrayBuffer,
@@ -79,6 +89,37 @@ export async function saveBufferToDeviceStorage(
 ): Promise<void> {
   const safeName = sanitizeFilename(filename);
   const safeBuf = cloneBuffer(buf);
+
+  const desktopBridge = (
+    window as unknown as {
+      desktopPdfBridge?: {
+        saveFile?: (
+          name: string,
+          data: Uint8Array
+        ) => Promise<{ saved?: boolean; canceled?: boolean; filePath?: string }>;
+      };
+    }
+  ).desktopPdfBridge;
+
+  if (desktopBridge?.saveFile) {
+    try {
+      const res = await desktopBridge.saveFile(safeName, new Uint8Array(safeBuf));
+      if (res?.saved) {
+        emitAppToast({
+          message: `Saved to ${res.filePath || safeName}`,
+          variant: 'success',
+        });
+      }
+      if (!res?.canceled || res?.saved) return;
+      return;
+    } catch (err) {
+      emitAppToast({
+        message: err instanceof Error ? err.message : 'Failed to save file.',
+        variant: 'error',
+      });
+      return;
+    }
+  }
 
   if (Capacitor.isNativePlatform()) {
     const b64 = bufferToBase64(safeBuf);
@@ -102,7 +143,7 @@ export async function saveBufferToDeviceStorage(
       // Fallback below
     }
 
-    // 2. Fallback: write to ExternalStorage or Cache & open native Save/Share chooser
+    // 2. Fallback: write to Cache & open native Save/Share chooser
     try {
       await Filesystem.writeFile({
         path: safeName,
@@ -149,7 +190,7 @@ export async function saveBufferToDeviceStorage(
       URL.revokeObjectURL(url);
     }, 10000);
     emitAppToast({
-      message: `Downloaded ${safeName}`,
+      message: `Saved to device downloads: ${safeName}`,
       variant: 'success',
     });
   } catch (err) {

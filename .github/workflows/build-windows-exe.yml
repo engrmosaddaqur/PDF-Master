@@ -1,0 +1,75 @@
+name: Build Windows EXE (v1.1)
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows-exe:
+    name: Build Windows .exe (v1.1)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+
+      - name: Install root dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Build web bundle
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+        run: npm run build
+
+      - name: Prepare desktop bundle and icon
+        shell: pwsh
+        run: |
+          if (Test-Path "desktop/dist") { Remove-Item -Recurse -Force "desktop/dist" }
+          Copy-Item -Recurse -Force "dist" "desktop/dist"
+          Copy-Item -Force "public/pwa-512x512.png" "desktop/icon.png"
+
+      - name: Install desktop Electron dependencies
+        run: npm --prefix desktop install
+
+      - name: Build Windows Installer & Portable EXE (v1.1)
+        run: npx --prefix desktop electron-builder --win nsis portable --x64 --publish never
+
+      - name: Verify Windows EXE outputs
+        shell: pwsh
+        run: Get-ChildItem -Path "desktop/release" -Filter "*.exe" | Format-Table Name, Length
+
+      - name: Upload Windows EXE artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: pdf-master-windows-v1.1
+          path: |
+            desktop/release/PDF-MASTER-Setup-v1.1.exe
+            desktop/release/PDF-MASTER-Portable-v1.1.exe
+          if-no-files-found: error
+
+      - name: Publish Windows EXE Release (v1.1)
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tag_name: win-v1.1.${{ github.run_number }}
+          name: PDF MASTER Windows v1.1.${{ github.run_number }}
+          body: |
+            Automated Windows `.exe` build for **PDF MASTER v1.1** (by Mosaddaq).
+            - **PDF-MASTER-Setup-v1.1.exe**: Windows Installer (file version `1.1.0`, registers `.pdf` Open With support)
+            - **PDF-MASTER-Portable-v1.1.exe**: Standalone Portable `.exe` (no installation needed)
+            - Double-click any `.pdf` with PDF MASTER to launch straight into the PDF Viewer, save locally from the `...` menu, or click **Edit Mode** to unlock all full tools.
+          files: |
+            desktop/release/PDF-MASTER-Setup-v1.1.exe
+            desktop/release/PDF-MASTER-Portable-v1.1.exe
+          make_latest: false

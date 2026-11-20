@@ -49,8 +49,10 @@ import {
   saveSettings,
   seedInitialDocumentsIfNeeded,
 } from './services/storageService';
+import { Directory, Filesystem } from '@capacitor/filesystem';
 import {
   type AppToastDetail,
+  base64ToArrayBuffer,
   emitAppToast,
   shareBufferNativeOrWeb,
 } from './services/deviceFileActions';
@@ -83,6 +85,7 @@ export default function App() {
   const [pickSearch, setPickSearch] = useState('');
   const [appToast, setAppToast] = useState<AppToastDetail | null>(null);
   const [loadingVault, setLoadingVault] = useState(true);
+  const [externalDoc, setExternalDoc] = useState<DocumentRecord | null>(null);
   const importInputRef = useRef<HTMLInputElement | null>(null);
   const pendingImportTargetRef = useRef<'viewer' | 'editor' | 'organizer'>('viewer');
 
@@ -155,6 +158,149 @@ export default function App() {
       return next.sort((a, b) => b.updatedAt - a.updatedAt);
     });
   };
+
+  const openExternalPdfBuffer = async (name: string, buf: ArrayBuffer) => {
+    try {
+      const info = await getPdfDocumentInfo(buf).catch(() => ({ pageCount: 1 }));
+      const now = Date.now();
+      const normalizedName = name.trim() || 'document.pdf';
+      const record: DocumentRecord = {
+        id: `ext_${now}_${Math.random().toString(36).slice(2, 6)}`,
+        name: normalizedName,
+        origin: 'imported',
+        createdAt: now,
+        updatedAt: now,
+        lastOpenedAt: now,
+        sizeBytes: buf.byteLength,
+        pageCount: info.pageCount,
+        isStarred: false,
+        isShared: false,
+        isTrashed: false,
+        folderId: null,
+        pdfBytes: cloneBuffer(buf),
+        versions: [
+          {
+            id: `ver_${now}`,
+            timestamp: now,
+            note: 'Opened from device storage',
+            sizeBytes: buf.byteLength,
+            pdfBytes: cloneBuffer(buf),
+          },
+        ],
+      };
+      setExternalDoc(record);
+      setWorkspace({ type: 'viewer', docId: record.id });
+    } catch (err) {
+      console.error('Failed to open external PDF:', err);
+      emitAppToast({
+        message:
+          settings.language === 'bn'
+            ? 'ফাইলটি পিডিএফ হিসেবে খোলা যায়নি।'
+            : 'Unable to open selected PDF file.',
+        variant: 'error',
+      });
+    }
+  };
+
+  const promoteExternalDocToVault = async (doc: DocumentRecord): Promise<DocumentRecord> => {
+    const thumb =
+      doc.thumbnailDataUrl ||
+      (await renderPageThumbnail(doc.pdfBytes, 1, 200).catch(() => undefined));
+    const persisted: DocumentRecord = {
+      ...doc,
+      thumbnailDataUrl: thumb,
+      updatedAt: Date.now(),
+    };
+    await upsertDoc(persisted);
+    setExternalDoc(null);
+    return persisted;
+  };
+
+  // Listen for external PDF launches (Android Intent, Windows .exe CLI/IPC, PWA launchQueue)
+  useEffect(() => {
+    const checkAndroidIntent = async () => {
+      const bridge = (
+        window as unknown as {
+          AndroidPdfBridge?: { consumePendingPdf?: () => string | null };
+        }
+      ).AndroidPdfBridge;
+      if (!bridge?.consumePendingPdf) return;
+      const raw = bridge.consumePendingPdf();
+      if (!raw) return;
+      try {
+        const parsed = JSON.parse(raw) as { name?: string; cacheFile?: string };
+        if (parsed.cacheFile) {
+          const readRes = await Filesystem.readFile({
+            path: parsed.cacheFile,
+            directory: Directory.Cache,
+          });
+          const buf =
+            typeof readRes.data === 'string'
+              ? base64ToArrayBuffer(readRes.data)
+              : await readRes.data.arrayBuffer();
+          await openExternalPdfBuffer(parsed.name || 'document.pdf', buf);
+        }
+      } catch (err) {
+        console.error('Android external PDF open error:', err);
+      }
+    };
+
+    void checkAndroidIntent();
+    const onNativePdfEvent = () => {
+      void checkAndroidIntent();
+    };
+    window.addEventListener('pm-open-external-pdf', onNativePdfEvent);
+
+    const desktopBridge = (
+      window as unknown as {
+        desktopPdfBridge?: {
+          consumePendingPdf?: () => Promise<{ name: string; bytes: Uint8Array } | null>;
+          onOpenExternalPdf?: (
+            cb: (payload: { name: string; bytes: Uint8Array }) => void
+          ) => () => void;
+        };
+      }
+    ).desktopPdfBridge;
+
+    if (desktopBridge?.consumePendingPdf) {
+      void desktopBridge.consumePendingPdf().then((payload) => {
+        if (payload?.bytes) {
+          const u8 = new Uint8Array(payload.bytes);
+          void openExternalPdfBuffer(payload.name || 'document.pdf', u8.slice().buffer);
+        }
+      });
+    }
+    const unsubDesktop = desktopBridge?.onOpenExternalPdf?.((payload) => {
+      if (payload?.bytes) {
+        const u8 = new Uint8Array(payload.bytes);
+        void openExternalPdfBuffer(payload.name || 'document.pdf', u8.slice().buffer);
+      }
+    });
+
+    const winAny = window as unknown as {
+      launchQueue?: {
+        setConsumer: (
+          cb: (params: { files?: Array<{ getFile: () => Promise<File> }> }) => void
+        ) => void;
+      };
+    };
+    winAny.launchQueue?.setConsumer(async (launchParams) => {
+      const firstHandle = launchParams.files?.[0];
+      if (!firstHandle) return;
+      try {
+        const file = await firstHandle.getFile();
+        const buf = await file.arrayBuffer();
+        await openExternalPdfBuffer(file.name || 'document.pdf', buf);
+      } catch (err) {
+        console.error('PWA launchQueue PDF open error:', err);
+      }
+    });
+
+    return () => {
+      window.removeEventListener('pm-open-external-pdf', onNativePdfEvent);
+      unsubDesktop?.();
+    };
+  }, []);
 
   const handleImportPdfs = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
@@ -351,8 +497,17 @@ export default function App() {
 
   const activeDocForWorkspace =
     'docId' in workspace && workspace.docId
-      ? docs.find((d) => d.id === workspace.docId)
+      ? externalDoc && externalDoc.id === workspace.docId
+        ? externalDoc
+        : docs.find((d) => d.id === workspace.docId)
       : undefined;
+
+  const isExternalViewerActive = Boolean(
+    workspace.type === 'viewer' &&
+      externalDoc &&
+      activeDocForWorkspace &&
+      externalDoc.id === activeDocForWorkspace.id
+  );
 
   const recentEditableDocs = docs
     .filter((d) => !d.isTrashed && !d.isVaultLocked)
@@ -622,13 +777,48 @@ export default function App() {
       {/* Active Full-Screen Mobile Workspaces */}
       {workspace.type === 'viewer' && activeDocForWorkspace && (
         <PdfViewerView
+          key={activeDocForWorkspace.id}
           doc={activeDocForWorkspace}
           language={settings.language}
           defaultViewMode={settings.defaultViewMode}
-          onClose={() => setWorkspace({ type: 'none' })}
-          onUpdateDoc={upsertDoc}
-          onOpenEditor={() => setWorkspace({ type: 'editor', docId: activeDocForWorkspace.id })}
-          onOpenOrganizer={() => setWorkspace({ type: 'organizer', docId: activeDocForWorkspace.id })}
+          isExternalSession={isExternalViewerActive}
+          onClose={() => {
+            setExternalDoc(null);
+            setWorkspace({ type: 'none' });
+          }}
+          onUpdateDoc={async (updated) => {
+            if (isExternalViewerActive) {
+              setExternalDoc(updated);
+            } else {
+              await upsertDoc(updated);
+            }
+          }}
+          onSaveExternalToVault={async (doc) => {
+            const persisted = await promoteExternalDocToVault(doc);
+            emitAppToast({
+              message:
+                settings.language === 'bn'
+                  ? `অ্যাপ ভল্টে সেভ হয়েছে: ${persisted.name}`
+                  : `Saved to App Vault: ${persisted.name}`,
+              variant: 'success',
+            });
+          }}
+          onOpenFullApp={() => {
+            setExternalDoc(null);
+            setWorkspace({ type: 'none' });
+          }}
+          onOpenEditor={async () => {
+            const target = isExternalViewerActive
+              ? await promoteExternalDocToVault(activeDocForWorkspace)
+              : activeDocForWorkspace;
+            setWorkspace({ type: 'editor', docId: target.id });
+          }}
+          onOpenOrganizer={async () => {
+            const target = isExternalViewerActive
+              ? await promoteExternalDocToVault(activeDocForWorkspace)
+              : activeDocForWorkspace;
+            setWorkspace({ type: 'organizer', docId: target.id });
+          }}
         />
       )}
 
