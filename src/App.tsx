@@ -824,6 +824,7 @@ export default function App() {
 
       {workspace.type === 'editor' && activeDocForWorkspace && (
         <PdfEditorView
+          key={activeDocForWorkspace.id}
           doc={activeDocForWorkspace}
           language={settings.language}
           onClose={() => setWorkspace({ type: 'none' })}

@@ -66,6 +66,11 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
       const manifestDocs = docs.map((d) => {
         const mainPath = `pdfs/${d.id}.pdf`;
         zip.file(mainPath, d.pdfBytes.slice(0));
+        let basePdfPath: string | undefined;
+        if (d.basePdfBytes) {
+          basePdfPath = `pdfs/${d.id}_base.pdf`;
+          zip.file(basePdfPath, d.basePdfBytes.slice(0));
+        }
         const versionMetas = (d.versions || []).map((v, i) => {
           const vPath = `versions/${d.id}_v${i}.pdf`;
           zip.file(vPath, v.pdfBytes.slice(0));
@@ -75,12 +80,15 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
             note: v.note,
             sizeBytes: v.sizeBytes,
             pdfPath: vPath,
+            editorState: v.editorState,
           };
         });
         return {
           ...d,
           pdfBytes: undefined,
+          basePdfBytes: undefined,
           pdfPath: mainPath,
+          basePdfPath,
           versions: versionMetas,
         };
       });
@@ -128,6 +136,8 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
           const pdfEntry = d.pdfPath ? zip.file(d.pdfPath) : null;
           if (!pdfEntry) continue;
           const mainBuf = await pdfEntry.async('arraybuffer');
+          const baseEntry = d.basePdfPath ? zip.file(d.basePdfPath) : null;
+          const baseBuf = baseEntry ? await baseEntry.async('arraybuffer') : undefined;
           const restoredVersions: DocumentRecord['versions'] = [];
           for (const v of d.versions || []) {
             const vEntry = v.pdfPath ? zip.file(v.pdfPath) : null;
@@ -139,11 +149,13 @@ export const SettingsTab: React.FC<SettingsTabProps> = ({
               note: v.note,
               sizeBytes: v.sizeBytes,
               pdfBytes: vBuf,
+              editorState: v.editorState,
             });
           }
           restored.push({
             ...d,
             pdfBytes: mainBuf,
+            basePdfBytes: baseBuf,
             versions: restoredVersions,
           });
         }

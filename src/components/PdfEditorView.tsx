@@ -4,21 +4,29 @@ import {
   AlignLeft,
   AlignRight,
   ArrowDown,
+  ArrowDownToLine,
   ArrowLeft,
   ArrowRight,
   ArrowUp,
   ArrowUpRight,
+  ArrowUpToLine,
   Bold,
   Calendar,
   Check,
+  CheckCheck,
+  CheckSquare,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
+  ChevronUp,
   Circle,
   Copy,
   Crop,
   Download,
   Droplet,
   Eraser,
+  Eye,
+  EyeOff,
   FlipHorizontal2,
   FlipVertical2,
   Hand,
@@ -61,10 +69,12 @@ import type {
   AppLanguage,
   DocumentRecord,
   ExtractedTextRun,
+  PdfEditorState,
   PdfFontFamily,
   TextReplacementEdit,
 } from '../types';
 import { getT } from '../i18n/translations';
+import { cloneEditorState } from '../services/storageService';
 import {
   OFFICIAL_FONT_OPTIONS,
   applyPdfEditsToBytes,
@@ -109,11 +119,229 @@ type EditorTool =
   | 'signature'
   | 'stamp';
 
-interface EditorStateSnapshot {
-  replacements: TextReplacementEdit[];
-  addedTexts: AddedTextBox[];
-  addedImages: AddedImageOverlay[];
-  annotations: AnnotationOverlay[];
+type EditorStateSnapshot = PdfEditorState;
+
+type SelectedElementRef = {
+  kind: 'image' | 'textBox' | 'annotation';
+  id: string;
+};
+
+type LayerAction =
+  | 'forward'
+  | 'backward'
+  | 'front'
+  | 'back'
+  | 'behindContent'
+  | 'frontContent';
+
+type UnifiedOverlayItem =
+  | { kind: 'textBox'; id: string; z: number; order: number; behind: boolean; item: AddedTextBox }
+  | { kind: 'image'; id: string; z: number; order: number; behind: boolean; item: AddedImageOverlay }
+  | { kind: 'annotation'; id: string; z: number; order: number; behind: boolean; item: AnnotationOverlay };
+
+const MAX_UNDO_HISTORY = 50;
+
+function getElementBounds(
+  kind: SelectedElementRef['kind'],
+  item: AddedTextBox | AddedImageOverlay | AnnotationOverlay
+): { x: number; y: number; w: number; h: number } {
+  if (kind === 'textBox') {
+    const tb = item as AddedTextBox;
+    const lineCount = Math.max(1, (tb.text || '').split('\n').length);
+    return {
+      x: tb.x,
+      y: tb.y,
+      w: Math.max(24, tb.width),
+      h: Math.max(18, tb.fontSize * 1.42 * lineCount),
+    };
+  }
+  if (kind === 'image') {
+    const im = item as AddedImageOverlay;
+    return { x: im.x, y: im.y, w: im.width, h: im.height };
+  }
+  const an = item as AnnotationOverlay;
+  if (an.kind === 'freehand' && an.points && an.points.length > 0) {
+    const xs = an.points.map((p) => p.x);
+    const ys = an.points.map((p) => p.y);
+    const minX = Math.min(...xs);
+    const minY = Math.min(...ys);
+    return {
+      x: minX,
+      y: minY,
+      w: Math.max(10, Math.max(...xs) - minX),
+      h: Math.max(10, Math.max(...ys) - minY),
+    };
+  }
+  if (an.kind === 'arrow') {
+    return {
+      x: Math.min(an.x, an.x + an.width),
+      y: Math.min(an.y, an.y + an.height),
+      w: Math.max(10, Math.abs(an.width)),
+      h: Math.max(10, Math.abs(an.height)),
+    };
+  }
+  if (an.kind === 'sticky') {
+    return { x: an.x, y: an.y, w: Math.max(84, an.width || 165), h: Math.max(44, an.height || 76) };
+  }
+  if (an.kind === 'stamp') {
+    return { x: an.x, y: an.y, w: Math.max(72, an.width || 96), h: Math.max(22, an.height || 28) };
+  }
+  return {
+    x: an.x,
+    y: an.y,
+    w: Math.max(10, Math.abs(an.width)),
+    h: Math.max(8, Math.abs(an.height)),
+  };
+}
+
+function buildUnifiedPageItems(snap: PdfEditorState, pg: number): UnifiedOverlayItem[] {
+  const items: UnifiedOverlayItem[] = [];
+  snap.addedTexts.forEach((tb, i) => {
+    if (tb.pageNumber === pg) {
+      items.push({
+        kind: 'textBox',
+        id: tb.id,
+        z: tb.zIndex ?? 1000 + i,
+        order: i,
+        behind: tb.layerPlacement === 'behind',
+        item: tb,
+      });
+    }
+  });
+  snap.addedImages.forEach((im, i) => {
+    if (im.pageNumber === pg) {
+      items.push({
+        kind: 'image',
+        id: im.id,
+        z: im.zIndex ?? 2000 + i,
+        order: 100000 + i,
+        behind: im.layerPlacement === 'behind',
+        item: im,
+      });
+    }
+  });
+  snap.annotations.forEach((an, i) => {
+    if (an.pageNumber === pg) {
+      items.push({
+        kind: 'annotation',
+        id: an.id,
+        z: an.zIndex ?? 3000 + i,
+        order: 200000 + i,
+        behind: an.layerPlacement === 'behind',
+        item: an,
+      });
+    }
+  });
+  items.sort((a, b) => a.z - b.z || a.order - b.order);
+  return items;
+}
+
+function getNextTopZIndex(snap: PdfEditorState, pg: number): number {
+  const items = buildUnifiedPageItems(snap, pg);
+  let maxZ = 3000;
+  for (const it of items) {
+    if (it.z > maxZ) maxZ = it.z;
+  }
+  return maxZ + 10;
+}
+
+function doesSnapContainElement(snap: PdfEditorState, sel: SelectedElementRef): boolean {
+  if (sel.kind === 'image') return snap.addedImages.some((x) => x.id === sel.id);
+  if (sel.kind === 'textBox') return snap.addedTexts.some((x) => x.id === sel.id);
+  return snap.annotations.some((x) => x.id === sel.id);
+}
+
+function applyLayerActionToState(
+  prev: PdfEditorState,
+  pg: number,
+  targets: SelectedElementRef[],
+  action: LayerAction
+): PdfEditorState {
+  if (targets.length === 0) return prev;
+  const targetKeys = new Set(targets.map((t) => `${t.kind}:${t.id}`));
+  const isTarget = (u: UnifiedOverlayItem) => targetKeys.has(`${u.kind}:${u.id}`);
+
+  const unified = buildUnifiedPageItems(prev, pg);
+  let behindList = unified.filter((u) => u.behind);
+  let frontList = unified.filter((u) => !u.behind);
+
+  const placementUpdates = new Map<string, 'front' | 'behind'>();
+  if (action === 'behindContent' || action === 'frontContent') {
+    const nextPlacement = action === 'behindContent' ? 'behind' : 'front';
+    for (const u of unified) {
+      if (isTarget(u)) {
+        placementUpdates.set(`${u.kind}:${u.id}`, nextPlacement);
+        u.behind = nextPlacement === 'behind';
+      }
+    }
+    const merged = [...behindList, ...frontList].sort((a, b) => a.z - b.z || a.order - b.order);
+    behindList = merged.filter((u) => u.behind);
+    frontList = merged.filter((u) => !u.behind);
+  } else {
+    const reorderPartition = (list: UnifiedOverlayItem[]): UnifiedOverlayItem[] => {
+      if (list.length <= 1 || !list.some(isTarget)) return list;
+      const arr = [...list];
+      if (action === 'front') {
+        return [...arr.filter((u) => !isTarget(u)), ...arr.filter(isTarget)];
+      }
+      if (action === 'back') {
+        return [...arr.filter(isTarget), ...arr.filter((u) => !isTarget(u))];
+      }
+      if (action === 'forward') {
+        for (let i = arr.length - 2; i >= 0; i--) {
+          if (isTarget(arr[i]) && !isTarget(arr[i + 1])) {
+            const tmp = arr[i];
+            arr[i] = arr[i + 1];
+            arr[i + 1] = tmp;
+          }
+        }
+        return arr;
+      }
+      for (let i = 1; i < arr.length; i++) {
+        if (isTarget(arr[i]) && !isTarget(arr[i - 1])) {
+          const tmp = arr[i];
+          arr[i] = arr[i - 1];
+          arr[i - 1] = tmp;
+        }
+      }
+      return arr;
+    };
+    behindList = reorderPartition(behindList);
+    frontList = reorderPartition(frontList);
+  }
+
+  const zUpdates = new Map<string, number>();
+  [...behindList, ...frontList].forEach((u, idx) => {
+    zUpdates.set(`${u.kind}:${u.id}`, 100 + idx * 10);
+  });
+
+  return {
+    ...prev,
+    addedTexts: prev.addedTexts.map((tb) => {
+      if (tb.pageNumber !== pg) return tb;
+      const key = `textBox:${tb.id}`;
+      const nz = zUpdates.get(key);
+      const np = placementUpdates.get(key);
+      if (nz === undefined && !np) return tb;
+      return { ...tb, zIndex: nz ?? tb.zIndex, layerPlacement: np ?? tb.layerPlacement };
+    }),
+    addedImages: prev.addedImages.map((im) => {
+      if (im.pageNumber !== pg) return im;
+      const key = `image:${im.id}`;
+      const nz = zUpdates.get(key);
+      const np = placementUpdates.get(key);
+      if (nz === undefined && !np) return im;
+      return { ...im, zIndex: nz ?? im.zIndex, layerPlacement: np ?? im.layerPlacement };
+    }),
+    annotations: prev.annotations.map((an) => {
+      if (an.pageNumber !== pg) return an;
+      const key = `annotation:${an.id}`;
+      const nz = zUpdates.get(key);
+      const np = placementUpdates.get(key);
+      if (nz === undefined && !np) return an;
+      return { ...an, zIndex: nz ?? an.zIndex, layerPlacement: np ?? an.layerPlacement };
+    }),
+  };
 }
 
 const STAMP_PRESETS = [
@@ -449,23 +677,28 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   const [keepToolActive, setKeepToolActive] = useState(false);
   const [snapGuides, setSnapGuides] = useState<{ x?: number; y?: number } | null>(null);
 
-  // Preserve original base PDF buffer across saves so staying open after Save never double-bakes or freezes overlays
+  // Preserve original unbaked base PDF buffer & persisted edit layer across saves and re-opens
   const basePdfRef = useRef<{ docId: string; bytes: ArrayBuffer }>({
     docId: doc.id,
-    bytes: cloneBuffer(doc.pdfBytes),
+    bytes: cloneBuffer(doc.basePdfBytes || doc.pdfBytes),
   });
   if (basePdfRef.current.docId !== doc.id) {
-    basePdfRef.current = { docId: doc.id, bytes: cloneBuffer(doc.pdfBytes) };
+    basePdfRef.current = { docId: doc.id, bytes: cloneBuffer(doc.basePdfBytes || doc.pdfBytes) };
   }
 
-  // Edit layers + undo/redo stack
-  const [state, setState] = useState<EditorStateSnapshot>({
-    replacements: [],
-    addedTexts: [],
-    addedImages: [],
-    annotations: [],
-  });
-  const [savedSnapshot, setSavedSnapshot] = useState<EditorStateSnapshot | null>(null);
+  // Restore persisted edits once per mounted session so previously added items stay live & re-editable
+  const initialSessionRef = useRef<EditorStateSnapshot>(
+    cloneEditorState(doc.editorState) || {
+      replacements: [],
+      addedTexts: [],
+      addedImages: [],
+      annotations: [],
+    }
+  );
+  const [state, setState] = useState<EditorStateSnapshot>(() => initialSessionRef.current);
+  const [savedSnapshot, setSavedSnapshot] = useState<EditorStateSnapshot | null>(() =>
+    doc.editorState ? initialSessionRef.current : null
+  );
   const stateRef = useRef(state);
   stateRef.current = state;
   const [undoStack, setUndoStack] = useState<EditorStateSnapshot[]>([]);
@@ -474,6 +707,19 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     fontSize: 14,
     fontFamily: 'arial',
   });
+  const idSeqRef = useRef(0);
+  const nextElementId = useCallback((prefix: string) => {
+    idSeqRef.current += 1;
+    return `${prefix}_${Date.now()}_${idSeqRef.current}`;
+  }, []);
+  const textSubmitLockRef = useRef(false);
+  const isMountedRef = useRef(true);
+  useEffect(() => {
+    isMountedRef.current = true;
+    return () => {
+      isMountedRef.current = false;
+    };
+  }, []);
 
   // Active modals/popovers
   const [editingRun, setEditingRun] = useState<ExtractedTextRun | null>(null);
@@ -535,13 +781,26 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     attachIntegritySeal: boolean;
   } | null>(null);
 
-  const [selectedElement, setSelectedElement] = useState<{
-    kind: 'image' | 'textBox' | 'annotation';
-    id: string;
-  } | null>(null);
+  const [selectedElements, setSelectedElements] = useState<SelectedElementRef[]>([]);
+  const [multiSelectMode, setMultiSelectMode] = useState(false);
+  const [marqueeBox, setMarqueeBox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
+  const marqueeBoxRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
+
+  const selectedElement: SelectedElementRef | null =
+    selectedElements.length === 1 ? selectedElements[0] : null;
+  const setSelectedElement = useCallback((sel: SelectedElementRef | null) => {
+    setSelectedElements(sel ? [sel] : []);
+  }, []);
   const selectedImageId = selectedElement?.kind === 'image' ? selectedElement.id : null;
-  const setSelectedImageId = (id: string | null) =>
-    setSelectedElement(id ? { kind: 'image', id } : null);
+  const setSelectedImageId = useCallback((id: string | null) => {
+    setSelectedElements(id ? [{ kind: 'image', id }] : []);
+  }, []);
+  const isElementSelected = useCallback(
+    (kind: SelectedElementRef['kind'], id: string) =>
+      selectedElements.some((s) => s.kind === kind && s.id === id),
+    [selectedElements]
+  );
+
   const [cropModalImg, setCropModalImg] = useState<AddedImageOverlay | null>(null);
   const [cropInsets, setCropInsets] = useState({ top: 0, right: 0, bottom: 0, left: 0 });
   const [cropNaturalSize, setCropNaturalSize] = useState<{ w: number; h: number } | null>(null);
@@ -554,9 +813,19 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     origX: number;
     origY: number;
     wasSelectedBeforeDown?: boolean;
+    toggleOffOnTap?: boolean;
     origPoints?: Array<{ x: number; y: number }>;
     origTipX?: number;
     origTipY?: number;
+    multiOrigs?: Array<{
+      kind: 'image' | 'textBox' | 'annotation';
+      id: string;
+      origX: number;
+      origY: number;
+      origPoints?: Array<{ x: number; y: number }>;
+      origTipX?: number;
+      origTipY?: number;
+    }>;
   } | null>(null);
   const [resizingImage, setResizingImage] = useState<{
     id: string;
@@ -623,22 +892,35 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   const liveBoxRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
 
   useEffect(() => {
-    setSelectedElement(null);
+    setSelectedElements([]);
     setShowImageAdjustModal(false);
     setSnapGuides(null);
     setEraserCursor(null);
     setEyedropperActive(false);
     setLiveBox(null);
     setLiveFreehand([]);
+    setMarqueeBox(null);
+    marqueeBoxRef.current = null;
     setPageJumpInput(String(pageNumber));
   }, [pageNumber]);
+
+  const pushUndoSnapshot = useCallback((snap: EditorStateSnapshot) => {
+    const cloned = cloneEditorState(snap) || snap;
+    setUndoStack((u) => [...u.slice(-(MAX_UNDO_HISTORY - 1)), cloned]);
+    setRedoStack([]);
+  }, []);
+
+  const capturePreGestureSnapshot = useCallback(() => {
+    preGestureSnapshotRef.current = cloneEditorState(stateRef.current) || stateRef.current;
+  }, []);
 
   const commitState = useCallback(
     (updater: (prev: EditorStateSnapshot) => EditorStateSnapshot) => {
       const current = stateRef.current;
       const next = updater(current);
       if (next === current) return;
-      setUndoStack((u) => [...u.slice(-29), current]);
+      const snapshotForHistory = cloneEditorState(current) || current;
+      setUndoStack((u) => [...u.slice(-(MAX_UNDO_HISTORY - 1)), snapshotForHistory]);
       setRedoStack([]);
       stateRef.current = next;
       setState(next);
@@ -646,14 +928,61 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     []
   );
 
+  const updateStateLive = useCallback(
+    (updater: (prev: EditorStateSnapshot) => EditorStateSnapshot) => {
+      const current = stateRef.current;
+      const next = updater(current);
+      if (next === current) return;
+      stateRef.current = next;
+      setState(next);
+    },
+    []
+  );
+
+  const closeActiveModals = useCallback(() => {
+    setEditingRun(null);
+    setAddingBoxPos(null);
+    setEditingBoxId(null);
+    setStickyPos(null);
+    setEditingStickyId(null);
+    setEditingStampId(null);
+    setCropModalImg(null);
+    setShowImageAdjustModal(false);
+    setShowSigModal(false);
+    setShowToolGrid(false);
+    setShowPageJump(false);
+    textSubmitLockRef.current = false;
+    preGestureSnapshotRef.current = null;
+  }, []);
+
+  const openImagePicker = useCallback(() => {
+    closeActiveModals();
+    setEyedropperActive(false);
+    setDraggingItem(null);
+    setResizingImage(null);
+    setResizingTextBox(null);
+    setResizingAnnotation(null);
+    setDraggingStickyTip(null);
+    dragStartRef.current = null;
+    liveFreehandRef.current = [];
+    liveBoxRef.current = null;
+    marqueeBoxRef.current = null;
+    setLiveFreehand([]);
+    setLiveBox(null);
+    setMarqueeBox(null);
+    setSelectedElements([]);
+    imageInputRef.current?.click();
+  }, [closeActiveModals]);
+
   const handleUndo = useCallback(() => {
     setUndoStack((u) => {
       if (u.length === 0) return u;
-      const prevSnap = u[u.length - 1];
-      setRedoStack((r) => [...r, stateRef.current]);
+      const prevSnap = cloneEditorState(u[u.length - 1]) || u[u.length - 1];
+      const currentForRedo = cloneEditorState(stateRef.current) || stateRef.current;
+      setRedoStack((r) => [...r.slice(-(MAX_UNDO_HISTORY - 1)), currentForRedo]);
       stateRef.current = prevSnap;
       setState(prevSnap);
-      setSelectedElement(null);
+      setSelectedElements((cur) => cur.filter((s) => doesSnapContainElement(prevSnap, s)));
       return u.slice(0, -1);
     });
   }, []);
@@ -661,14 +990,26 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   const handleRedo = useCallback(() => {
     setRedoStack((r) => {
       if (r.length === 0) return r;
-      const nextSnap = r[r.length - 1];
-      setUndoStack((u) => [...u, stateRef.current]);
+      const nextSnap = cloneEditorState(r[r.length - 1]) || r[r.length - 1];
+      const currentForUndo = cloneEditorState(stateRef.current) || stateRef.current;
+      setUndoStack((u) => [...u.slice(-(MAX_UNDO_HISTORY - 1)), currentForUndo]);
       stateRef.current = nextSnap;
       setState(nextSnap);
-      setSelectedElement(null);
+      setSelectedElements((cur) => cur.filter((s) => doesSnapContainElement(nextSnap, s)));
       return r.slice(0, -1);
     });
   }, []);
+
+  const selectAllOnCurrentPage = useCallback(() => {
+    const snap = stateRef.current;
+    const refs: SelectedElementRef[] = [
+      ...snap.addedTexts.filter((x) => x.pageNumber === pageNumber).map((x) => ({ kind: 'textBox' as const, id: x.id })),
+      ...snap.addedImages.filter((x) => x.pageNumber === pageNumber).map((x) => ({ kind: 'image' as const, id: x.id })),
+      ...snap.annotations.filter((x) => x.pageNumber === pageNumber).map((x) => ({ kind: 'annotation' as const, id: x.id })),
+    ];
+    setSelectedElements(refs);
+    if (refs.length > 0) setActiveTool('select');
+  }, [pageNumber]);
 
   // CRITICAL: Only enable 1-finger/left-mouse drag-pan when Pan tool is selected.
   // Spacebar + Drag & Middle-mouse drag & 2-finger pinch still work in all tools!
@@ -717,71 +1058,75 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         return;
       }
 
-      if (e.key === 'Escape' && selectedElement) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'y') {
         e.preventDefault();
-        setSelectedElement(null);
+        handleRedo();
         return;
       }
 
-      // Smooth 1pt (or 8pt with Shift) nudging when an element is selected
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a') {
+        e.preventDefault();
+        selectAllOnCurrentPage();
+        return;
+      }
+
+      if (e.key === 'Escape' && (selectedElements.length > 0 || multiSelectMode)) {
+        e.preventDefault();
+        setSelectedElements([]);
+        setMultiSelectMode(false);
+        return;
+      }
+
+      // Smooth 1pt (or 8pt with Shift) nudging for single or multi-selected elements
       if (
-        selectedElement &&
+        selectedElements.length > 0 &&
         (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'ArrowLeft' || e.key === 'ArrowRight')
       ) {
         e.preventDefault();
         const step = e.shiftKey ? 8 : 1;
         const dx = e.key === 'ArrowLeft' ? -step : e.key === 'ArrowRight' ? step : 0;
         const dy = e.key === 'ArrowUp' ? -step : e.key === 'ArrowDown' ? step : 0;
-        commitState((prev) => {
-          if (selectedElement.kind === 'image') {
-            return {
-              ...prev,
-              addedImages: prev.addedImages.map((im) =>
-                im.id === selectedElement.id
-                  ? {
-                      ...im,
-                      x: Math.max(0, Math.min(pageSize.width - 10, im.x + dx)),
-                      y: Math.max(0, Math.min(pageSize.height - 10, im.y + dy)),
-                    }
-                  : im
-              ),
-            };
-          }
-          if (selectedElement.kind === 'textBox') {
-            return {
-              ...prev,
-              addedTexts: prev.addedTexts.map((tb) =>
-                tb.id === selectedElement.id
-                  ? {
-                      ...tb,
-                      x: Math.max(0, Math.min(pageSize.width - 10, tb.x + dx)),
-                      y: Math.max(0, Math.min(pageSize.height - 10, tb.y + dy)),
-                    }
-                  : tb
-              ),
-            };
-          }
-          return {
-            ...prev,
-            annotations: prev.annotations.map((an) => {
-              if (an.id !== selectedElement.id) return an;
-              if (an.kind === 'freehand' && an.points) {
-                return {
-                  ...an,
-                  points: an.points.map((pt) => ({ x: pt.x + dx, y: pt.y + dy })),
-                };
-              }
+        const imgIds = new Set(selectedElements.filter((s) => s.kind === 'image').map((s) => s.id));
+        const tbIds = new Set(selectedElements.filter((s) => s.kind === 'textBox').map((s) => s.id));
+        const annIds = new Set(selectedElements.filter((s) => s.kind === 'annotation').map((s) => s.id));
+        commitState((prev) => ({
+          ...prev,
+          addedImages: prev.addedImages.map((im) =>
+            imgIds.has(im.id)
+              ? {
+                  ...im,
+                  x: Math.max(0, Math.min(pageSize.width - 10, im.x + dx)),
+                  y: Math.max(0, Math.min(pageSize.height - 10, im.y + dy)),
+                }
+              : im
+          ),
+          addedTexts: prev.addedTexts.map((tb) =>
+            tbIds.has(tb.id)
+              ? {
+                  ...tb,
+                  x: Math.max(0, Math.min(pageSize.width - 10, tb.x + dx)),
+                  y: Math.max(0, Math.min(pageSize.height - 10, tb.y + dy)),
+                }
+              : tb
+          ),
+          annotations: prev.annotations.map((an) => {
+            if (!annIds.has(an.id)) return an;
+            if (an.kind === 'freehand' && an.points) {
               return {
                 ...an,
-                x: Math.max(0, Math.min(pageSize.width - 10, an.x + dx)),
-                y: Math.max(0, Math.min(pageSize.height - 10, an.y + dy)),
-                ...(an.kind === 'sticky' && an.stickyTipX !== undefined && an.stickyTipY !== undefined
-                  ? { stickyTipX: an.stickyTipX + dx, stickyTipY: an.stickyTipY + dy }
-                  : {}),
+                points: an.points.map((pt) => ({ x: pt.x + dx, y: pt.y + dy })),
               };
-            }),
-          };
-        });
+            }
+            return {
+              ...an,
+              x: Math.max(0, Math.min(pageSize.width - 10, an.x + dx)),
+              y: Math.max(0, Math.min(pageSize.height - 10, an.y + dy)),
+              ...(an.kind === 'sticky' && an.stickyTipX !== undefined && an.stickyTipY !== undefined
+                ? { stickyTipX: an.stickyTipX + dx, stickyTipY: an.stickyTipY + dy }
+                : {}),
+            };
+          }),
+        }));
         return;
       }
 
@@ -820,25 +1165,18 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       } else if (e.key === 'PageUp') {
         e.preventDefault();
         setPageNumber((p) => Math.max(1, p - 1));
-      } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedElement) {
+      } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedElements.length > 0) {
         e.preventDefault();
-        const targetEl = selectedElement;
+        const imgIds = new Set(selectedElements.filter((s) => s.kind === 'image').map((s) => s.id));
+        const tbIds = new Set(selectedElements.filter((s) => s.kind === 'textBox').map((s) => s.id));
+        const annIds = new Set(selectedElements.filter((s) => s.kind === 'annotation').map((s) => s.id));
         commitState((prev) => ({
           ...prev,
-          addedImages:
-            targetEl.kind === 'image'
-              ? prev.addedImages.filter((im) => im.id !== targetEl.id)
-              : prev.addedImages,
-          addedTexts:
-            targetEl.kind === 'textBox'
-              ? prev.addedTexts.filter((tb) => tb.id !== targetEl.id)
-              : prev.addedTexts,
-          annotations:
-            targetEl.kind === 'annotation'
-              ? prev.annotations.filter((an) => an.id !== targetEl.id)
-              : prev.annotations,
+          addedImages: prev.addedImages.filter((im) => !imgIds.has(im.id)),
+          addedTexts: prev.addedTexts.filter((tb) => !tbIds.has(tb.id)),
+          annotations: prev.annotations.filter((an) => !annIds.has(an.id)),
         }));
-        setSelectedElement(null);
+        setSelectedElements([]);
       }
     };
 
@@ -852,13 +1190,15 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     cropModalImg,
     showImageAdjustModal,
     editingStampId,
-    selectedElement,
+    selectedElements,
+    multiSelectMode,
     doc.pageCount,
     pageSize.width,
     pageSize.height,
     commitState,
     handleUndo,
     handleRedo,
+    selectAllOnCurrentPage,
   ]);
 
   const [renderScale, setRenderScale] = useState(scale);
@@ -872,7 +1212,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     let active = true;
     const loadPageCanvas = async () => {
       if (canvasRef.current) {
-        const res = await renderPageToCanvas(basePdfRef.current.bytes, pageNumber, canvasRef.current, renderScale);
+        const res = await renderPageToCanvas(basePdfRef.current.bytes, pageNumber, canvasRef.current, renderScale, 0, true);
         if (active) {
           setPageSize({ width: res.unscaledWidth, height: res.unscaledHeight });
         }
@@ -905,6 +1245,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   };
 
   const openEditAddedTextBox = (tb: AddedTextBox) => {
+    closeActiveModals();
     setEditingBoxId(tb.id);
     setAddingBoxPos({ x: tb.x, y: tb.y });
     setNewBoxDraft({
@@ -924,6 +1265,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   };
 
   const openEditStickyNote = (ann: AnnotationOverlay) => {
+    closeActiveModals();
     const geo = computeStickyArrowGeometry(ann);
     setEditingStickyId(ann.id);
     setStickyPos({ x: ann.x, y: ann.y });
@@ -936,6 +1278,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   };
 
   const openEditStamp = (ann: AnnotationOverlay) => {
+    closeActiveModals();
     setEditingStampId(ann.id);
     setStampEditDraft({
       text: ann.comment || ann.dateStr || 'APPROVED',
@@ -1036,7 +1379,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     if (showPageJump) setShowPageJump(false);
     if (performance.now() - lastGestureEndTsRef.current < 260) return;
     if (e.target !== overlayRef.current) return;
-    setSelectedElement(null);
+    if (!multiSelectMode && !e.shiftKey && !e.ctrlKey && !e.metaKey) {
+      setSelectedElements([]);
+    }
     const pt = toUnscaledCoords(e.clientX, e.clientY);
 
     if (activeTool === 'whiteout' && eyedropperActive) {
@@ -1048,6 +1393,8 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     }
 
     if (activeTool === 'addText') {
+      if (addingBoxPos) return;
+      closeActiveModals();
       setEditingBoxId(null);
       setAddingBoxPos(pt);
       setNewBoxDraft({
@@ -1068,6 +1415,8 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     }
 
     if (activeTool === 'sticky') {
+      if (stickyPos) return;
+      closeActiveModals();
       setEditingStickyId(null);
       setStickyPos(pt);
       setStickyText('');
@@ -1089,7 +1438,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       const stampFont = 10;
       const stampW = Math.max(96, chosenLabel.length * 7.2 + 24);
       const stampH = 28;
-      const newId = `ann_${Date.now()}`;
+      const newId = nextElementId('ann');
       commitState((prev) => ({
         ...prev,
         annotations: [
@@ -1107,6 +1456,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             fillColor: stampSolidFill ? activeColor : undefined,
             dateStr: new Date().toLocaleDateString(),
             comment: chosenLabel,
+            zIndex: getNextTopZIndex(prev, pageNumber),
           },
         ],
       }));
@@ -1120,7 +1470,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         setShowSigModal(true);
         return;
       }
-      const newId = `sig_${Date.now()}`;
+      const newId = nextElementId('sig');
       commitState((prev) => ({
         ...prev,
         annotations: [
@@ -1137,6 +1487,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             signatureDataUrl: pendingSig.dataUrl,
             signerName: pendingSig.signerName,
             dateStr: pendingSig.dateStr,
+            zIndex: getNextTopZIndex(prev, pageNumber),
           },
         ],
       }));
@@ -1167,7 +1518,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       e.preventDefault();
       e.stopPropagation();
       tryCapturePointer(e.currentTarget, e.pointerId);
-      preGestureSnapshotRef.current = stateRef.current;
+      capturePreGestureSnapshot();
       erasingActiveRef.current = true;
       erasedAnythingRef.current = false;
       const pt = toUnscaledCoords(e.clientX, e.clientY);
@@ -1183,7 +1534,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     ) {
       e.preventDefault();
       e.stopPropagation();
-      setSelectedElement(null);
+      setSelectedElements([]);
       const pt = toUnscaledCoords(e.clientX, e.clientY);
       tryCapturePointer(e.currentTarget, e.pointerId);
       dragStartRef.current = pt;
@@ -1193,10 +1544,26 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       return;
     }
 
+    if (
+      activeTool === 'select' &&
+      e.target === overlayRef.current &&
+      (e.pointerType === 'mouse' || multiSelectMode)
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
+      const pt = toUnscaledCoords(e.clientX, e.clientY);
+      tryCapturePointer(e.currentTarget, e.pointerId);
+      dragStartRef.current = pt;
+      const initMarquee = { x: pt.x, y: pt.y, w: 0, h: 0 };
+      marqueeBoxRef.current = initMarquee;
+      setMarqueeBox(initMarquee);
+      return;
+    }
+
     if (!isDragStrokeTool) return;
     e.preventDefault();
     e.stopPropagation();
-    setSelectedElement(null);
+    setSelectedElements([]);
     const pt = toUnscaledCoords(e.clientX, e.clientY);
 
     tryCapturePointer(e.currentTarget, e.pointerId);
@@ -1448,53 +1815,85 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
 
       const actualDx = nx - draggingItem.origX;
       const actualDy = ny - draggingItem.origY;
-      setState((prev) => {
-        if (draggingItem.kind === 'image') {
-          return {
-            ...prev,
-            addedImages: prev.addedImages.map((im) =>
-              im.id === draggingItem.id ? { ...im, x: Math.round(nx), y: Math.round(ny) } : im
-            ),
-          };
-        }
-        if (draggingItem.kind === 'textBox') {
-          return {
-            ...prev,
-            addedTexts: prev.addedTexts.map((tb) =>
-              tb.id === draggingItem.id ? { ...tb, x: Math.round(nx), y: Math.round(ny) } : tb
-            ),
-          };
-        }
-        return {
-          ...prev,
-          annotations: prev.annotations.map((an) => {
-            if (an.id !== draggingItem.id) return an;
-            if (an.kind === 'freehand' && draggingItem.origPoints) {
-              return {
-                ...an,
-                points: draggingItem.origPoints.map((pt) => ({
-                  x: pt.x + dx,
-                  y: pt.y + dy,
-                })),
-              };
-            }
-            if (an.kind === 'sticky') {
-              return {
-                ...an,
-                x: Math.round(nx),
-                y: Math.round(ny),
-                ...(draggingItem.origTipX !== undefined && draggingItem.origTipY !== undefined
-                  ? {
-                      stickyTipX: Math.max(4, Math.min(pageSize.width - 4, draggingItem.origTipX + actualDx)),
-                      stickyTipY: Math.max(4, Math.min(pageSize.height - 4, draggingItem.origTipY + actualDy)),
-                    }
-                  : {}),
-              };
-            }
-            return { ...an, x: Math.round(nx), y: Math.round(ny) };
-          }),
-        };
-      });
+      const origsList =
+        draggingItem.multiOrigs && draggingItem.multiOrigs.length > 0
+          ? draggingItem.multiOrigs
+          : [
+              {
+                kind: draggingItem.kind,
+                id: draggingItem.id,
+                origX: draggingItem.origX,
+                origY: draggingItem.origY,
+                origPoints: draggingItem.origPoints,
+                origTipX: draggingItem.origTipX,
+                origTipY: draggingItem.origTipY,
+              },
+            ];
+      const imgOrigMap = new Map(origsList.filter((o) => o.kind === 'image').map((o) => [o.id, o]));
+      const tbOrigMap = new Map(origsList.filter((o) => o.kind === 'textBox').map((o) => [o.id, o]));
+      const annOrigMap = new Map(origsList.filter((o) => o.kind === 'annotation').map((o) => [o.id, o]));
+
+      setState((prev) => ({
+        ...prev,
+        addedImages:
+          imgOrigMap.size > 0
+            ? prev.addedImages.map((im) => {
+                const o = imgOrigMap.get(im.id);
+                if (!o) return im;
+                return {
+                  ...im,
+                  x: Math.round(Math.max(0, Math.min(pageSize.width - 10, o.origX + actualDx))),
+                  y: Math.round(Math.max(0, Math.min(pageSize.height - 10, o.origY + actualDy))),
+                };
+              })
+            : prev.addedImages,
+        addedTexts:
+          tbOrigMap.size > 0
+            ? prev.addedTexts.map((tb) => {
+                const o = tbOrigMap.get(tb.id);
+                if (!o) return tb;
+                return {
+                  ...tb,
+                  x: Math.round(Math.max(0, Math.min(pageSize.width - 10, o.origX + actualDx))),
+                  y: Math.round(Math.max(0, Math.min(pageSize.height - 10, o.origY + actualDy))),
+                };
+              })
+            : prev.addedTexts,
+        annotations:
+          annOrigMap.size > 0
+            ? prev.annotations.map((an) => {
+                const o = annOrigMap.get(an.id);
+                if (!o) return an;
+                if (an.kind === 'freehand' && o.origPoints) {
+                  return {
+                    ...an,
+                    points: o.origPoints.map((pt) => ({
+                      x: pt.x + actualDx,
+                      y: pt.y + actualDy,
+                    })),
+                  };
+                }
+                if (an.kind === 'sticky') {
+                  return {
+                    ...an,
+                    x: Math.round(Math.max(0, Math.min(pageSize.width - 10, o.origX + actualDx))),
+                    y: Math.round(Math.max(0, Math.min(pageSize.height - 10, o.origY + actualDy))),
+                    ...(o.origTipX !== undefined && o.origTipY !== undefined
+                      ? {
+                          stickyTipX: Math.max(4, Math.min(pageSize.width - 4, o.origTipX + actualDx)),
+                          stickyTipY: Math.max(4, Math.min(pageSize.height - 4, o.origTipY + actualDy)),
+                        }
+                      : {}),
+                  };
+                }
+                return {
+                  ...an,
+                  x: Math.round(Math.max(0, Math.min(pageSize.width - 10, o.origX + actualDx))),
+                  y: Math.round(Math.max(0, Math.min(pageSize.height - 10, o.origY + actualDy))),
+                };
+              })
+            : prev.annotations,
+      }));
       return;
     }
 
@@ -1508,6 +1907,20 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     }
 
     if (!dragStartRef.current) return;
+    if (activeTool === 'select') {
+      const pt = toUnscaledCoords(e.clientX, e.clientY);
+      const sx = dragStartRef.current.x;
+      const sy = dragStartRef.current.y;
+      const mBox = {
+        x: Math.min(sx, pt.x),
+        y: Math.min(sy, pt.y),
+        w: Math.abs(pt.x - sx),
+        h: Math.abs(pt.y - sy),
+      };
+      marqueeBoxRef.current = mBox;
+      setMarqueeBox(mBox);
+      return;
+    }
     if (activeTool === 'draw') {
       const nativeEvt = e.nativeEvent as PointerEvent & { getCoalescedEvents?: () => PointerEvent[] };
       const coalesced = typeof nativeEvt.getCoalescedEvents === 'function' ? nativeEvt.getCoalescedEvents() : null;
@@ -1575,17 +1988,18 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     dragStartRef.current = null;
     liveFreehandRef.current = [];
     liveBoxRef.current = null;
+    marqueeBoxRef.current = null;
     setLiveFreehand([]);
     setLiveBox(null);
+    setMarqueeBox(null);
   };
 
-  const handleOverlayPointerUp = () => {
+  const handleOverlayPointerUp = (e?: React.PointerEvent<HTMLDivElement>) => {
     setSnapGuides(null);
     if (draggingStickyTip) {
       lastGestureEndTsRef.current = performance.now();
       if (pointerMovedRef.current && preGestureSnapshotRef.current) {
-        setUndoStack((u) => [...u.slice(-29), preGestureSnapshotRef.current!]);
-        setRedoStack([]);
+        pushUndoSnapshot(preGestureSnapshotRef.current);
       }
       preGestureSnapshotRef.current = null;
       setDraggingStickyTip(null);
@@ -1594,8 +2008,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     if (resizingTextBox) {
       lastGestureEndTsRef.current = performance.now();
       if (pointerMovedRef.current && preGestureSnapshotRef.current) {
-        setUndoStack((u) => [...u.slice(-29), preGestureSnapshotRef.current!]);
-        setRedoStack([]);
+        pushUndoSnapshot(preGestureSnapshotRef.current);
       }
       preGestureSnapshotRef.current = null;
       setResizingTextBox(null);
@@ -1604,8 +2017,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     if (resizingImage) {
       lastGestureEndTsRef.current = performance.now();
       if (pointerMovedRef.current && preGestureSnapshotRef.current) {
-        setUndoStack((u) => [...u.slice(-29), preGestureSnapshotRef.current!]);
-        setRedoStack([]);
+        pushUndoSnapshot(preGestureSnapshotRef.current);
       }
       preGestureSnapshotRef.current = null;
       setResizingImage(null);
@@ -1614,8 +2026,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     if (resizingAnnotation) {
       lastGestureEndTsRef.current = performance.now();
       if (pointerMovedRef.current && preGestureSnapshotRef.current) {
-        setUndoStack((u) => [...u.slice(-29), preGestureSnapshotRef.current!]);
-        setRedoStack([]);
+        pushUndoSnapshot(preGestureSnapshotRef.current);
       }
       preGestureSnapshotRef.current = null;
       setResizingAnnotation(null);
@@ -1626,25 +2037,36 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       const wasTap = !pointerMovedRef.current;
       const item = draggingItem;
       if (!wasTap && preGestureSnapshotRef.current) {
-        setUndoStack((u) => [...u.slice(-29), preGestureSnapshotRef.current!]);
-        setRedoStack([]);
+        pushUndoSnapshot(preGestureSnapshotRef.current);
       }
       preGestureSnapshotRef.current = null;
       setDraggingItem(null);
       if (wasTap) {
-        setSelectedElement({ kind: item.kind, id: item.id });
-        // Tap once to select & reveal resize/editing controls; tap again (already selected) to open quick editor
-        if (item.wasSelectedBeforeDown) {
-          if (item.kind === 'image') {
-            preGestureSnapshotRef.current = stateRef.current;
-            setShowImageAdjustModal(true);
-          } else if (item.kind === 'textBox') {
-            const tb = stateRef.current.addedTexts.find((x) => x.id === item.id);
-            if (tb) openEditAddedTextBox(tb);
-          } else if (item.kind === 'annotation') {
-            const ann = stateRef.current.annotations.find((x) => x.id === item.id);
-            if (ann?.kind === 'sticky') openEditStickyNote(ann);
-            else if (ann?.kind === 'stamp') openEditStamp(ann);
+        if (item.toggleOffOnTap) {
+          setSelectedElements((prev) =>
+            prev.filter((s) => !(s.kind === item.kind && s.id === item.id))
+          );
+          return;
+        }
+        if (!multiSelectMode && selectedElements.length > 1) {
+          setSelectedElement({ kind: item.kind, id: item.id });
+          return;
+        }
+        if (!multiSelectMode) {
+          setSelectedElement({ kind: item.kind, id: item.id });
+          // Tap once to select & reveal resize/editing controls; tap again (already selected) to open quick editor
+          if (item.wasSelectedBeforeDown) {
+            if (item.kind === 'image') {
+              capturePreGestureSnapshot();
+              setShowImageAdjustModal(true);
+            } else if (item.kind === 'textBox') {
+              const tb = stateRef.current.addedTexts.find((x) => x.id === item.id);
+              if (tb) openEditAddedTextBox(tb);
+            } else if (item.kind === 'annotation') {
+              const ann = stateRef.current.annotations.find((x) => x.id === item.id);
+              if (ann?.kind === 'sticky') openEditStickyNote(ann);
+              else if (ann?.kind === 'stamp') openEditStamp(ann);
+            }
           }
         }
       }
@@ -1654,8 +2076,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       lastGestureEndTsRef.current = performance.now();
       erasingActiveRef.current = false;
       if (erasedAnythingRef.current && preGestureSnapshotRef.current) {
-        setUndoStack((u) => [...u.slice(-29), preGestureSnapshotRef.current!]);
-        setRedoStack([]);
+        pushUndoSnapshot(preGestureSnapshotRef.current);
       }
       erasedAnythingRef.current = false;
       preGestureSnapshotRef.current = null;
@@ -1663,6 +2084,42 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     }
 
     if (!dragStartRef.current) return;
+    if (activeTool === 'select') {
+      const mBox = marqueeBoxRef.current;
+      dragStartRef.current = null;
+      marqueeBoxRef.current = null;
+      setMarqueeBox(null);
+      if (mBox && (mBox.w > 6 || mBox.h > 6)) {
+        lastGestureEndTsRef.current = performance.now();
+        const unified = buildUnifiedPageItems(stateRef.current, pageNumber);
+        const hits: SelectedElementRef[] = [];
+        for (const u of unified) {
+          const b = getElementBounds(u.kind, u.item);
+          const overlaps =
+            b.x <= mBox.x + mBox.w &&
+            b.x + b.w >= mBox.x &&
+            b.y <= mBox.y + mBox.h &&
+            b.y + b.h >= mBox.y;
+          if (overlaps) hits.push({ kind: u.kind, id: u.id });
+        }
+        if (e?.shiftKey || multiSelectMode) {
+          setSelectedElements((prev) => {
+            const seen = new Set(prev.map((s) => `${s.kind}:${s.id}`));
+            const merged = [...prev];
+            for (const h of hits) {
+              if (!seen.has(`${h.kind}:${h.id}`)) merged.push(h);
+            }
+            return merged;
+          });
+        } else {
+          setSelectedElements(hits);
+        }
+      } else if (!multiSelectMode && !e?.shiftKey) {
+        setSelectedElements([]);
+      }
+      return;
+    }
+
     const finalPts = liveFreehandRef.current;
     const finalBox = liveBoxRef.current;
 
@@ -1673,7 +2130,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       const bw = Math.abs(finalBox.w);
       const bh = Math.abs(finalBox.h);
       const customRun: ExtractedTextRun = {
-        id: `custom_run_${pageNumber}_${Date.now()}`,
+        id: nextElementId(`custom_run_${pageNumber}`),
         pageNumber,
         str: '',
         x: bx,
@@ -1703,7 +2160,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         annotations: [
           ...prev.annotations,
           {
-            id: `ann_${Date.now()}`,
+            id: nextElementId('ann'),
             pageNumber,
             kind: 'freehand',
             x: 0,
@@ -1714,6 +2171,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             strokeWidth,
             opacity: penOpacity,
             points: strokePts,
+            zIndex: getNextTopZIndex(prev, pageNumber),
           },
         ],
       }));
@@ -1738,7 +2196,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             : kind === 'arrow'
             ? finalBox.h
             : Math.max(10, finalBox.h);
-        const newAnnId = `ann_${Date.now()}`;
+        const newAnnId = nextElementId('ann');
         commitState((prev) => ({
           ...prev,
           annotations: [
@@ -1763,6 +2221,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   : (kind === 'rect' || kind === 'circle') && shapeFilled
                   ? activeColor
                   : undefined,
+              zIndex: getNextTopZIndex(prev, pageNumber),
             },
           ],
         }));
@@ -1891,6 +2350,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   const handleApplyRunReplacement = (deleted: boolean) => {
     if (!editingRun) return;
     const baseRun = textRuns.find((r) => r.id === editingRun.id) || (ocrScannedPages[pageNumber] || []).find((r) => r.id === editingRun.id) || editingRun;
+    const nextRepId = nextElementId('rep');
     commitState((prev) => {
       const filtered = prev.replacements.filter((r) => r.runId !== editingRun.id);
       return {
@@ -1898,7 +2358,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         replacements: [
           ...filtered,
           {
-            id: `rep_${Date.now()}`,
+            id: nextRepId,
             runId: editingRun.id,
             pageNumber,
             originalText: baseRun.str,
@@ -1935,12 +2395,18 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
 
   const handleImageFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file) return;
+    const targetPage = pageNumber;
+    const targetPageW = pageSize.width;
+    const targetPageH = pageSize.height;
     const reader = new FileReader();
     reader.onload = () => {
+      if (!isMountedRef.current) return;
       const rawUrl = reader.result as string;
       const img = new Image();
       img.onload = () => {
+        if (!isMountedRef.current) return;
         const natW = Math.max(1, img.naturalWidth || 180);
         const natH = Math.max(1, img.naturalHeight || 140);
         const maxDim = 1800;
@@ -1948,7 +2414,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         const cw = Math.max(1, Math.round(natW * ratio));
         const ch = Math.max(1, Math.round(natH * ratio));
         let finalUrl = rawUrl;
-        if (!rawUrl.startsWith('data:image/png') && !rawUrl.startsWith('data:image/jpeg') || ratio < 1) {
+        if ((!rawUrl.startsWith('data:image/png') && !rawUrl.startsWith('data:image/jpeg')) || ratio < 1) {
           const c = document.createElement('canvas');
           c.width = cw;
           c.height = ch;
@@ -1957,20 +2423,22 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         }
         const w = Math.min(220, natW);
         const h = Math.max(24, Math.round((w / natW) * natH));
-        const newId = `img_${Date.now()}`;
+        const newId = nextElementId('img');
+        closeActiveModals();
         commitState((prev) => ({
           ...prev,
           addedImages: [
             ...prev.addedImages,
             {
               id: newId,
-              pageNumber,
+              pageNumber: targetPage,
               dataUrl: finalUrl,
-              x: Math.max(16, Math.round((pageSize.width - w) / 2)),
-              y: Math.max(24, Math.round((pageSize.height - h) / 3)),
+              x: Math.max(16, Math.round((targetPageW - w) / 2)),
+              y: Math.max(24, Math.round((targetPageH - h) / 3)),
               width: w,
               height: h,
               rotation: 0,
+              zIndex: getNextTopZIndex(prev, targetPage),
             },
           ],
         }));
@@ -1981,13 +2449,19 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       img.src = rawUrl;
     };
     reader.readAsDataURL(file);
-    e.target.value = '';
   };
 
   const handleSave = async (mode: 'version' | 'copy' | 'download', closeAfter = false) => {
     setSaving(true);
     try {
-      const editedBytes = await applyPdfEditsToBytes(basePdfRef.current.bytes, stateRef.current);
+      const baseBytesSnapshot = cloneBuffer(basePdfRef.current.bytes);
+      const stateSnapshot = cloneEditorState(stateRef.current) || {
+        replacements: [],
+        addedTexts: [],
+        addedImages: [],
+        annotations: [],
+      };
+      const editedBytes = await applyPdfEditsToBytes(baseBytesSnapshot, stateSnapshot);
       const seal = pendingSig?.attachIntegritySeal
         ? await computeSha256Hex(editedBytes)
         : doc.sha256Seal;
@@ -2004,6 +2478,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
 
       const thumb = await renderPageThumbnail(editedBytes, 1, 200).catch(() => doc.thumbnailDataUrl);
       const now = Date.now();
+      const summaryCounts = `${stateSnapshot.replacements.length} text edits, ${stateSnapshot.addedTexts.length} text boxes, ${stateSnapshot.addedImages.length} images, ${stateSnapshot.annotations.length} annotations`;
 
       if (mode === 'version') {
         const updated: DocumentRecord = {
@@ -2013,14 +2488,17 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           sizeBytes: editedBytes.byteLength,
           thumbnailDataUrl: thumb,
           pdfBytes: cloneBuffer(editedBytes),
+          basePdfBytes: cloneBuffer(baseBytesSnapshot),
+          editorState: cloneEditorState(stateSnapshot),
           sha256Seal: seal,
           versions: [
             {
               id: `ver_${now}`,
               timestamp: now,
-              note: `Edited (${stateRef.current.replacements.length} text edits, ${stateRef.current.annotations.length} annotations)`,
+              note: `Edited (${summaryCounts})`,
               sizeBytes: editedBytes.byteLength,
               pdfBytes: cloneBuffer(editedBytes),
+              editorState: cloneEditorState(stateSnapshot),
             },
             ...doc.versions,
           ],
@@ -2044,6 +2522,8 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           sizeBytes: editedBytes.byteLength,
           thumbnailDataUrl: thumb,
           pdfBytes: cloneBuffer(editedBytes),
+          basePdfBytes: cloneBuffer(baseBytesSnapshot),
+          editorState: cloneEditorState(stateSnapshot),
           sha256Seal: seal,
           versions: [
             {
@@ -2052,6 +2532,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               note: 'Saved as edited copy',
               sizeBytes: editedBytes.byteLength,
               pdfBytes: cloneBuffer(editedBytes),
+              editorState: cloneEditorState(stateSnapshot),
             },
           ],
         };
@@ -2146,64 +2627,322 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   // Existing elements ignore pointers while drawing/stroking/erasing/eyedropper so you can draw smoothly over anything
   const lockExistingElements = isDragStrokeTool || activeTool === 'eraser';
 
-  const showContextualSubBar = Boolean(selectedImg || selectedTextBox || selectedAnn) || activeTool !== 'pan';
+  const unifiedPageItems = useMemo(
+    () => buildUnifiedPageItems(state, pageNumber),
+    [state, pageNumber]
+  );
+  const behindPageItems = useMemo(
+    () => unifiedPageItems.filter((u) => u.behind),
+    [unifiedPageItems]
+  );
+  const frontPageItems = useMemo(
+    () => unifiedPageItems.filter((u) => !u.behind),
+    [unifiedPageItems]
+  );
+  const hasMultiSelection = selectedElements.length > 1;
+  const showContextualSubBar =
+    Boolean(hasMultiSelection || selectedImg || selectedTextBox || selectedAnn) || activeTool !== 'pan';
+  const multiSelectedTextCount = selectedElements.filter((s) => s.kind === 'textBox').length;
+  const multiSelectedImgCount = selectedElements.filter((s) => s.kind === 'image').length;
+  const multiSelectedAnnCount = selectedElements.filter((s) => s.kind === 'annotation').length;
+  const allSelectedBehind = useMemo(() => {
+    if (selectedElements.length === 0) return false;
+    return selectedElements.every((s) => {
+      if (s.kind === 'textBox') return pageAddedTexts.find((x) => x.id === s.id)?.layerPlacement === 'behind';
+      if (s.kind === 'image') return pageAddedImages.find((x) => x.id === s.id)?.layerPlacement === 'behind';
+      return pageAnnotations.find((x) => x.id === s.id)?.layerPlacement === 'behind';
+    });
+  }, [selectedElements, pageAddedTexts, pageAddedImages, pageAnnotations]);
+
+  const startElementPointerDown = (
+    e: React.PointerEvent,
+    kind: SelectedElementRef['kind'],
+    id: string,
+    origX: number,
+    origY: number,
+    opts?: { origPoints?: Array<{ x: number; y: number }>; origTipX?: number; origTipY?: number }
+  ) => {
+    if (lockExistingElements || eyedropperActive) return;
+    e.stopPropagation();
+    pointerMovedRef.current = false;
+    capturePreGestureSnapshot();
+    const toggleRequested = e.shiftKey || e.ctrlKey || e.metaKey || multiSelectMode;
+    const wasSelected = isElementSelected(kind, id);
+    let activeSel: SelectedElementRef[];
+    if (wasSelected) {
+      activeSel = selectedElements;
+    } else if (toggleRequested) {
+      activeSel = [...selectedElements, { kind, id }];
+      setSelectedElements(activeSel);
+    } else {
+      activeSel = [{ kind, id }];
+      setSelectedElements(activeSel);
+    }
+    const curSnap = stateRef.current;
+    const multiOrigs = activeSel.map((sel) => {
+      if (sel.kind === 'image') {
+        const im = curSnap.addedImages.find((x) => x.id === sel.id);
+        return { kind: 'image' as const, id: sel.id, origX: im?.x ?? 0, origY: im?.y ?? 0 };
+      }
+      if (sel.kind === 'textBox') {
+        const tb = curSnap.addedTexts.find((x) => x.id === sel.id);
+        return { kind: 'textBox' as const, id: sel.id, origX: tb?.x ?? 0, origY: tb?.y ?? 0 };
+      }
+      const an = curSnap.annotations.find((x) => x.id === sel.id);
+      return {
+        kind: 'annotation' as const,
+        id: sel.id,
+        origX: an?.x ?? 0,
+        origY: an?.y ?? 0,
+        origPoints: an?.points ? an.points.map((p) => ({ ...p })) : undefined,
+        origTipX: an?.stickyTipX,
+        origTipY: an?.stickyTipY,
+      };
+    });
+    tryCapturePointer(overlayRef.current, e.pointerId);
+    setDraggingItem({
+      kind,
+      id,
+      startClientX: e.clientX,
+      startClientY: e.clientY,
+      origX,
+      origY,
+      wasSelectedBeforeDown: wasSelected,
+      toggleOffOnTap: wasSelected && toggleRequested,
+      origPoints: opts?.origPoints,
+      origTipX: opts?.origTipX,
+      origTipY: opts?.origTipY,
+      multiOrigs,
+    });
+  };
 
   const duplicateSelectedElement = () => {
-    if (!selectedElement) return;
-    if (selectedElement.kind === 'image' && selectedImg) {
-      const newId = `img_${Date.now()}`;
-      commitState((prev) => ({
+    if (selectedElements.length === 0) return;
+    const newRefs: SelectedElementRef[] = [];
+    commitState((prev) => {
+      let nextZ = getNextTopZIndex(prev, pageNumber);
+      const addedImgs: AddedImageOverlay[] = [];
+      const addedTbs: AddedTextBox[] = [];
+      const addedAnns: AnnotationOverlay[] = [];
+
+      for (const sel of selectedElements) {
+        if (sel.kind === 'image') {
+          const src = prev.addedImages.find((im) => im.id === sel.id);
+          if (!src) continue;
+          const newId = nextElementId('img');
+          newRefs.push({ kind: 'image', id: newId });
+          addedImgs.push({
+            ...src,
+            id: newId,
+            x: Math.min(pageSize.width - 40, src.x + 18),
+            y: Math.min(pageSize.height - 40, src.y + 18),
+            zIndex: nextZ,
+          });
+          nextZ += 10;
+        } else if (sel.kind === 'textBox') {
+          const src = prev.addedTexts.find((tb) => tb.id === sel.id);
+          if (!src) continue;
+          const newId = nextElementId('tb');
+          newRefs.push({ kind: 'textBox', id: newId });
+          addedTbs.push({
+            ...src,
+            id: newId,
+            x: Math.min(pageSize.width - 40, src.x + 18),
+            y: Math.min(pageSize.height - 40, src.y + 18),
+            zIndex: nextZ,
+          });
+          nextZ += 10;
+        } else {
+          const src = prev.annotations.find((an) => an.id === sel.id);
+          if (!src) continue;
+          const newId = nextElementId('ann');
+          newRefs.push({ kind: 'annotation', id: newId });
+          addedAnns.push({
+            ...src,
+            id: newId,
+            x: Math.min(pageSize.width - 30, src.x + 18),
+            y: Math.min(pageSize.height - 30, src.y + 18),
+            points: src.points?.map((p) => ({ x: p.x + 18, y: p.y + 18 })),
+            stickyTipX:
+              src.stickyTipX !== undefined ? Math.min(pageSize.width - 8, src.stickyTipX + 18) : undefined,
+            stickyTipY:
+              src.stickyTipY !== undefined ? Math.min(pageSize.height - 8, src.stickyTipY + 18) : undefined,
+            zIndex: nextZ,
+          });
+          nextZ += 10;
+        }
+      }
+      return {
         ...prev,
-        addedImages: [
-          ...prev.addedImages,
-          { ...selectedImg, id: newId, x: Math.min(pageSize.width - 40, selectedImg.x + 18), y: Math.min(pageSize.height - 40, selectedImg.y + 18) },
-        ],
-      }));
-      setSelectedElement({ kind: 'image', id: newId });
-    } else if (selectedElement.kind === 'textBox' && selectedTextBox) {
-      const newId = `tb_${Date.now()}`;
-      commitState((prev) => ({
-        ...prev,
-        addedTexts: [
-          ...prev.addedTexts,
-          { ...selectedTextBox, id: newId, x: Math.min(pageSize.width - 40, selectedTextBox.x + 18), y: Math.min(pageSize.height - 40, selectedTextBox.y + 18) },
-        ],
-      }));
-      setSelectedElement({ kind: 'textBox', id: newId });
-    } else if (selectedElement.kind === 'annotation' && selectedAnn) {
-      const newId = `ann_${Date.now()}`;
-      const cloned: AnnotationOverlay = {
-        ...selectedAnn,
-        id: newId,
-        x: Math.min(pageSize.width - 30, selectedAnn.x + 18),
-        y: Math.min(pageSize.height - 30, selectedAnn.y + 18),
-        points: selectedAnn.points?.map((p) => ({ x: p.x + 18, y: p.y + 18 })),
-        stickyTipX: selectedAnn.stickyTipX !== undefined ? Math.min(pageSize.width - 8, selectedAnn.stickyTipX + 18) : undefined,
-        stickyTipY: selectedAnn.stickyTipY !== undefined ? Math.min(pageSize.height - 8, selectedAnn.stickyTipY + 18) : undefined,
+        addedImages: [...prev.addedImages, ...addedImgs],
+        addedTexts: [...prev.addedTexts, ...addedTbs],
+        annotations: [...prev.annotations, ...addedAnns],
       };
-      commitState((prev) => ({ ...prev, annotations: [...prev.annotations, cloned] }));
-      setSelectedElement({ kind: 'annotation', id: newId });
+    });
+    if (newRefs.length > 0) setSelectedElements(newRefs);
+  };
+
+  const batchDeleteSelected = () => {
+    if (selectedElements.length === 0) return;
+    const imgIds = new Set(selectedElements.filter((s) => s.kind === 'image').map((s) => s.id));
+    const tbIds = new Set(selectedElements.filter((s) => s.kind === 'textBox').map((s) => s.id));
+    const annIds = new Set(selectedElements.filter((s) => s.kind === 'annotation').map((s) => s.id));
+    commitState((prev) => ({
+      ...prev,
+      addedImages: prev.addedImages.filter((im) => !imgIds.has(im.id)),
+      addedTexts: prev.addedTexts.filter((tb) => !tbIds.has(tb.id)),
+      annotations: prev.annotations.filter((an) => !annIds.has(an.id)),
+    }));
+    setSelectedElements([]);
+  };
+
+  const applyLayerAction = (action: LayerAction) => {
+    if (selectedElements.length === 0) return;
+    commitState((prev) => applyLayerActionToState(prev, pageNumber, selectedElements, action));
+    if (action === 'behindContent') {
+      flashStatus(t.editor.behindPageContent, 1600);
+    } else if (action === 'frontContent') {
+      flashStatus(t.editor.frontOfPageContent, 1600);
     }
   };
 
-  const bringSelectedToFront = () => {
-    if (!selectedElement) return;
+  const batchChangeColor = (color: string) => {
+    if (selectedElements.length === 0) return;
+    const tbIds = new Set(selectedElements.filter((s) => s.kind === 'textBox').map((s) => s.id));
+    const annIds = new Set(selectedElements.filter((s) => s.kind === 'annotation').map((s) => s.id));
+    commitState((prev) => ({
+      ...prev,
+      addedTexts: prev.addedTexts.map((tb) => (tbIds.has(tb.id) ? { ...tb, color } : tb)),
+      annotations: prev.annotations.map((an) =>
+        annIds.has(an.id) && an.kind !== 'whiteout' && an.kind !== 'signature'
+          ? {
+              ...an,
+              color,
+              fillColor: an.kind === 'sticky' ? an.fillColor : an.fillColor ? color : undefined,
+            }
+          : an
+      ),
+    }));
+  };
+
+  const batchAdjustFontSize = (delta: number) => {
+    if (selectedElements.length === 0) return;
+    const tbIds = new Set(selectedElements.filter((s) => s.kind === 'textBox').map((s) => s.id));
+    const annIds = new Set(selectedElements.filter((s) => s.kind === 'annotation').map((s) => s.id));
+    commitState((prev) => ({
+      ...prev,
+      addedTexts: prev.addedTexts.map((tb) =>
+        tbIds.has(tb.id)
+          ? { ...tb, fontSize: Math.max(8, Math.min(64, tb.fontSize + delta)) }
+          : tb
+      ),
+      annotations: prev.annotations.map((an) => {
+        if (!annIds.has(an.id)) return an;
+        if (an.kind === 'sticky') {
+          return { ...an, fontSize: Math.max(7, Math.min(22, (an.fontSize || 10) + delta)) };
+        }
+        if (an.kind === 'stamp') {
+          const nextFs = Math.max(8, Math.min(24, (an.fontSize || 10) + delta));
+          const sf = nextFs / (an.fontSize || 10);
+          return {
+            ...an,
+            fontSize: nextFs,
+            width: Math.max(72, Math.round((an.width || 96) * sf)),
+            height: Math.max(22, Math.round((an.height || 28) * sf)),
+          };
+        }
+        return an;
+      }),
+    }));
+  };
+
+  const batchToggleTextStyle = (prop: 'bold' | 'italic') => {
+    if (selectedElements.length === 0) return;
+    const tbIds = new Set(selectedElements.filter((s) => s.kind === 'textBox').map((s) => s.id));
+    if (tbIds.size === 0) return;
     commitState((prev) => {
-      if (selectedElement.kind === 'image') {
-        const target = prev.addedImages.find((im) => im.id === selectedElement.id);
-        if (!target) return prev;
-        return { ...prev, addedImages: [...prev.addedImages.filter((im) => im.id !== target.id), target] };
-      }
-      if (selectedElement.kind === 'textBox') {
-        const target = prev.addedTexts.find((tb) => tb.id === selectedElement.id);
-        if (!target) return prev;
-        return { ...prev, addedTexts: [...prev.addedTexts.filter((tb) => tb.id !== target.id), target] };
-      }
-      const target = prev.annotations.find((an) => an.id === selectedElement.id);
-      if (!target) return prev;
-      return { ...prev, annotations: [...prev.annotations.filter((an) => an.id !== target.id), target] };
+      const selectedTbs = prev.addedTexts.filter((tb) => tbIds.has(tb.id));
+      const allActive = selectedTbs.length > 0 && selectedTbs.every((tb) => Boolean(tb[prop]));
+      const nextVal = !allActive;
+      return {
+        ...prev,
+        addedTexts: prev.addedTexts.map((tb) => (tbIds.has(tb.id) ? { ...tb, [prop]: nextVal } : tb)),
+      };
     });
   };
+
+  const batchCycleOpacity = () => {
+    if (selectedElements.length === 0) return;
+    const imgIds = new Set(selectedElements.filter((s) => s.kind === 'image').map((s) => s.id));
+    const annIds = new Set(selectedElements.filter((s) => s.kind === 'annotation').map((s) => s.id));
+    const steps = [1, 0.75, 0.5, 0.25];
+    commitState((prev) => {
+      const firstImg = prev.addedImages.find((im) => imgIds.has(im.id));
+      const firstAnn = prev.annotations.find((an) => annIds.has(an.id));
+      const curOp = firstImg?.opacity ?? firstAnn?.opacity ?? 1;
+      const idx = steps.findIndex((s) => Math.abs(s - curOp) < 0.08);
+      const nextOp = steps[(idx + 1) % steps.length];
+      return {
+        ...prev,
+        addedImages: prev.addedImages.map((im) => (imgIds.has(im.id) ? { ...im, opacity: nextOp } : im)),
+        annotations: prev.annotations.map((an) => (annIds.has(an.id) ? { ...an, opacity: nextOp } : an)),
+      };
+    });
+  };
+
+  const renderLayerControls = (isBehind: boolean) => (
+    <div className="flex items-center gap-1 pl-1 border-l border-slate-200 dark:border-slate-700 shrink-0">
+      <button
+        type="button"
+        onClick={() => applyLayerAction('forward')}
+        title={t.editor.bringForward}
+        aria-label={t.editor.bringForward}
+        className="px-1.5 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:border-[#2563EB] shrink-0"
+      >
+        <ChevronUp className="w-3.5 h-3.5" />
+      </button>
+      <button
+        type="button"
+        onClick={() => applyLayerAction('backward')}
+        title={t.editor.sendBackward}
+        aria-label={t.editor.sendBackward}
+        className="px-1.5 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:border-[#2563EB] shrink-0"
+      >
+        <ChevronDown className="w-3.5 h-3.5" />
+      </button>
+      <button
+        type="button"
+        onClick={() => applyLayerAction('front')}
+        title={t.editor.bringFront}
+        aria-label={t.editor.bringFront}
+        className="px-1.5 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:border-[#2563EB] shrink-0"
+      >
+        <ArrowUpToLine className="w-3.5 h-3.5" />
+      </button>
+      <button
+        type="button"
+        onClick={() => applyLayerAction('back')}
+        title={t.editor.sendToBack}
+        aria-label={t.editor.sendToBack}
+        className="px-1.5 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 hover:border-[#2563EB] shrink-0"
+      >
+        <ArrowDownToLine className="w-3.5 h-3.5" />
+      </button>
+      <button
+        type="button"
+        onClick={() => applyLayerAction(isBehind ? 'frontContent' : 'behindContent')}
+        title={isBehind ? t.editor.frontOfPageContent : t.editor.behindPageContent}
+        className={`px-2 py-1 rounded-lg border flex items-center gap-1 font-semibold whitespace-nowrap shrink-0 ${
+          isBehind
+            ? 'bg-amber-500 text-white border-amber-500'
+            : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200'
+        }`}
+      >
+        {isBehind ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+        <span>{isBehind ? t.editor.frontOfPageContent : t.editor.behindPageContent}</span>
+      </button>
+    </div>
+  );
 
   return (
     <div
@@ -2274,18 +3013,30 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           <button
             onClick={handleUndo}
             disabled={undoStack.length === 0}
-            aria-label={t.editor.undo}
-            className="min-h-[42px] min-w-[42px] flex items-center justify-center rounded-xl disabled:opacity-30 hover:bg-slate-100 dark:hover:bg-slate-800"
+            aria-label={`${t.editor.undo} (${undoStack.length})`}
+            title={`${t.editor.undo}${undoStack.length > 0 ? ` (${undoStack.length})` : ''}`}
+            className="min-h-[42px] px-2 flex items-center justify-center gap-0.5 rounded-xl disabled:opacity-30 hover:bg-slate-100 dark:hover:bg-slate-800"
           >
             <Undo2 className="w-4 h-4" />
+            {undoStack.length > 0 && (
+              <span className="text-[10px] font-mono-nums font-bold text-slate-500 dark:text-slate-400">
+                {undoStack.length}
+              </span>
+            )}
           </button>
           <button
             onClick={handleRedo}
             disabled={redoStack.length === 0}
-            aria-label={t.editor.redo}
-            className="min-h-[42px] min-w-[42px] flex items-center justify-center rounded-xl disabled:opacity-30 hover:bg-slate-100 dark:hover:bg-slate-800"
+            aria-label={`${t.editor.redo} (${redoStack.length})`}
+            title={`${t.editor.redo}${redoStack.length > 0 ? ` (${redoStack.length})` : ''}`}
+            className="min-h-[42px] px-2 flex items-center justify-center gap-0.5 rounded-xl disabled:opacity-30 hover:bg-slate-100 dark:hover:bg-slate-800"
           >
             <Redo2 className="w-4 h-4" />
+            {redoStack.length > 0 && (
+              <span className="text-[10px] font-mono-nums font-bold text-slate-500 dark:text-slate-400">
+                {redoStack.length}
+              </span>
+            )}
           </button>
           <button
             onClick={() => handleSave('download')}
@@ -2314,6 +3065,10 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             <span className="font-semibold text-[#2563EB]">{statusMessage}</span>
           ) : eyedropperActive ? (
             <span className="font-semibold text-[#2563EB]">{t.editor.pickFromPageHint}</span>
+          ) : hasMultiSelection ? (
+            <span className="font-semibold text-[#2563EB]">
+              {selectedElements.length} {t.editor.selectedCount}
+            </span>
           ) : selectedElement ? (
             t.editor.tapSelectedHint
           ) : textRuns.length > 0 ? (
@@ -2373,8 +3128,388 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               className="relative bg-white shadow-xl rounded-md overflow-visible select-none shrink-0"
               style={{ width: pageSize.width * scale, height: pageSize.height * scale }}
             >
-              <div className="absolute inset-0 rounded-md overflow-hidden pointer-events-none">
-                <canvas ref={canvasRef} className="block w-full h-full" />
+              {/* Elements positioned BEHIND original PDF page content */}
+              {behindPageItems.length > 0 && (
+                <div className="absolute inset-0 rounded-md overflow-hidden pointer-events-none z-[1]">
+                  {(() => {
+                    const nodes: React.ReactNode[] = [];
+                    let svgBatch: AnnotationOverlay[] = [];
+                    let svgZ = 10;
+                    const flushSvg = (keySuffix: string | number) => {
+                      if (svgBatch.length === 0) return;
+                      const captured = svgBatch;
+                      const zVal = svgZ;
+                      svgBatch = [];
+                      nodes.push(
+                        <svg
+                          key={`behind_svg_${keySuffix}`}
+                          style={{ zIndex: zVal }}
+                          className="pointer-events-none absolute inset-0 w-full h-full"
+                          viewBox={`0 0 ${pageSize.width} ${pageSize.height}`}
+                        >
+                          {captured.map((ann) => {
+                            const sw = ann.strokeWidth || 2.5;
+                            const op = ann.opacity ?? 1;
+                            if (ann.kind === 'highlight') {
+                              return (
+                                <rect
+                                  key={ann.id}
+                                  x={ann.x}
+                                  y={ann.y}
+                                  width={ann.width}
+                                  height={ann.height}
+                                  fill={ann.color}
+                                  fillOpacity={ann.opacity ?? 0.36}
+                                />
+                              );
+                            }
+                            if (ann.kind === 'whiteout') {
+                              return (
+                                <rect
+                                  key={ann.id}
+                                  x={ann.x}
+                                  y={ann.y}
+                                  width={ann.width}
+                                  height={ann.height}
+                                  fill={ann.fillColor || ann.color || '#FFFFFF'}
+                                />
+                              );
+                            }
+                            if (ann.kind === 'underline') {
+                              return (
+                                <line
+                                  key={ann.id}
+                                  x1={ann.x}
+                                  y1={ann.y + ann.height}
+                                  x2={ann.x + ann.width}
+                                  y2={ann.y + ann.height}
+                                  stroke={ann.color}
+                                  strokeWidth={sw}
+                                  strokeLinecap="round"
+                                  strokeOpacity={op}
+                                />
+                              );
+                            }
+                            if (ann.kind === 'strikethrough') {
+                              return (
+                                <line
+                                  key={ann.id}
+                                  x1={ann.x}
+                                  y1={ann.y + ann.height / 2}
+                                  x2={ann.x + ann.width}
+                                  y2={ann.y + ann.height / 2}
+                                  stroke={ann.color}
+                                  strokeWidth={sw}
+                                  strokeLinecap="round"
+                                  strokeOpacity={op}
+                                />
+                              );
+                            }
+                            if (ann.kind === 'rect') {
+                              return (
+                                <rect
+                                  key={ann.id}
+                                  x={ann.x}
+                                  y={ann.y}
+                                  width={ann.width}
+                                  height={ann.height}
+                                  fill={ann.fillColor || 'none'}
+                                  fillOpacity={ann.fillColor ? 0.18 : 0}
+                                  stroke={ann.color}
+                                  strokeWidth={sw}
+                                  strokeDasharray={ann.lineStyle === 'dashed' ? '6 4' : undefined}
+                                  strokeOpacity={op}
+                                />
+                              );
+                            }
+                            if (ann.kind === 'circle') {
+                              return (
+                                <ellipse
+                                  key={ann.id}
+                                  cx={ann.x + ann.width / 2}
+                                  cy={ann.y + ann.height / 2}
+                                  rx={Math.max(1, ann.width / 2)}
+                                  ry={Math.max(1, ann.height / 2)}
+                                  fill={ann.fillColor || 'none'}
+                                  fillOpacity={ann.fillColor ? 0.18 : 0}
+                                  stroke={ann.color}
+                                  strokeWidth={sw}
+                                  strokeDasharray={ann.lineStyle === 'dashed' ? '6 4' : undefined}
+                                  strokeOpacity={op}
+                                />
+                              );
+                            }
+                            if (ann.kind === 'arrow') {
+                              const sx = ann.x;
+                              const sy = ann.y;
+                              const ex = ann.x + ann.width;
+                              const ey = ann.y + ann.height;
+                              const ang = Math.atan2(ey - sy, ex - sx);
+                              const headLen = Math.max(9, sw * 3.4);
+                              const aStyle = ann.arrowStyle || 'single';
+                              const revAng = ang + Math.PI;
+                              return (
+                                <g key={ann.id} strokeOpacity={op}>
+                                  <line
+                                    x1={sx}
+                                    y1={sy}
+                                    x2={ex}
+                                    y2={ey}
+                                    stroke={ann.color}
+                                    strokeWidth={sw}
+                                    strokeDasharray={ann.lineStyle === 'dashed' ? '6 4' : undefined}
+                                    strokeLinecap="round"
+                                  />
+                                  {aStyle !== 'line' && (
+                                    <path
+                                      d={`M ${ex - headLen * Math.cos(ang - Math.PI / 6)} ${ey - headLen * Math.sin(ang - Math.PI / 6)} L ${ex} ${ey} L ${ex - headLen * Math.cos(ang + Math.PI / 6)} ${ey - headLen * Math.sin(ang + Math.PI / 6)}`}
+                                      fill="none"
+                                      stroke={ann.color}
+                                      strokeWidth={sw}
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                    />
+                                  )}
+                                  {aStyle === 'double' && (
+                                    <path
+                                      d={`M ${sx - headLen * Math.cos(revAng - Math.PI / 6)} ${sy - headLen * Math.sin(revAng - Math.PI / 6)} L ${sx} ${sy} L ${sx - headLen * Math.cos(revAng + Math.PI / 6)} ${sy - headLen * Math.sin(revAng + Math.PI / 6)}`}
+                                      fill="none"
+                                      stroke={ann.color}
+                                      strokeWidth={sw}
+                                      strokeLinecap="round"
+                                      strokeLinejoin="round"
+                                    />
+                                  )}
+                                </g>
+                              );
+                            }
+                            if (ann.kind === 'sticky') {
+                              const geo = computeStickyArrowGeometry(ann);
+                              if (!geo.hasArrow) return null;
+                              const accent = ann.color && ann.color !== '#FACC15' ? ann.color : '#D97706';
+                              const ang = Math.atan2(geo.tipY - geo.startY, geo.tipX - geo.startX);
+                              const headLen = Math.max(8, Math.min(13, (ann.strokeWidth || 2.2) * 3.8));
+                              return (
+                                <g key={`sarrow_${ann.id}`}>
+                                  <line
+                                    x1={geo.startX}
+                                    y1={geo.startY}
+                                    x2={geo.tipX}
+                                    y2={geo.tipY}
+                                    stroke={accent}
+                                    strokeWidth={ann.strokeWidth || 2.2}
+                                    strokeLinecap="round"
+                                  />
+                                  <path
+                                    d={`M ${geo.tipX - headLen * Math.cos(ang - Math.PI / 6)} ${geo.tipY - headLen * Math.sin(ang - Math.PI / 6)} L ${geo.tipX} ${geo.tipY} L ${geo.tipX - headLen * Math.cos(ang + Math.PI / 6)} ${geo.tipY - headLen * Math.sin(ang + Math.PI / 6)}`}
+                                    fill="none"
+                                    stroke={accent}
+                                    strokeWidth={ann.strokeWidth || 2.2}
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                </g>
+                              );
+                            }
+                            if (ann.kind === 'freehand' && ann.points && ann.points.length > 0) {
+                              return (
+                                <path
+                                  key={ann.id}
+                                  d={buildSmoothSvgPath(ann.points)}
+                                  fill="none"
+                                  stroke={ann.color}
+                                  strokeWidth={sw}
+                                  strokeOpacity={op}
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                />
+                              );
+                            }
+                            return null;
+                          })}
+                        </svg>
+                      );
+                    };
+
+                    behindPageItems.forEach((entry, idx) => {
+                      const cssZ = 10 + idx * 2;
+                      if (entry.kind === 'annotation') {
+                        const ann = entry.item;
+                        if (ann.kind === 'sticky' || ann.kind === 'stamp' || ann.kind === 'signature') {
+                          if (ann.kind === 'sticky') {
+                            if (svgBatch.length === 0) svgZ = cssZ;
+                            svgBatch.push(ann);
+                          }
+                          flushSvg(`pre_${entry.id}`);
+                          if (ann.kind === 'sticky') {
+                            const boxW = Math.max(84, ann.width || 165);
+                            const boxH = Math.max(44, ann.height || 76);
+                            nodes.push(
+                              <div
+                                key={`behind_${ann.id}`}
+                                style={{
+                                  left: ann.x * scale,
+                                  top: ann.y * scale,
+                                  width: boxW * scale,
+                                  height: boxH * scale,
+                                  backgroundColor: ann.fillColor || '#FEF3C7',
+                                  borderColor: ann.color && ann.color !== '#FACC15' ? ann.color : '#D97706',
+                                  fontSize: Math.max(7, Math.min(24, ann.fontSize || 10)) * scale,
+                                  zIndex: cssZ + 1,
+                                }}
+                                className="absolute p-2 rounded-lg border-2 text-slate-900 overflow-hidden leading-snug break-words whitespace-pre-wrap"
+                              >
+                                {ann.comment}
+                              </div>
+                            );
+                          } else if (ann.kind === 'stamp') {
+                            const isSolid = Boolean(ann.fillColor);
+                            nodes.push(
+                              <div
+                                key={`behind_${ann.id}`}
+                                style={{
+                                  left: ann.x * scale,
+                                  top: ann.y * scale,
+                                  minWidth: (ann.width || 96) * scale,
+                                  height: (ann.height || 28) * scale,
+                                  borderColor: ann.color,
+                                  backgroundColor: isSolid ? ann.fillColor : 'rgba(255,255,255,0.95)',
+                                  color: isSolid ? '#FFFFFF' : ann.color,
+                                  fontSize: Math.max(8, Math.min(26, ann.fontSize || 10)) * scale,
+                                  transform: ann.rotation ? `rotate(${ann.rotation}deg)` : undefined,
+                                  transformOrigin: 'center center',
+                                  zIndex: cssZ,
+                                }}
+                                className="absolute px-2.5 rounded border-2 font-extrabold tracking-wide flex items-center justify-center whitespace-nowrap"
+                              >
+                                {ann.comment || ann.dateStr || ''}
+                              </div>
+                            );
+                          } else {
+                            nodes.push(
+                              <div
+                                key={`behind_${ann.id}`}
+                                style={{
+                                  left: ann.x * scale,
+                                  top: ann.y * scale,
+                                  width: ann.width * scale,
+                                  transform: ann.rotation ? `rotate(${ann.rotation}deg)` : undefined,
+                                  transformOrigin: 'center center',
+                                  zIndex: cssZ,
+                                }}
+                                className="absolute"
+                              >
+                                <img
+                                  src={ann.signatureDataUrl}
+                                  alt="Signature"
+                                  style={{ width: ann.width * scale, height: ann.height * scale }}
+                                  className="object-contain"
+                                />
+                              </div>
+                            );
+                          }
+                        } else {
+                          if (svgBatch.length === 0) svgZ = cssZ;
+                          svgBatch.push(ann);
+                        }
+                        return;
+                      }
+
+                      flushSvg(`pre_${entry.id}`);
+                      if (entry.kind === 'textBox') {
+                        const tb = entry.item;
+                        const bgStyle =
+                          tb.backgroundColor && tb.backgroundColor !== 'transparent'
+                            ? tb.backgroundColor
+                            : 'transparent';
+                        nodes.push(
+                          <div
+                            key={`behind_${tb.id}`}
+                            style={{
+                              left: tb.x * scale,
+                              top: tb.y * scale,
+                              width: tb.width * scale,
+                              padding: `${2 * scale}px ${4 * scale}px`,
+                              lineHeight: 1.32,
+                              fontSize: tb.fontSize * scale,
+                              fontFamily: getFontCssStack(tb.fontFamily),
+                              color: tb.color,
+                              backgroundColor: bgStyle,
+                              borderColor: tb.borderColor || 'transparent',
+                              borderStyle: tb.borderColor ? 'solid' : 'none',
+                              borderWidth: tb.borderColor ? 1 : 0,
+                              transform: tb.rotation ? `rotate(${tb.rotation}deg)` : undefined,
+                              transformOrigin: 'center center',
+                              fontWeight: tb.bold ? 700 : 400,
+                              fontStyle: tb.italic ? 'italic' : 'normal',
+                              textDecoration: tb.underline ? 'underline' : 'none',
+                              textAlign: tb.align,
+                              letterSpacing: `${tb.letterSpacing * scale}px`,
+                              zIndex: cssZ,
+                            }}
+                            className="absolute rounded whitespace-pre-wrap"
+                          >
+                            {tb.text}
+                          </div>
+                        );
+                      } else {
+                        const im = entry.item;
+                        const radiusPx = Math.min(im.width, im.height) * ((im.borderRadius || 0) / 100) * scale;
+                        const filters: string[] = [];
+                        if ((im.brightness ?? 100) !== 100) filters.push(`brightness(${im.brightness}%)`);
+                        if ((im.contrast ?? 100) !== 100) filters.push(`contrast(${im.contrast}%)`);
+                        if (im.grayscale) filters.push('grayscale(100%)');
+                        nodes.push(
+                          <div
+                            key={`behind_${im.id}`}
+                            style={{
+                              left: im.x * scale,
+                              top: im.y * scale,
+                              width: im.width * scale,
+                              height: im.height * scale,
+                              zIndex: cssZ,
+                            }}
+                            className="absolute"
+                          >
+                            <div
+                              style={{
+                                opacity: im.opacity ?? 1,
+                                transform: `rotate(${im.rotation || 0}deg)`,
+                                borderRadius: `${radiusPx}px`,
+                                border:
+                                  im.borderWidth && im.borderWidth > 0
+                                    ? `${im.borderWidth * scale}px solid ${im.borderColor || '#142B4A'}`
+                                    : undefined,
+                                overflow: 'hidden',
+                              }}
+                              className="w-full h-full"
+                            >
+                              <img
+                                src={im.dataUrl}
+                                alt="Inserted"
+                                draggable={false}
+                                style={{
+                                  transform: `scale(${im.flipX ? -1 : 1}, ${im.flipY ? -1 : 1})`,
+                                  filter: filters.length > 0 ? filters.join(' ') : undefined,
+                                }}
+                                className="w-full h-full object-fill block"
+                              />
+                            </div>
+                          </div>
+                        );
+                      }
+                    });
+                    flushSvg('tail');
+                    return nodes;
+                  })()}
+                </div>
+              )}
+
+              <div className="absolute inset-0 rounded-md overflow-hidden pointer-events-none z-[5]">
+                <canvas
+                  ref={canvasRef}
+                  className={`block w-full h-full ${behindPageItems.length > 0 ? 'mix-blend-multiply' : ''}`}
+                />
               </div>
 
               {/* Interactive Vector & Text Overlay Layer */}
@@ -2394,6 +3529,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     isDragStrokeTool ||
                     activeTool === 'eraser' ||
                     eyedropperActive ||
+                    (activeTool === 'select' && multiSelectMode) ||
                     (activeTool === 'editText' && editBoxDrawMode)
                       ? 'none'
                       : 'pan-x pan-y',
@@ -2408,7 +3544,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       ? 'copy'
                       : 'default',
                 }}
-                className="absolute inset-0"
+                className="absolute inset-0 z-[10]"
               >
                 {/* Always render committed native text replacements across all tools */}
                 {pageReplacements.map((rep) => {
@@ -2483,457 +3619,760 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   />
                 )}
 
-                {/* Added text boxes */}
-                {pageAddedTexts.map((tb) => {
-                  const isSelected = selectedElement?.kind === 'textBox' && selectedElement.id === tb.id;
-                  const bgStyle =
-                    tb.backgroundColor && tb.backgroundColor !== 'transparent'
-                      ? tb.backgroundColor
-                      : 'rgba(255,255,255,0.12)';
-                  return (
-                    <div
-                      key={tb.id}
-                      onPointerDown={(e) => {
-                        if (lockExistingElements || eyedropperActive) return;
-                        e.stopPropagation();
-                        pointerMovedRef.current = false;
-                        preGestureSnapshotRef.current = stateRef.current;
-                        setSelectedElement({ kind: 'textBox', id: tb.id });
-                        tryCapturePointer(overlayRef.current, e.pointerId);
-                        setDraggingItem({
-                          kind: 'textBox',
-                          id: tb.id,
-                          startClientX: e.clientX,
-                          startClientY: e.clientY,
-                          origX: tb.x,
-                          origY: tb.y,
-                          wasSelectedBeforeDown: isSelected,
-                        });
-                      }}
-                      style={{
-                        left: tb.x * scale,
-                        top: tb.y * scale,
-                        width: tb.width * scale,
-                        padding: `${2 * scale}px ${4 * scale}px`,
-                        lineHeight: 1.32,
-                        fontSize: tb.fontSize * scale,
-                        fontFamily: getFontCssStack(tb.fontFamily),
-                        color: tb.color,
-                        backgroundColor: bgStyle,
-                        borderColor: isSelected ? '#2563EB' : tb.borderColor || 'rgba(37,99,235,0.55)',
-                        borderStyle: tb.borderColor || isSelected ? 'solid' : 'dashed',
-                        borderWidth: isSelected ? 2 : 1,
-                        transform: tb.rotation ? `rotate(${tb.rotation}deg)` : undefined,
-                        transformOrigin: 'center center',
-                        fontWeight: tb.bold ? 700 : 400,
-                        fontStyle: tb.italic ? 'italic' : 'normal',
-                        textDecoration: tb.underline ? 'underline' : 'none',
-                        textAlign: tb.align,
-                        letterSpacing: `${tb.letterSpacing * scale}px`,
-                        touchAction: 'none',
-                        pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
-                      }}
-                      title="Drag to move · Tap again to edit text"
-                      className={`group absolute rounded whitespace-pre-wrap cursor-move z-10 ${
-                        isSelected ? 'ring-2 ring-[#2563EB]/30 z-20' : ''
-                      }`}
-                    >
-                      {tb.text}
-                      {isSelected && !lockExistingElements && (
-                        <>
-                          <button
-                            type="button"
-                            style={{ touchAction: 'none' }}
-                            onPointerDown={(e) => e.stopPropagation()}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              openEditAddedTextBox(tb);
-                            }}
-                            aria-label="Edit text box"
-                            className="absolute -top-3 right-5 w-6 h-6 rounded-full bg-[#2563EB] text-white flex items-center justify-center shadow-md z-30"
-                          >
-                            <Pencil className="w-3 h-3" />
-                          </button>
-                          <button
-                            type="button"
-                            style={{ touchAction: 'none' }}
-                            onPointerDown={(e) => e.stopPropagation()}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              commitState((prev) => ({
-                                ...prev,
-                                addedTexts: prev.addedTexts.filter((x) => x.id !== tb.id),
-                              }));
-                              setSelectedElement(null);
-                            }}
-                            aria-label="Delete text box"
-                            className="absolute -top-3 -right-2.5 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md z-30"
-                          >
-                            <X className="w-3.5 h-3.5" />
-                          </button>
-                          <div
-                            style={{ touchAction: 'none' }}
-                            onPointerDown={(e) => {
-                              e.stopPropagation();
-                              pointerMovedRef.current = false;
-                              preGestureSnapshotRef.current = stateRef.current;
-                              setSelectedElement({ kind: 'textBox', id: tb.id });
-                              tryCapturePointer(overlayRef.current, e.pointerId);
-                              setResizingTextBox({
-                                id: tb.id,
-                                startClientX: e.clientX,
-                                origW: tb.width,
-                              });
-                            }}
-                            title="Drag to resize text box width"
-                            className="absolute top-1/2 -right-2 -translate-y-1/2 w-4 h-7 rounded-full bg-white border-2 border-[#2563EB] shadow cursor-ew-resize z-30"
-                          />
-                        </>
-                      )}
-                    </div>
-                  );
-                })}
-
-                {/* Added images */}
-                {pageAddedImages.map((im) => {
-                  const isSelected = selectedImageId === im.id;
-                  const radiusPx =
-                    Math.min(im.width, im.height) * ((im.borderRadius || 0) / 100) * scale;
-                  const filters: string[] = [];
-                  if ((im.brightness ?? 100) !== 100) filters.push(`brightness(${im.brightness}%)`);
-                  if ((im.contrast ?? 100) !== 100) filters.push(`contrast(${im.contrast}%)`);
-                  if (im.grayscale) filters.push('grayscale(100%)');
-                  const handleList: Array<{
-                    handle: 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
-                    cls: string;
-                  }> = [
-                    { handle: 'nw', cls: '-top-2.5 -left-2.5 w-5 h-5 rounded-full cursor-nwse-resize' },
-                    { handle: 'ne', cls: '-top-2.5 -right-2.5 w-5 h-5 rounded-full cursor-nesw-resize' },
-                    { handle: 'sw', cls: '-bottom-2.5 -left-2.5 w-5 h-5 rounded-full cursor-nesw-resize' },
-                    { handle: 'se', cls: '-bottom-2.5 -right-2.5 w-5 h-5 rounded-full cursor-nwse-resize' },
-                    { handle: 'n', cls: '-top-2 left-1/2 -translate-x-1/2 w-6 h-3.5 rounded-full cursor-ns-resize' },
-                    { handle: 's', cls: '-bottom-2 left-1/2 -translate-x-1/2 w-6 h-3.5 rounded-full cursor-ns-resize' },
-                    { handle: 'w', cls: 'top-1/2 -left-2 -translate-y-1/2 w-3.5 h-6 rounded-full cursor-ew-resize' },
-                    { handle: 'e', cls: 'top-1/2 -right-2 -translate-y-1/2 w-3.5 h-6 rounded-full cursor-ew-resize' },
-                  ];
-                  return (
-                    <div
-                      key={im.id}
-                      onPointerDown={(e) => {
-                        if (lockExistingElements || eyedropperActive) return;
-                        e.stopPropagation();
-                        pointerMovedRef.current = false;
-                        preGestureSnapshotRef.current = stateRef.current;
-                        setSelectedImageId(im.id);
-                        tryCapturePointer(overlayRef.current, e.pointerId);
-                        setDraggingItem({
-                          kind: 'image',
-                          id: im.id,
-                          startClientX: e.clientX,
-                          startClientY: e.clientY,
-                          origX: im.x,
-                          origY: im.y,
-                          wasSelectedBeforeDown: isSelected,
-                        });
-                      }}
-                      style={{
-                        left: im.x * scale,
-                        top: im.y * scale,
-                        width: im.width * scale,
-                        height: im.height * scale,
-                        touchAction: 'none',
-                        pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
-                      }}
-                      className={`group absolute cursor-move select-none z-10 ${
-                        isSelected ? 'ring-2 ring-[#2563EB] z-20' : 'hover:ring-1 hover:ring-[#2563EB]/60'
-                      }`}
-                    >
-                      <div
-                        style={{
-                          opacity: im.opacity ?? 1,
-                          transform: `rotate(${im.rotation || 0}deg)`,
-                          borderRadius: `${radiusPx}px`,
-                          border:
-                            im.borderWidth && im.borderWidth > 0
-                              ? `${im.borderWidth * scale}px solid ${im.borderColor || '#142B4A'}`
-                              : undefined,
-                          overflow: 'hidden',
-                        }}
-                        className="w-full h-full pointer-events-none"
-                      >
-                        <img
-                          src={im.dataUrl}
-                          alt="Inserted"
-                          draggable={false}
+                {/* Interactive hitboxes for BEHIND-PDF HTML items (text boxes, images, sticky, stamp, sig) */}
+                {!lockExistingElements &&
+                  activeTool !== 'pan' &&
+                  behindPageItems
+                    .filter(
+                      (u) =>
+                        u.kind !== 'annotation' ||
+                        u.item.kind === 'sticky' ||
+                        u.item.kind === 'stamp' ||
+                        u.item.kind === 'signature'
+                    )
+                    .map((entry) => {
+                      const isSel = isElementSelected(entry.kind, entry.id);
+                      const isSingleSel = selectedElement?.kind === entry.kind && selectedElement.id === entry.id;
+                      const b = getElementBounds(entry.kind, entry.item);
+                      const annSticky =
+                        entry.kind === 'annotation' && entry.item.kind === 'sticky' ? entry.item : null;
+                      return (
+                        <div
+                          key={`behind_hit_${entry.kind}_${entry.id}`}
+                          onPointerDown={(e) =>
+                            startElementPointerDown(e, entry.kind, entry.id, b.x, b.y, {
+                              origTipX: annSticky?.stickyTipX,
+                              origTipY: annSticky?.stickyTipY,
+                            })
+                          }
                           style={{
-                            transform: `scale(${im.flipX ? -1 : 1}, ${im.flipY ? -1 : 1})`,
-                            filter: filters.length > 0 ? filters.join(' ') : undefined,
+                            left: b.x * scale,
+                            top: b.y * scale,
+                            width: b.w * scale,
+                            height: b.h * scale,
+                            touchAction: 'none',
+                            pointerEvents: lockExistingElements || isPlacementTool || eyedropperActive ? 'none' : 'auto',
+                            zIndex: isSel ? 25 : 4,
                           }}
-                          className="w-full h-full object-fill pointer-events-none block"
-                        />
-                      </div>
-
-                      {isSelected && !lockExistingElements && (
-                        <>
-                          <button
-                            type="button"
-                            style={{ touchAction: 'none' }}
-                            onPointerDown={(e) => e.stopPropagation()}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              preGestureSnapshotRef.current = stateRef.current;
-                              setShowImageAdjustModal(true);
-                            }}
-                            aria-label="Adjust image"
-                            className="absolute -top-3 right-5 z-30 w-6 h-6 rounded-full bg-[#2563EB] text-white flex items-center justify-center shadow-md"
-                          >
-                            <SlidersHorizontal className="w-3 h-3" />
-                          </button>
-                          <button
-                            type="button"
-                            style={{ touchAction: 'none' }}
-                            onPointerDown={(e) => e.stopPropagation()}
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              commitState((prev) => ({
-                                ...prev,
-                                addedImages: prev.addedImages.filter((x) => x.id !== im.id),
-                              }));
-                              setSelectedImageId(null);
-                            }}
-                            aria-label="Delete image"
-                            className="absolute -top-3 -right-2.5 z-30 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md"
-                          >
-                            <X className="w-3.5 h-3.5" />
-                          </button>
-
-                          {handleList.map(({ handle, cls }) => (
-                            <div
-                              key={handle}
+                          title="Behind PDF content · Drag or tap to select"
+                          className={`absolute cursor-move rounded ${
+                            isSel
+                              ? 'ring-2 ring-dashed ring-[#2563EB] bg-[#2563EB]/10'
+                              : 'hover:ring-1 hover:ring-dashed hover:ring-[#2563EB]/55'
+                          }`}
+                        >
+                          {isSel && (
+                            <span className="pointer-events-none absolute -top-5 left-0 px-1.5 py-0.5 rounded bg-slate-900/90 text-white text-[9px] font-bold whitespace-nowrap shadow">
+                              {t.editor.layerBehindBadge}
+                            </span>
+                          )}
+                          {isSingleSel && (
+                            <button
+                              type="button"
                               style={{ touchAction: 'none' }}
-                              onPointerDown={(e) => {
+                              onPointerDown={(e) => e.stopPropagation()}
+                              onClick={(e) => {
                                 e.stopPropagation();
-                                pointerMovedRef.current = false;
-                                preGestureSnapshotRef.current = stateRef.current;
-                                setSelectedImageId(im.id);
-                                tryCapturePointer(overlayRef.current, e.pointerId);
-                                setResizingImage({
-                                  id: im.id,
-                                  handle,
-                                  lockAspect: im.lockAspect !== false,
-                                  startClientX: e.clientX,
-                                  startClientY: e.clientY,
-                                  origX: im.x,
-                                  origY: im.y,
-                                  origW: im.width,
-                                  origH: im.height,
-                                });
+                                batchDeleteSelected();
                               }}
-                              title="Drag to resize picture"
-                              className={`absolute ${cls} z-30 bg-white border-2 border-[#2563EB] shadow-md`}
-                            />
-                          ))}
-                        </>
-                      )}
-                    </div>
-                  );
-                })}
+                              aria-label="Delete behind item"
+                              className="absolute -top-3 -right-2.5 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md z-30"
+                            >
+                              <X className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                        </div>
+                      );
+                    })}
 
-                {/* Vector SVG layer (committed + live preview) */}
+                {/* Unified z-index interleaved rendering of ALL front overlay elements */}
+                {(() => {
+                  const nodes: React.ReactNode[] = [];
+                  let svgBatch: AnnotationOverlay[] = [];
+                  let svgZ = 100;
+
+                  const flushFrontSvg = (keySuffix: string | number) => {
+                    if (svgBatch.length === 0) return;
+                    const captured = svgBatch;
+                    const zVal = svgZ;
+                    svgBatch = [];
+                    nodes.push(
+                      <svg
+                        key={`front_svg_${keySuffix}`}
+                        style={{ zIndex: zVal }}
+                        className="pointer-events-none absolute inset-0 w-full h-full"
+                        viewBox={`0 0 ${pageSize.width} ${pageSize.height}`}
+                      >
+                        {captured.map((ann) => {
+                          const isSel = isElementSelected('annotation', ann.id);
+                          const sw = ann.strokeWidth || 2.5;
+                          const op = ann.opacity ?? 1;
+                          if (ann.kind === 'highlight') {
+                            return (
+                              <rect
+                                key={ann.id}
+                                x={ann.x}
+                                y={ann.y}
+                                width={ann.width}
+                                height={ann.height}
+                                fill={ann.color}
+                                fillOpacity={ann.opacity ?? 0.36}
+                                stroke={isSel ? '#2563EB' : undefined}
+                                strokeWidth={isSel ? 1.5 : undefined}
+                                strokeDasharray={isSel ? '4 2' : undefined}
+                              />
+                            );
+                          }
+                          if (ann.kind === 'whiteout') {
+                            return (
+                              <rect
+                                key={ann.id}
+                                x={ann.x}
+                                y={ann.y}
+                                width={ann.width}
+                                height={ann.height}
+                                fill={ann.fillColor || ann.color || '#FFFFFF'}
+                                stroke={isSel ? '#2563EB' : '#CBD5E1'}
+                                strokeWidth={isSel ? 1.5 : 0.5}
+                                strokeDasharray={isSel ? '4 2' : '2 2'}
+                              />
+                            );
+                          }
+                          if (ann.kind === 'underline') {
+                            return (
+                              <line
+                                key={ann.id}
+                                x1={ann.x}
+                                y1={ann.y + ann.height}
+                                x2={ann.x + ann.width}
+                                y2={ann.y + ann.height}
+                                stroke={ann.color}
+                                strokeWidth={sw + (isSel ? 1.5 : 0)}
+                                strokeLinecap="round"
+                                strokeOpacity={op}
+                              />
+                            );
+                          }
+                          if (ann.kind === 'strikethrough') {
+                            return (
+                              <line
+                                key={ann.id}
+                                x1={ann.x}
+                                y1={ann.y + ann.height / 2}
+                                x2={ann.x + ann.width}
+                                y2={ann.y + ann.height / 2}
+                                stroke={ann.color}
+                                strokeWidth={sw + (isSel ? 1.5 : 0)}
+                                strokeLinecap="round"
+                                strokeOpacity={op}
+                              />
+                            );
+                          }
+                          if (ann.kind === 'rect') {
+                            return (
+                              <rect
+                                key={ann.id}
+                                x={ann.x}
+                                y={ann.y}
+                                width={ann.width}
+                                height={ann.height}
+                                fill={ann.fillColor || 'none'}
+                                fillOpacity={ann.fillColor ? 0.18 : 0}
+                                stroke={ann.color}
+                                strokeWidth={sw + (isSel ? 1.5 : 0)}
+                                strokeDasharray={ann.lineStyle === 'dashed' ? '6 4' : undefined}
+                                strokeOpacity={op}
+                              />
+                            );
+                          }
+                          if (ann.kind === 'circle') {
+                            return (
+                              <ellipse
+                                key={ann.id}
+                                cx={ann.x + ann.width / 2}
+                                cy={ann.y + ann.height / 2}
+                                rx={Math.max(1, ann.width / 2)}
+                                ry={Math.max(1, ann.height / 2)}
+                                fill={ann.fillColor || 'none'}
+                                fillOpacity={ann.fillColor ? 0.18 : 0}
+                                stroke={ann.color}
+                                strokeWidth={sw + (isSel ? 1.5 : 0)}
+                                strokeDasharray={ann.lineStyle === 'dashed' ? '6 4' : undefined}
+                                strokeOpacity={op}
+                              />
+                            );
+                          }
+                          if (ann.kind === 'arrow') {
+                            const sx = ann.x;
+                            const sy = ann.y;
+                            const ex = ann.x + ann.width;
+                            const ey = ann.y + ann.height;
+                            const ang = Math.atan2(ey - sy, ex - sx);
+                            const headLen = Math.max(9, sw * 3.4);
+                            const aStyle = ann.arrowStyle || 'single';
+                            const revAng = ang + Math.PI;
+                            return (
+                              <g key={ann.id} strokeOpacity={op}>
+                                <line
+                                  x1={sx}
+                                  y1={sy}
+                                  x2={ex}
+                                  y2={ey}
+                                  stroke={ann.color}
+                                  strokeWidth={sw + (isSel ? 1.5 : 0)}
+                                  strokeDasharray={ann.lineStyle === 'dashed' ? '6 4' : undefined}
+                                  strokeLinecap="round"
+                                />
+                                {aStyle !== 'line' && (
+                                  <path
+                                    d={`M ${ex - headLen * Math.cos(ang - Math.PI / 6)} ${ey - headLen * Math.sin(ang - Math.PI / 6)} L ${ex} ${ey} L ${ex - headLen * Math.cos(ang + Math.PI / 6)} ${ey - headLen * Math.sin(ang + Math.PI / 6)}`}
+                                    fill="none"
+                                    stroke={ann.color}
+                                    strokeWidth={sw + (isSel ? 1.5 : 0)}
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                )}
+                                {aStyle === 'double' && (
+                                  <path
+                                    d={`M ${sx - headLen * Math.cos(revAng - Math.PI / 6)} ${sy - headLen * Math.sin(revAng - Math.PI / 6)} L ${sx} ${sy} L ${sx - headLen * Math.cos(revAng + Math.PI / 6)} ${sy - headLen * Math.sin(revAng + Math.PI / 6)}`}
+                                    fill="none"
+                                    stroke={ann.color}
+                                    strokeWidth={sw + (isSel ? 1.5 : 0)}
+                                    strokeLinecap="round"
+                                    strokeLinejoin="round"
+                                  />
+                                )}
+                              </g>
+                            );
+                          }
+                          if (ann.kind === 'sticky') {
+                            const geo = computeStickyArrowGeometry(ann);
+                            if (!geo.hasArrow) return null;
+                            const accent = ann.color && ann.color !== '#FACC15' ? ann.color : '#D97706';
+                            const ang = Math.atan2(geo.tipY - geo.startY, geo.tipX - geo.startX);
+                            const headLen = Math.max(8, Math.min(13, (ann.strokeWidth || 2.2) * 3.8));
+                            return (
+                              <g key={`sarrow_${ann.id}`}>
+                                <line
+                                  x1={geo.startX}
+                                  y1={geo.startY}
+                                  x2={geo.tipX}
+                                  y2={geo.tipY}
+                                  stroke={accent}
+                                  strokeWidth={ann.strokeWidth || 2.2}
+                                  strokeLinecap="round"
+                                />
+                                <path
+                                  d={`M ${geo.tipX - headLen * Math.cos(ang - Math.PI / 6)} ${geo.tipY - headLen * Math.sin(ang - Math.PI / 6)} L ${geo.tipX} ${geo.tipY} L ${geo.tipX - headLen * Math.cos(ang + Math.PI / 6)} ${geo.tipY - headLen * Math.sin(ang + Math.PI / 6)}`}
+                                  fill="none"
+                                  stroke={accent}
+                                  strokeWidth={ann.strokeWidth || 2.2}
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                />
+                              </g>
+                            );
+                          }
+                          if (ann.kind === 'freehand' && ann.points && ann.points.length > 0) {
+                            return (
+                              <path
+                                key={ann.id}
+                                d={buildSmoothSvgPath(ann.points)}
+                                fill="none"
+                                stroke={ann.color}
+                                strokeWidth={sw + (isSel ? 1.5 : 0)}
+                                strokeOpacity={op}
+                                strokeLinecap="round"
+                                strokeLinejoin="round"
+                              />
+                            );
+                          }
+                          return null;
+                        })}
+                      </svg>
+                    );
+                  };
+
+                  frontPageItems.forEach((entry, idx) => {
+                    const cssZ = 100 + idx * 4;
+                    if (entry.kind === 'textBox') {
+                      flushFrontSvg(`pre_${entry.id}`);
+                      const tb = entry.item;
+                      const isSel = isElementSelected('textBox', tb.id);
+                      const isSingleSel = selectedElement?.kind === 'textBox' && selectedElement.id === tb.id;
+                      const bgStyle =
+                        tb.backgroundColor && tb.backgroundColor !== 'transparent'
+                          ? tb.backgroundColor
+                          : 'rgba(255,255,255,0.12)';
+                      nodes.push(
+                        <div
+                          key={tb.id}
+                          onPointerDown={(e) => startElementPointerDown(e, 'textBox', tb.id, tb.x, tb.y)}
+                          style={{
+                            left: tb.x * scale,
+                            top: tb.y * scale,
+                            width: tb.width * scale,
+                            padding: `${2 * scale}px ${4 * scale}px`,
+                            lineHeight: 1.32,
+                            fontSize: tb.fontSize * scale,
+                            fontFamily: getFontCssStack(tb.fontFamily),
+                            color: tb.color,
+                            backgroundColor: bgStyle,
+                            borderColor: isSel ? '#2563EB' : tb.borderColor || 'rgba(37,99,235,0.55)',
+                            borderStyle: tb.borderColor || isSel ? 'solid' : 'dashed',
+                            borderWidth: isSel ? 2 : 1,
+                            transform: tb.rotation ? `rotate(${tb.rotation}deg)` : undefined,
+                            transformOrigin: 'center center',
+                            fontWeight: tb.bold ? 700 : 400,
+                            fontStyle: tb.italic ? 'italic' : 'normal',
+                            textDecoration: tb.underline ? 'underline' : 'none',
+                            textAlign: tb.align,
+                            letterSpacing: `${tb.letterSpacing * scale}px`,
+                            touchAction: 'none',
+                            pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
+                            zIndex: cssZ,
+                          }}
+                          title="Drag to move · Tap again to edit text"
+                          className={`group absolute rounded whitespace-pre-wrap cursor-move ${
+                            isSel ? 'ring-2 ring-[#2563EB]/30' : ''
+                          }`}
+                        >
+                          {tb.text}
+                          {isSingleSel && !lockExistingElements && (
+                            <>
+                              <button
+                                type="button"
+                                style={{ touchAction: 'none' }}
+                                onPointerDown={(e) => e.stopPropagation()}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openEditAddedTextBox(tb);
+                                }}
+                                aria-label="Edit text box"
+                                className="absolute -top-3 right-5 w-6 h-6 rounded-full bg-[#2563EB] text-white flex items-center justify-center shadow-md z-30"
+                              >
+                                <Pencil className="w-3 h-3" />
+                              </button>
+                              <button
+                                type="button"
+                                style={{ touchAction: 'none' }}
+                                onPointerDown={(e) => e.stopPropagation()}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  commitState((prev) => ({
+                                    ...prev,
+                                    addedTexts: prev.addedTexts.filter((x) => x.id !== tb.id),
+                                  }));
+                                  setSelectedElements([]);
+                                }}
+                                aria-label="Delete text box"
+                                className="absolute -top-3 -right-2.5 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md z-30"
+                              >
+                                <X className="w-3.5 h-3.5" />
+                              </button>
+                              <div
+                                style={{ touchAction: 'none' }}
+                                onPointerDown={(e) => {
+                                  e.stopPropagation();
+                                  pointerMovedRef.current = false;
+                                  capturePreGestureSnapshot();
+                                  setSelectedElement({ kind: 'textBox', id: tb.id });
+                                  tryCapturePointer(overlayRef.current, e.pointerId);
+                                  setResizingTextBox({
+                                    id: tb.id,
+                                    startClientX: e.clientX,
+                                    origW: tb.width,
+                                  });
+                                }}
+                                title="Drag to resize text box width"
+                                className="absolute top-1/2 -right-2 -translate-y-1/2 w-4 h-7 rounded-full bg-white border-2 border-[#2563EB] shadow cursor-ew-resize z-30"
+                              />
+                            </>
+                          )}
+                        </div>
+                      );
+                      return;
+                    }
+
+                    if (entry.kind === 'image') {
+                      flushFrontSvg(`pre_${entry.id}`);
+                      const im = entry.item;
+                      const isSel = isElementSelected('image', im.id);
+                      const isSingleSel = selectedImageId === im.id;
+                      const radiusPx =
+                        Math.min(im.width, im.height) * ((im.borderRadius || 0) / 100) * scale;
+                      const filters: string[] = [];
+                      if ((im.brightness ?? 100) !== 100) filters.push(`brightness(${im.brightness}%)`);
+                      if ((im.contrast ?? 100) !== 100) filters.push(`contrast(${im.contrast}%)`);
+                      if (im.grayscale) filters.push('grayscale(100%)');
+                      const handleList: Array<{
+                        handle: 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+                        cls: string;
+                      }> = [
+                        { handle: 'nw', cls: '-top-2.5 -left-2.5 w-5 h-5 rounded-full cursor-nwse-resize' },
+                        { handle: 'ne', cls: '-top-2.5 -right-2.5 w-5 h-5 rounded-full cursor-nesw-resize' },
+                        { handle: 'sw', cls: '-bottom-2.5 -left-2.5 w-5 h-5 rounded-full cursor-nesw-resize' },
+                        { handle: 'se', cls: '-bottom-2.5 -right-2.5 w-5 h-5 rounded-full cursor-nwse-resize' },
+                        { handle: 'n', cls: '-top-2 left-1/2 -translate-x-1/2 w-6 h-3.5 rounded-full cursor-ns-resize' },
+                        { handle: 's', cls: '-bottom-2 left-1/2 -translate-x-1/2 w-6 h-3.5 rounded-full cursor-ns-resize' },
+                        { handle: 'w', cls: 'top-1/2 -left-2 -translate-y-1/2 w-3.5 h-6 rounded-full cursor-ew-resize' },
+                        { handle: 'e', cls: 'top-1/2 -right-2 -translate-y-1/2 w-3.5 h-6 rounded-full cursor-ew-resize' },
+                      ];
+                      nodes.push(
+                        <div
+                          key={im.id}
+                          onPointerDown={(e) => startElementPointerDown(e, 'image', im.id, im.x, im.y)}
+                          style={{
+                            left: im.x * scale,
+                            top: im.y * scale,
+                            width: im.width * scale,
+                            height: im.height * scale,
+                            touchAction: 'none',
+                            pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
+                            zIndex: cssZ,
+                          }}
+                          className={`group absolute cursor-move select-none ${
+                            isSel ? 'ring-2 ring-[#2563EB]' : 'hover:ring-1 hover:ring-[#2563EB]/60'
+                          }`}
+                        >
+                          <div
+                            style={{
+                              opacity: im.opacity ?? 1,
+                              transform: `rotate(${im.rotation || 0}deg)`,
+                              borderRadius: `${radiusPx}px`,
+                              border:
+                                im.borderWidth && im.borderWidth > 0
+                                  ? `${im.borderWidth * scale}px solid ${im.borderColor || '#142B4A'}`
+                                  : undefined,
+                              overflow: 'hidden',
+                            }}
+                            className="w-full h-full pointer-events-none"
+                          >
+                            <img
+                              src={im.dataUrl}
+                              alt="Inserted"
+                              draggable={false}
+                              style={{
+                                transform: `scale(${im.flipX ? -1 : 1}, ${im.flipY ? -1 : 1})`,
+                                filter: filters.length > 0 ? filters.join(' ') : undefined,
+                              }}
+                              className="w-full h-full object-fill pointer-events-none block"
+                            />
+                          </div>
+
+                          {isSingleSel && !lockExistingElements && (
+                            <>
+                              <button
+                                type="button"
+                                style={{ touchAction: 'none' }}
+                                onPointerDown={(e) => e.stopPropagation()}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  capturePreGestureSnapshot();
+                                  setShowImageAdjustModal(true);
+                                }}
+                                aria-label="Adjust image"
+                                className="absolute -top-3 right-5 z-30 w-6 h-6 rounded-full bg-[#2563EB] text-white flex items-center justify-center shadow-md"
+                              >
+                                <SlidersHorizontal className="w-3 h-3" />
+                              </button>
+                              <button
+                                type="button"
+                                style={{ touchAction: 'none' }}
+                                onPointerDown={(e) => e.stopPropagation()}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  commitState((prev) => ({
+                                    ...prev,
+                                    addedImages: prev.addedImages.filter((x) => x.id !== im.id),
+                                  }));
+                                  setSelectedElements([]);
+                                }}
+                                aria-label="Delete image"
+                                className="absolute -top-3 -right-2.5 z-30 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md"
+                              >
+                                <X className="w-3.5 h-3.5" />
+                              </button>
+
+                              {handleList.map(({ handle, cls }) => (
+                                <div
+                                  key={handle}
+                                  style={{ touchAction: 'none' }}
+                                  onPointerDown={(e) => {
+                                    e.stopPropagation();
+                                    pointerMovedRef.current = false;
+                                    capturePreGestureSnapshot();
+                                    setSelectedImageId(im.id);
+                                    tryCapturePointer(overlayRef.current, e.pointerId);
+                                    setResizingImage({
+                                      id: im.id,
+                                      handle,
+                                      lockAspect: im.lockAspect !== false,
+                                      startClientX: e.clientX,
+                                      startClientY: e.clientY,
+                                      origX: im.x,
+                                      origY: im.y,
+                                      origW: im.width,
+                                      origH: im.height,
+                                    });
+                                  }}
+                                  title="Drag to resize picture"
+                                  className={`absolute ${cls} z-30 bg-white border-2 border-[#2563EB] shadow-md`}
+                                />
+                              ))}
+                            </>
+                          )}
+                        </div>
+                      );
+                      return;
+                    }
+
+                    const ann = entry.item;
+                    if (ann.kind === 'sticky' || ann.kind === 'stamp' || ann.kind === 'signature') {
+                      if (ann.kind === 'sticky') {
+                        if (svgBatch.length === 0) svgZ = cssZ;
+                        svgBatch.push(ann);
+                      }
+                      flushFrontSvg(`pre_${entry.id}`);
+                      const isSel = isElementSelected('annotation', ann.id);
+                      const isSingleSel = selectedElement?.kind === 'annotation' && selectedElement.id === ann.id;
+                      const startDrag = (e: React.PointerEvent) =>
+                        startElementPointerDown(e, 'annotation', ann.id, ann.x, ann.y, {
+                          origTipX: ann.stickyTipX,
+                          origTipY: ann.stickyTipY,
+                        });
+                      const removeBtn = isSingleSel && !lockExistingElements && (
+                        <button
+                          type="button"
+                          style={{ touchAction: 'none' }}
+                          onPointerDown={(e) => e.stopPropagation()}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            commitState((prev) => ({
+                              ...prev,
+                              annotations: prev.annotations.filter((x) => x.id !== ann.id),
+                            }));
+                            setSelectedElements([]);
+                          }}
+                          aria-label="Delete annotation"
+                          className="absolute -top-3 -right-3 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md z-30"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      );
+
+                      if (ann.kind === 'sticky') {
+                        const boxW = Math.max(84, ann.width || 165);
+                        const boxH = Math.max(44, ann.height || 76);
+                        const noteBg = ann.fillColor || '#FEF3C7';
+                        const noteAccent = ann.color && ann.color !== '#FACC15' ? ann.color : '#D97706';
+                        const fontSize = Math.max(7, Math.min(24, ann.fontSize || 10));
+                        const geo = computeStickyArrowGeometry(ann);
+                        nodes.push(
+                          <React.Fragment key={ann.id}>
+                            <div
+                              onPointerDown={startDrag}
+                              style={{
+                                left: ann.x * scale,
+                                top: ann.y * scale,
+                                width: boxW * scale,
+                                height: boxH * scale,
+                                backgroundColor: noteBg,
+                                borderColor: isSel ? '#2563EB' : noteAccent,
+                                fontSize: fontSize * scale,
+                                touchAction: 'none',
+                                pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
+                                zIndex: cssZ + 1,
+                              }}
+                              title="Drag to move · Tap again to edit note · Pull corners to resize"
+                              className={`absolute p-2 rounded-lg border-2 text-slate-900 shadow-md cursor-move overflow-visible ${
+                                isSel ? 'ring-2 ring-[#2563EB]/30' : ''
+                              }`}
+                            >
+                              <div className="w-full h-full overflow-hidden leading-snug break-words whitespace-pre-wrap">
+                                {ann.comment}
+                              </div>
+                              {isSingleSel &&
+                                !lockExistingElements &&
+                                (['nw', 'ne', 'sw', 'se'] as const).map((corner) => {
+                                  const posClass =
+                                    corner === 'nw'
+                                      ? '-top-2.5 -left-2.5 cursor-nwse-resize'
+                                      : corner === 'ne'
+                                      ? '-top-2.5 -right-2.5 cursor-nesw-resize'
+                                      : corner === 'sw'
+                                      ? '-bottom-2.5 -left-2.5 cursor-nesw-resize'
+                                      : '-bottom-2.5 -right-2.5 cursor-nwse-resize';
+                                  return (
+                                    <div
+                                      key={corner}
+                                      style={{ touchAction: 'none' }}
+                                      onPointerDown={(e) => {
+                                        e.stopPropagation();
+                                        pointerMovedRef.current = false;
+                                        capturePreGestureSnapshot();
+                                        tryCapturePointer(overlayRef.current, e.pointerId);
+                                        setResizingAnnotation({
+                                          id: ann.id,
+                                          handle: corner,
+                                          startClientX: e.clientX,
+                                          startClientY: e.clientY,
+                                          origX: ann.x,
+                                          origY: ann.y,
+                                          origW: boxW,
+                                          origH: boxH,
+                                        });
+                                      }}
+                                      title="Drag corner to resize sticky note"
+                                      className={`absolute ${posClass} w-5 h-5 rounded-full bg-white border-2 border-[#2563EB] shadow-md z-30`}
+                                    />
+                                  );
+                                })}
+                              {removeBtn}
+                            </div>
+
+                            {isSingleSel && !lockExistingElements && geo.hasArrow && (
+                              <div
+                                style={{
+                                  touchAction: 'none',
+                                  left: geo.tipX * scale - 16,
+                                  top: geo.tipY * scale - 16,
+                                  zIndex: cssZ + 2,
+                                }}
+                                onPointerDown={(e) => {
+                                  e.stopPropagation();
+                                  pointerMovedRef.current = false;
+                                  capturePreGestureSnapshot();
+                                  tryCapturePointer(overlayRef.current, e.pointerId);
+                                  setDraggingStickyTip({ id: ann.id });
+                                }}
+                                title={t.editor.dragTipHint}
+                                className="absolute w-8 h-8 cursor-crosshair flex items-center justify-center"
+                              >
+                                <span
+                                  style={{ borderColor: noteAccent }}
+                                  className="w-5 h-5 rounded-full bg-white border-[2.5px] shadow-lg flex items-center justify-center"
+                                >
+                                  <span
+                                    className="w-2 h-2 rounded-full"
+                                    style={{ backgroundColor: noteAccent }}
+                                  />
+                                </span>
+                                {draggingStickyTip?.id === ann.id && (
+                                  <span className="pointer-events-none absolute -top-6 left-1/2 -translate-x-1/2 px-1.5 py-0.5 rounded bg-slate-900/90 text-white font-mono-nums text-[9px] whitespace-nowrap shadow">
+                                    {geo.angleDeg}° · {Math.round(geo.length)}pt
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                          </React.Fragment>
+                        );
+                      } else if (ann.kind === 'stamp') {
+                        const label = ann.comment || ann.dateStr || '';
+                        const stampFont = Math.max(8, Math.min(26, ann.fontSize || 10));
+                        const isSolid = Boolean(ann.fillColor);
+                        nodes.push(
+                          <div
+                            key={ann.id}
+                            onPointerDown={startDrag}
+                            style={{
+                              left: ann.x * scale,
+                              top: ann.y * scale,
+                              minWidth: (ann.width || 96) * scale,
+                              height: (ann.height || 28) * scale,
+                              borderColor: ann.color,
+                              backgroundColor: isSolid ? ann.fillColor : 'rgba(255,255,255,0.95)',
+                              color: isSolid ? '#FFFFFF' : ann.color,
+                              fontSize: stampFont * scale,
+                              transform: ann.rotation ? `rotate(${ann.rotation}deg)` : undefined,
+                              transformOrigin: 'center center',
+                              touchAction: 'none',
+                              pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
+                              zIndex: cssZ,
+                            }}
+                            className={`absolute px-2.5 rounded border-2 font-extrabold tracking-wide flex items-center justify-center cursor-move whitespace-nowrap ${
+                              isSel ? 'ring-2 ring-[#2563EB]' : ''
+                            }`}
+                          >
+                            {label}
+                            {removeBtn}
+                          </div>
+                        );
+                      } else {
+                        nodes.push(
+                          <div
+                            key={ann.id}
+                            onPointerDown={startDrag}
+                            style={{
+                              left: ann.x * scale,
+                              top: ann.y * scale,
+                              width: ann.width * scale,
+                              transform: ann.rotation ? `rotate(${ann.rotation}deg)` : undefined,
+                              transformOrigin: 'center center',
+                              touchAction: 'none',
+                              pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
+                              zIndex: cssZ,
+                            }}
+                            className={`absolute cursor-move ${
+                              isSel ? 'ring-2 ring-[#2563EB] rounded' : ''
+                            }`}
+                          >
+                            <img
+                              src={ann.signatureDataUrl}
+                              alt="Signature"
+                              style={{ width: ann.width * scale, height: ann.height * scale }}
+                              className="object-contain pointer-events-none"
+                            />
+                            {(ann.signerName || ann.dateStr) && (
+                              <p className="text-[8px] text-slate-600 truncate">
+                                {ann.signerName} {ann.dateStr ? `· ${ann.dateStr}` : ''}
+                              </p>
+                            )}
+                            {isSingleSel && !lockExistingElements && (
+                              <div
+                                style={{ touchAction: 'none' }}
+                                onPointerDown={(e) => {
+                                  e.stopPropagation();
+                                  pointerMovedRef.current = false;
+                                  capturePreGestureSnapshot();
+                                  tryCapturePointer(overlayRef.current, e.pointerId);
+                                  setResizingAnnotation({
+                                    id: ann.id,
+                                    handle: 'se',
+                                    startClientX: e.clientX,
+                                    startClientY: e.clientY,
+                                    origX: ann.x,
+                                    origY: ann.y,
+                                    origW: ann.width,
+                                    origH: ann.height,
+                                  });
+                                }}
+                                title="Drag to resize signature"
+                                className="absolute -bottom-2.5 -right-2.5 w-5 h-5 rounded-full bg-white border-2 border-[#2563EB] shadow-md cursor-nwse-resize z-30"
+                              />
+                            )}
+                            {removeBtn}
+                          </div>
+                        );
+                      }
+                      return;
+                    }
+
+                    if (svgBatch.length === 0) svgZ = cssZ;
+                    svgBatch.push(ann);
+                  });
+
+                  flushFrontSvg('tail');
+                  return nodes;
+                })()}
+
+                {/* Live drawing, snap guides, eraser cursor & marquee box SVG layer */}
                 <svg
+                  style={{ zIndex: 5000 }}
                   className="pointer-events-none absolute inset-0 w-full h-full"
                   viewBox={`0 0 ${pageSize.width} ${pageSize.height}`}
                 >
-                  {pageAnnotations.map((ann) => {
-                    const isSel = selectedElement?.kind === 'annotation' && selectedElement.id === ann.id;
-                    const sw = ann.strokeWidth || 2.5;
-                    const op = ann.opacity ?? 1;
-
-                    if (ann.kind === 'highlight') {
-                      return (
-                        <rect
-                          key={ann.id}
-                          x={ann.x}
-                          y={ann.y}
-                          width={ann.width}
-                          height={ann.height}
-                          fill={ann.color}
-                          fillOpacity={ann.opacity ?? 0.36}
-                          stroke={isSel ? '#2563EB' : undefined}
-                          strokeWidth={isSel ? 1.5 : undefined}
-                          strokeDasharray={isSel ? '4 2' : undefined}
-                        />
-                      );
-                    }
-                    if (ann.kind === 'whiteout') {
-                      return (
-                        <rect
-                          key={ann.id}
-                          x={ann.x}
-                          y={ann.y}
-                          width={ann.width}
-                          height={ann.height}
-                          fill={ann.fillColor || ann.color || '#FFFFFF'}
-                          stroke={isSel ? '#2563EB' : '#CBD5E1'}
-                          strokeWidth={isSel ? 1.5 : 0.5}
-                          strokeDasharray={isSel ? '4 2' : '2 2'}
-                        />
-                      );
-                    }
-                    if (ann.kind === 'underline') {
-                      return (
-                        <line
-                          key={ann.id}
-                          x1={ann.x}
-                          y1={ann.y + ann.height}
-                          x2={ann.x + ann.width}
-                          y2={ann.y + ann.height}
-                          stroke={ann.color}
-                          strokeWidth={sw + (isSel ? 1.5 : 0)}
-                          strokeLinecap="round"
-                          strokeOpacity={op}
-                        />
-                      );
-                    }
-                    if (ann.kind === 'strikethrough') {
-                      return (
-                        <line
-                          key={ann.id}
-                          x1={ann.x}
-                          y1={ann.y + ann.height / 2}
-                          x2={ann.x + ann.width}
-                          y2={ann.y + ann.height / 2}
-                          stroke={ann.color}
-                          strokeWidth={sw + (isSel ? 1.5 : 0)}
-                          strokeLinecap="round"
-                          strokeOpacity={op}
-                        />
-                      );
-                    }
-                    if (ann.kind === 'rect') {
-                      return (
-                        <rect
-                          key={ann.id}
-                          x={ann.x}
-                          y={ann.y}
-                          width={ann.width}
-                          height={ann.height}
-                          fill={ann.fillColor || 'none'}
-                          fillOpacity={ann.fillColor ? 0.18 : 0}
-                          stroke={ann.color}
-                          strokeWidth={sw + (isSel ? 1.5 : 0)}
-                          strokeDasharray={ann.lineStyle === 'dashed' ? '6 4' : undefined}
-                          strokeOpacity={op}
-                        />
-                      );
-                    }
-                    if (ann.kind === 'circle') {
-                      return (
-                        <ellipse
-                          key={ann.id}
-                          cx={ann.x + ann.width / 2}
-                          cy={ann.y + ann.height / 2}
-                          rx={Math.max(1, ann.width / 2)}
-                          ry={Math.max(1, ann.height / 2)}
-                          fill={ann.fillColor || 'none'}
-                          fillOpacity={ann.fillColor ? 0.18 : 0}
-                          stroke={ann.color}
-                          strokeWidth={sw + (isSel ? 1.5 : 0)}
-                          strokeDasharray={ann.lineStyle === 'dashed' ? '6 4' : undefined}
-                          strokeOpacity={op}
-                        />
-                      );
-                    }
-                    if (ann.kind === 'arrow') {
-                      const sx = ann.x;
-                      const sy = ann.y;
-                      const ex = ann.x + ann.width;
-                      const ey = ann.y + ann.height;
-                      const ang = Math.atan2(ey - sy, ex - sx);
-                      const headLen = Math.max(9, sw * 3.4);
-                      const aStyle = ann.arrowStyle || 'single';
-                      const revAng = ang + Math.PI;
-                      return (
-                        <g key={ann.id} strokeOpacity={op}>
-                          <line
-                            x1={sx}
-                            y1={sy}
-                            x2={ex}
-                            y2={ey}
-                            stroke={ann.color}
-                            strokeWidth={sw + (isSel ? 1.5 : 0)}
-                            strokeDasharray={ann.lineStyle === 'dashed' ? '6 4' : undefined}
-                            strokeLinecap="round"
-                          />
-                          {aStyle !== 'line' && (
-                            <path
-                              d={`M ${ex - headLen * Math.cos(ang - Math.PI / 6)} ${ey - headLen * Math.sin(ang - Math.PI / 6)} L ${ex} ${ey} L ${ex - headLen * Math.cos(ang + Math.PI / 6)} ${ey - headLen * Math.sin(ang + Math.PI / 6)}`}
-                              fill="none"
-                              stroke={ann.color}
-                              strokeWidth={sw + (isSel ? 1.5 : 0)}
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                            />
-                          )}
-                          {aStyle === 'double' && (
-                            <path
-                              d={`M ${sx - headLen * Math.cos(revAng - Math.PI / 6)} ${sy - headLen * Math.sin(revAng - Math.PI / 6)} L ${sx} ${sy} L ${sx - headLen * Math.cos(revAng + Math.PI / 6)} ${sy - headLen * Math.sin(revAng + Math.PI / 6)}`}
-                              fill="none"
-                              stroke={ann.color}
-                              strokeWidth={sw + (isSel ? 1.5 : 0)}
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                            />
-                          )}
-                        </g>
-                      );
-                    }
-                    if (ann.kind === 'sticky') {
-                      const geo = computeStickyArrowGeometry(ann);
-                      if (!geo.hasArrow) return null;
-                      const accent = ann.color && ann.color !== '#FACC15' ? ann.color : '#D97706';
-                      const ang = Math.atan2(geo.tipY - geo.startY, geo.tipX - geo.startX);
-                      const headLen = Math.max(8, Math.min(13, (ann.strokeWidth || 2.2) * 3.8));
-                      return (
-                        <g key={`sarrow_${ann.id}`}>
-                          <line
-                            x1={geo.startX}
-                            y1={geo.startY}
-                            x2={geo.tipX}
-                            y2={geo.tipY}
-                            stroke={accent}
-                            strokeWidth={ann.strokeWidth || 2.2}
-                            strokeLinecap="round"
-                          />
-                          <path
-                            d={`M ${geo.tipX - headLen * Math.cos(ang - Math.PI / 6)} ${geo.tipY - headLen * Math.sin(ang - Math.PI / 6)} L ${geo.tipX} ${geo.tipY} L ${geo.tipX - headLen * Math.cos(ang + Math.PI / 6)} ${geo.tipY - headLen * Math.sin(ang + Math.PI / 6)}`}
-                            fill="none"
-                            stroke={accent}
-                            strokeWidth={ann.strokeWidth || 2.2}
-                            strokeLinecap="round"
-                            strokeLinejoin="round"
-                          />
-                        </g>
-                      );
-                    }
-                    if (ann.kind === 'freehand' && ann.points && ann.points.length > 0) {
-                      return (
-                        <path
-                          key={ann.id}
-                          d={buildSmoothSvgPath(ann.points)}
-                          fill="none"
-                          stroke={ann.color}
-                          strokeWidth={sw + (isSel ? 1.5 : 0)}
-                          strokeOpacity={op}
-                          strokeLinecap="round"
-                          strokeLinejoin="round"
-                        />
-                      );
-                    }
-                    return null;
-                  })}
-
-                  {/* Live smooth freehand stroke */}
                   {liveFreehand.length >= 1 && (
                     <path
                       d={buildSmoothSvgPath(liveFreehand)}
@@ -2946,7 +4385,6 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     />
                   )}
 
-                  {/* Accurate live preview for every drag tool */}
                   {liveBox && activeTool === 'arrow' && (
                     <g>
                       <line
@@ -3087,7 +4525,19 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     />
                   )}
 
-                  {/* Eraser cursor circle */}
+                  {marqueeBox && (
+                    <rect
+                      x={marqueeBox.x}
+                      y={marqueeBox.y}
+                      width={marqueeBox.w}
+                      height={marqueeBox.h}
+                      fill="rgba(37,99,235,0.12)"
+                      stroke="#2563EB"
+                      strokeWidth={1.4}
+                      strokeDasharray="4 3"
+                    />
+                  )}
+
                   {activeTool === 'eraser' && eraserCursor && (
                     <circle
                       cx={eraserCursor.x}
@@ -3100,7 +4550,6 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     />
                   )}
 
-                  {/* Magnetic Alignment Snap Guides */}
                   {snapGuides?.x !== undefined && (
                     <line
                       x1={snapGuides.x}
@@ -3129,10 +4578,11 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 {(liveBox && activeTool === 'arrow' && Math.hypot(liveBox.w, liveBox.h) > 6) && (
                   <div
                     style={{
-                      left: Math.min(pageSize.width - 95, Math.max(8, (liveBox.x + liveBox.w))) * scale,
+                      left: Math.min(pageSize.width - 95, Math.max(8, liveBox.x + liveBox.w)) * scale,
                       top: Math.max(6, (liveBox.y + liveBox.h) * scale - 28),
+                      zIndex: 5010,
                     }}
-                    className="pointer-events-none absolute z-30 px-2 py-0.5 rounded-full bg-slate-900/90 text-white font-mono-nums text-[10px] shadow"
+                    className="pointer-events-none absolute px-2 py-0.5 rounded-full bg-slate-900/90 text-white font-mono-nums text-[10px] shadow"
                   >
                     {Math.round((Math.atan2(liveBox.h, liveBox.w) * 180) / Math.PI)}° · {Math.round(Math.hypot(liveBox.w, liveBox.h))}pt
                   </div>
@@ -3144,8 +4594,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     style={{
                       left: Math.min(pageSize.width - 110, Math.max(6, selectedImg.x)) * scale,
                       top: Math.max(6, selectedImg.y * scale - 26),
+                      zIndex: 5010,
                     }}
-                    className="pointer-events-none absolute z-30 px-2 py-0.5 rounded-full bg-[#142B4A]/95 text-white font-mono-nums text-[10px] shadow"
+                    className="pointer-events-none absolute px-2 py-0.5 rounded-full bg-[#142B4A]/95 text-white font-mono-nums text-[10px] shadow"
                   >
                     {Math.round(selectedImg.width)} × {Math.round(selectedImg.height)} pt
                   </div>
@@ -3155,8 +4606,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     style={{
                       left: Math.min(pageSize.width - 100, Math.max(6, selectedImg.x)) * scale,
                       top: Math.max(6, selectedImg.y * scale - 26),
+                      zIndex: 5010,
                     }}
-                    className="pointer-events-none absolute z-30 px-2 py-0.5 rounded-full bg-[#142B4A]/95 text-white font-mono-nums text-[10px] shadow"
+                    className="pointer-events-none absolute px-2 py-0.5 rounded-full bg-[#142B4A]/95 text-white font-mono-nums text-[10px] shadow"
                   >
                     {Math.round(selectedImg.x)}, {Math.round(selectedImg.y)} pt
                   </div>
@@ -3165,10 +4617,26 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 {/* Interactive hitboxes for drawn vector annotations + 4-corner/endpoint resize handles */}
                 {!lockExistingElements &&
                   activeTool !== 'pan' &&
-                  pageAnnotations
-                    .filter((a) => a.kind !== 'sticky' && a.kind !== 'stamp' && a.kind !== 'signature')
-                    .map((ann) => {
-                      const isSel = selectedElement?.kind === 'annotation' && selectedElement.id === ann.id;
+                  unifiedPageItems
+                    .filter(
+                      (u): u is UnifiedOverlayItem & { kind: 'annotation' } =>
+                        u.kind === 'annotation' &&
+                        u.item.kind !== 'sticky' &&
+                        u.item.kind !== 'stamp' &&
+                        u.item.kind !== 'signature'
+                    )
+                    .map((entry) => {
+                      const ann = entry.item;
+                      const isSel = isElementSelected('annotation', ann.id);
+                      const isSingleSel = selectedElement?.kind === 'annotation' && selectedElement.id === ann.id;
+                      const isBehind = entry.behind;
+                      const frontIdx = frontPageItems.indexOf(entry);
+                      const hitZ = isBehind
+                        ? isSel
+                          ? 25
+                          : 5
+                        : 100 + Math.max(0, frontIdx) * 4 + 1;
+
                       let bx = ann.x;
                       let by = ann.y;
                       let bw = Math.max(20, Math.abs(ann.width));
@@ -3197,23 +4665,11 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       return (
                         <div
                           key={`hit_${ann.id}`}
-                          onPointerDown={(e) => {
-                            e.stopPropagation();
-                            pointerMovedRef.current = false;
-                            preGestureSnapshotRef.current = stateRef.current;
-                            setSelectedElement({ kind: 'annotation', id: ann.id });
-                            tryCapturePointer(overlayRef.current, e.pointerId);
-                            setDraggingItem({
-                              kind: 'annotation',
-                              id: ann.id,
-                              startClientX: e.clientX,
-                              startClientY: e.clientY,
-                              origX: ann.x,
-                              origY: ann.y,
-                              wasSelectedBeforeDown: isSel,
+                          onPointerDown={(e) =>
+                            startElementPointerDown(e, 'annotation', ann.id, ann.x, ann.y, {
                               origPoints: ann.points ? ann.points.map((p) => ({ ...p })) : undefined,
-                            });
-                          }}
+                            })
+                          }
                           style={{
                             left: bx * scale,
                             top: by * scale,
@@ -3224,12 +4680,20 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                               lockExistingElements || isPlacementTool || eyedropperActive
                                 ? 'none'
                                 : 'auto',
+                            zIndex: hitZ,
                           }}
                           className={`absolute cursor-move ${
-                            isSel ? 'ring-2 ring-[#2563EB] rounded bg-[#2563EB]/5 z-20' : ''
+                            isSel
+                              ? `ring-2 ${isBehind ? 'ring-dashed' : ''} ring-[#2563EB] rounded bg-[#2563EB]/5`
+                              : ''
                           }`}
                         >
-                          {isSel && (
+                          {isSel && isBehind && (
+                            <span className="pointer-events-none absolute -top-5 left-0 px-1.5 py-0.5 rounded bg-slate-900/90 text-white text-[9px] font-bold whitespace-nowrap shadow">
+                              {t.editor.layerBehindBadge}
+                            </span>
+                          )}
+                          {isSingleSel && (
                             <button
                               type="button"
                               style={{ touchAction: 'none' }}
@@ -3240,7 +4704,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                                   ...prev,
                                   annotations: prev.annotations.filter((x) => x.id !== ann.id),
                                 }));
-                                setSelectedElement(null);
+                                setSelectedElements([]);
                               }}
                               aria-label="Delete shape"
                               className="absolute -top-3 -right-3 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md z-30"
@@ -3249,8 +4713,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                             </button>
                           )}
 
-                          {/* 4-Corner resize handles for boxes/highlights/whiteout */}
-                          {isSel &&
+                          {isSingleSel &&
                             isBoxResizable &&
                             (['nw', 'ne', 'sw', 'se'] as const).map((corner) => {
                               const posClass =
@@ -3268,7 +4731,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                                   onPointerDown={(e) => {
                                     e.stopPropagation();
                                     pointerMovedRef.current = false;
-                                    preGestureSnapshotRef.current = stateRef.current;
+                                    capturePreGestureSnapshot();
                                     tryCapturePointer(overlayRef.current, e.pointerId);
                                     setResizingAnnotation({
                                       id: ann.id,
@@ -3287,8 +4750,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                               );
                             })}
 
-                          {/* Endpoint resize handles for arrow / underline / strike */}
-                          {isSel && isLineResizable && (
+                          {isSingleSel && isLineResizable && (
                             <>
                               <div
                                 style={{
@@ -3305,7 +4767,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                                 onPointerDown={(e) => {
                                   e.stopPropagation();
                                   pointerMovedRef.current = false;
-                                  preGestureSnapshotRef.current = stateRef.current;
+                                  capturePreGestureSnapshot();
                                   tryCapturePointer(overlayRef.current, e.pointerId);
                                   setResizingAnnotation({
                                     id: ann.id,
@@ -3335,7 +4797,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                                 onPointerDown={(e) => {
                                   e.stopPropagation();
                                   pointerMovedRef.current = false;
-                                  preGestureSnapshotRef.current = stateRef.current;
+                                  capturePreGestureSnapshot();
                                   tryCapturePointer(overlayRef.current, e.pointerId);
                                   setResizingAnnotation({
                                     id: ann.id,
@@ -3360,244 +4822,6 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                         </div>
                       );
                     })}
-
-                {/* Sticky notes, stamps, signatures */}
-                {pageAnnotations
-                  .filter((a) => a.kind === 'sticky' || a.kind === 'stamp' || a.kind === 'signature')
-                  .map((ann) => {
-                    const isSel = selectedElement?.kind === 'annotation' && selectedElement.id === ann.id;
-                    const startDrag = (e: React.PointerEvent) => {
-                      if (lockExistingElements || eyedropperActive) return;
-                      e.stopPropagation();
-                      pointerMovedRef.current = false;
-                      preGestureSnapshotRef.current = stateRef.current;
-                      setSelectedElement({ kind: 'annotation', id: ann.id });
-                      tryCapturePointer(overlayRef.current, e.pointerId);
-                      setDraggingItem({
-                        kind: 'annotation',
-                        id: ann.id,
-                        startClientX: e.clientX,
-                        startClientY: e.clientY,
-                        origX: ann.x,
-                        origY: ann.y,
-                        wasSelectedBeforeDown: isSel,
-                        origTipX: ann.stickyTipX,
-                        origTipY: ann.stickyTipY,
-                      });
-                    };
-                    const removeBtn = isSel && !lockExistingElements && (
-                      <button
-                        type="button"
-                        style={{ touchAction: 'none' }}
-                        onPointerDown={(e) => e.stopPropagation()}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          commitState((prev) => ({
-                            ...prev,
-                            annotations: prev.annotations.filter((x) => x.id !== ann.id),
-                          }));
-                          setSelectedElement(null);
-                        }}
-                        aria-label="Delete annotation"
-                        className="absolute -top-3 -right-3 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md z-30"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    );
-
-                    if (ann.kind === 'sticky') {
-                      const boxW = Math.max(84, ann.width || 165);
-                      const boxH = Math.max(44, ann.height || 76);
-                      const noteBg = ann.fillColor || '#FEF3C7';
-                      const noteAccent = ann.color && ann.color !== '#FACC15' ? ann.color : '#D97706';
-                      const fontSize = Math.max(7, Math.min(24, ann.fontSize || 10));
-                      const geo = computeStickyArrowGeometry(ann);
-                      return (
-                        <React.Fragment key={ann.id}>
-                          <div
-                            onPointerDown={startDrag}
-                            style={{
-                              left: ann.x * scale,
-                              top: ann.y * scale,
-                              width: boxW * scale,
-                              height: boxH * scale,
-                              backgroundColor: noteBg,
-                              borderColor: isSel ? '#2563EB' : noteAccent,
-                              fontSize: fontSize * scale,
-                              touchAction: 'none',
-                              pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
-                            }}
-                            title="Drag to move · Tap again to edit note · Pull corners to resize"
-                            className={`absolute p-2 rounded-lg border-2 text-slate-900 shadow-md cursor-move z-10 overflow-visible ${
-                              isSel ? 'ring-2 ring-[#2563EB]/30 z-20' : ''
-                            }`}
-                          >
-                            <div className="w-full h-full overflow-hidden leading-snug break-words whitespace-pre-wrap">
-                              {ann.comment}
-                            </div>
-
-                            {isSel &&
-                              !lockExistingElements &&
-                              (['nw', 'ne', 'sw', 'se'] as const).map((corner) => {
-                                const posClass =
-                                  corner === 'nw'
-                                    ? '-top-2.5 -left-2.5 cursor-nwse-resize'
-                                    : corner === 'ne'
-                                    ? '-top-2.5 -right-2.5 cursor-nesw-resize'
-                                    : corner === 'sw'
-                                    ? '-bottom-2.5 -left-2.5 cursor-nesw-resize'
-                                    : '-bottom-2.5 -right-2.5 cursor-nwse-resize';
-                                return (
-                                  <div
-                                    key={corner}
-                                    style={{ touchAction: 'none' }}
-                                    onPointerDown={(e) => {
-                                      e.stopPropagation();
-                                      pointerMovedRef.current = false;
-                                      preGestureSnapshotRef.current = stateRef.current;
-                                      tryCapturePointer(overlayRef.current, e.pointerId);
-                                      setResizingAnnotation({
-                                        id: ann.id,
-                                        handle: corner,
-                                        startClientX: e.clientX,
-                                        startClientY: e.clientY,
-                                        origX: ann.x,
-                                        origY: ann.y,
-                                        origW: boxW,
-                                        origH: boxH,
-                                      });
-                                    }}
-                                    title="Drag corner to resize sticky note"
-                                    className={`absolute ${posClass} w-5 h-5 rounded-full bg-white border-2 border-[#2563EB] shadow-md z-30`}
-                                  />
-                                );
-                              })}
-                            {removeBtn}
-                          </div>
-
-                          {/* Draggable Free-Angle & Any-Length Callout Arrow Tip Handle with enlarged mobile touch hit area */}
-                          {isSel && !lockExistingElements && geo.hasArrow && (
-                            <div
-                              style={{
-                                touchAction: 'none',
-                                left: geo.tipX * scale - 16,
-                                top: geo.tipY * scale - 16,
-                              }}
-                              onPointerDown={(e) => {
-                                e.stopPropagation();
-                                pointerMovedRef.current = false;
-                                preGestureSnapshotRef.current = stateRef.current;
-                                tryCapturePointer(overlayRef.current, e.pointerId);
-                                setDraggingStickyTip({ id: ann.id });
-                              }}
-                              title={t.editor.dragTipHint}
-                              className="absolute w-8 h-8 cursor-crosshair z-30 flex items-center justify-center"
-                            >
-                              <span
-                                style={{ borderColor: noteAccent }}
-                                className="w-5 h-5 rounded-full bg-white border-[2.5px] shadow-lg flex items-center justify-center"
-                              >
-                                <span
-                                  className="w-2 h-2 rounded-full"
-                                  style={{ backgroundColor: noteAccent }}
-                                />
-                              </span>
-                              {draggingStickyTip?.id === ann.id && (
-                                <span className="pointer-events-none absolute -top-6 left-1/2 -translate-x-1/2 px-1.5 py-0.5 rounded bg-slate-900/90 text-white font-mono-nums text-[9px] whitespace-nowrap shadow">
-                                  {geo.angleDeg}° · {Math.round(geo.length)}pt
-                                </span>
-                              )}
-                            </div>
-                          )}
-                        </React.Fragment>
-                      );
-                    }
-                    if (ann.kind === 'stamp') {
-                      const label = ann.comment || ann.dateStr || '';
-                      const stampFont = Math.max(8, Math.min(26, ann.fontSize || 10));
-                      const isSolid = Boolean(ann.fillColor);
-                      return (
-                        <div
-                          key={ann.id}
-                          onPointerDown={startDrag}
-                          style={{
-                            left: ann.x * scale,
-                            top: ann.y * scale,
-                            minWidth: (ann.width || 96) * scale,
-                            height: (ann.height || 28) * scale,
-                            borderColor: ann.color,
-                            backgroundColor: isSolid ? ann.fillColor : 'rgba(255,255,255,0.95)',
-                            color: isSolid ? '#FFFFFF' : ann.color,
-                            fontSize: stampFont * scale,
-                            transform: ann.rotation ? `rotate(${ann.rotation}deg)` : undefined,
-                            transformOrigin: 'center center',
-                            touchAction: 'none',
-                            pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
-                          }}
-                          className={`absolute px-2.5 rounded border-2 font-extrabold tracking-wide flex items-center justify-center cursor-move z-10 whitespace-nowrap ${
-                            isSel ? 'ring-2 ring-[#2563EB] z-20' : ''
-                          }`}
-                        >
-                          {label}
-                          {removeBtn}
-                        </div>
-                      );
-                    }
-                    return (
-                      <div
-                        key={ann.id}
-                        onPointerDown={startDrag}
-                        style={{
-                          left: ann.x * scale,
-                          top: ann.y * scale,
-                          width: ann.width * scale,
-                          transform: ann.rotation ? `rotate(${ann.rotation}deg)` : undefined,
-                          transformOrigin: 'center center',
-                          touchAction: 'none',
-                          pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
-                        }}
-                        className={`absolute cursor-move z-10 ${
-                          isSel ? 'ring-2 ring-[#2563EB] rounded z-20' : ''
-                        }`}
-                      >
-                        <img
-                          src={ann.signatureDataUrl}
-                          alt="Signature"
-                          style={{ width: ann.width * scale, height: ann.height * scale }}
-                          className="object-contain pointer-events-none"
-                        />
-                        {(ann.signerName || ann.dateStr) && (
-                          <p className="text-[8px] text-slate-600 truncate">
-                            {ann.signerName} {ann.dateStr ? `· ${ann.dateStr}` : ''}
-                          </p>
-                        )}
-                        {isSel && !lockExistingElements && (
-                          <div
-                            style={{ touchAction: 'none' }}
-                            onPointerDown={(e) => {
-                              e.stopPropagation();
-                              pointerMovedRef.current = false;
-                              preGestureSnapshotRef.current = stateRef.current;
-                              tryCapturePointer(overlayRef.current, e.pointerId);
-                              setResizingAnnotation({
-                                id: ann.id,
-                                handle: 'se',
-                                startClientX: e.clientX,
-                                startClientY: e.clientY,
-                                origX: ann.x,
-                                origY: ann.y,
-                                origW: ann.width,
-                                origH: ann.height,
-                              });
-                            }}
-                            title="Drag to resize signature"
-                            className="absolute -bottom-2.5 -right-2.5 w-5 h-5 rounded-full bg-white border-2 border-[#2563EB] shadow-md cursor-nwse-resize z-30"
-                          />
-                        )}
-                        {removeBtn}
-                      </div>
-                    );
-                  })}
               </div>
             </div>
           </div>
@@ -3645,7 +4869,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                             setShowToolGrid(false);
                             setEyedropperActive(false);
                             if (tool.id === 'addImage') {
-                              imageInputRef.current?.click();
+                              openImagePicker();
                               return;
                             }
                             setSelectedElement(null);
@@ -3687,12 +4911,132 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
 
         {showContextualSubBar && (
           <div className="flex items-center justify-between gap-2 px-3 py-1.5 bg-slate-50 dark:bg-slate-800/70 border-b border-slate-200 dark:border-slate-800 overflow-x-auto no-scrollbar text-xs">
-            {selectedImg ? (
+            {hasMultiSelection ? (
+              <div className="flex items-center gap-1.5 w-full">
+                <span className="px-2 py-1 rounded-lg bg-[#2563EB] text-white font-bold whitespace-nowrap shrink-0 flex items-center gap-1">
+                  <CheckSquare className="w-3.5 h-3.5" />
+                  {selectedElements.length} {t.editor.selectedCount}
+                </span>
+                {(multiSelectedTextCount > 0 || multiSelectedAnnCount > 0) && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => batchChangeColor(activeColor)}
+                      className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 flex items-center gap-1 whitespace-nowrap shrink-0"
+                    >
+                      <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ backgroundColor: activeColor }} />
+                      {language === 'bn' ? 'রঙ' : 'Color'}
+                    </button>
+                    <div className="flex items-center gap-1 shrink-0">
+                      {(['#0F172A', '#2563EB', '#DC2626', '#16A34A'] as const).map((qc) => (
+                        <button
+                          key={`batch_clr_${qc}`}
+                          type="button"
+                          onClick={() => batchChangeColor(qc)}
+                          style={{ backgroundColor: qc }}
+                          aria-label={`Batch color ${qc}`}
+                          className="w-5 h-5 rounded-full border border-white dark:border-slate-700 shadow-sm shrink-0"
+                        />
+                      ))}
+                    </div>
+                  </>
+                )}
+                {(multiSelectedTextCount > 0 ||
+                  pageAnnotations.some(
+                    (an) =>
+                      (an.kind === 'sticky' || an.kind === 'stamp') &&
+                      isElementSelected('annotation', an.id)
+                  )) && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => batchAdjustFontSize(2)}
+                      className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-bold shrink-0"
+                    >
+                      A+
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => batchAdjustFontSize(-2)}
+                      className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-bold shrink-0"
+                    >
+                      A-
+                    </button>
+                  </>
+                )}
+                {multiSelectedTextCount > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => batchToggleTextStyle('bold')}
+                      aria-label="Batch toggle bold"
+                      className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shrink-0"
+                    >
+                      <Bold className="w-3.5 h-3.5" />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => batchToggleTextStyle('italic')}
+                      aria-label="Batch toggle italic"
+                      className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shrink-0"
+                    >
+                      <Italic className="w-3.5 h-3.5" />
+                    </button>
+                  </>
+                )}
+                {(multiSelectedImgCount > 0 || multiSelectedAnnCount > 0) && (
+                  <button
+                    type="button"
+                    onClick={batchCycleOpacity}
+                    title={t.editor.opacity}
+                    className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold whitespace-nowrap shrink-0"
+                  >
+                    {t.editor.opacity}
+                  </button>
+                )}
+                {renderLayerControls(allSelectedBehind)}
+                <button
+                  type="button"
+                  onClick={selectAllOnCurrentPage}
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold flex items-center gap-1 whitespace-nowrap shrink-0"
+                >
+                  <CheckCheck className="w-3.5 h-3.5" />
+                  {t.editor.selectAllOnPage}
+                </button>
+                <button
+                  type="button"
+                  onClick={duplicateSelectedElement}
+                  title={t.editor.duplicate}
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shrink-0"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={batchDeleteSelected}
+                  title={t.editor.batchDelete}
+                  className="px-2.5 py-1 rounded-lg bg-rose-500 text-white font-semibold flex items-center gap-1 whitespace-nowrap shrink-0"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  {t.editor.batchDelete}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSelectedElements([]);
+                    setMultiSelectMode(false);
+                  }}
+                  className="ml-auto px-2.5 py-1 rounded-lg bg-[#142B4A] text-white font-semibold whitespace-nowrap shrink-0"
+                >
+                  {t.editor.doneSelect}
+                </button>
+              </div>
+            ) : selectedImg ? (
               <div className="flex items-center gap-1.5 w-full">
                 <button
                   type="button"
                   onClick={() => {
-                    preGestureSnapshotRef.current = stateRef.current;
+                    capturePreGestureSnapshot();
                     setShowImageAdjustModal(true);
                   }}
                   className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white font-semibold flex items-center gap-1 whitespace-nowrap shrink-0"
@@ -3836,7 +5180,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 </button>
                 <button
                   type="button"
-                  onClick={() => imageInputRef.current?.click()}
+                  onClick={openImagePicker}
                   className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold flex items-center gap-1 whitespace-nowrap shrink-0"
                 >
                   <ImagePlus className="w-3.5 h-3.5" /> +
@@ -3849,14 +5193,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 >
                   <Copy className="w-3.5 h-3.5" />
                 </button>
-                <button
-                  type="button"
-                  onClick={bringSelectedToFront}
-                  title={t.editor.bringFront}
-                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shrink-0"
-                >
-                  <Layers className="w-3.5 h-3.5" />
-                </button>
+                {renderLayerControls(selectedImg.layerPlacement === 'behind')}
                 <button
                   type="button"
                   onClick={() => {
@@ -3989,14 +5326,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 >
                   <Copy className="w-3.5 h-3.5" />
                 </button>
-                <button
-                  type="button"
-                  onClick={bringSelectedToFront}
-                  title={t.editor.bringFront}
-                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shrink-0"
-                >
-                  <Layers className="w-3.5 h-3.5" />
-                </button>
+                {renderLayerControls(selectedTextBox.layerPlacement === 'behind')}
                 <button
                   type="button"
                   onClick={() => {
@@ -4339,14 +5669,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 >
                   <Copy className="w-3.5 h-3.5" />
                 </button>
-                <button
-                  type="button"
-                  onClick={bringSelectedToFront}
-                  title={t.editor.bringFront}
-                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shrink-0"
-                >
-                  <Layers className="w-3.5 h-3.5" />
-                </button>
+                {renderLayerControls(selectedAnn.layerPlacement === 'behind')}
                 <button
                   type="button"
                   onClick={() => {
@@ -4377,7 +5700,25 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 <div className="flex items-center gap-1.5 shrink-0">
                   <button
                     type="button"
-                    onClick={() => imageInputRef.current?.click()}
+                    onClick={() => setMultiSelectMode((v) => !v)}
+                    className={`px-2 py-1 rounded-lg font-semibold flex items-center gap-1 whitespace-nowrap border ${
+                      multiSelectMode
+                        ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                        : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    <CheckSquare className="w-3.5 h-3.5" /> {t.editor.multiSelect}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={selectAllOnCurrentPage}
+                    className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold flex items-center gap-1 whitespace-nowrap"
+                  >
+                    <CheckCheck className="w-3.5 h-3.5" /> {t.editor.selectAllOnPage}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={openImagePicker}
                     className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white font-semibold flex items-center gap-1 whitespace-nowrap"
                   >
                     <ImagePlus className="w-3.5 h-3.5" /> {t.editor.tapChooseImage}
@@ -5017,7 +6358,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     setShowToolGrid(false);
                     setEyedropperActive(false);
                     if (tool.id === 'addImage') {
-                      imageInputRef.current?.click();
+                      openImagePicker();
                       return;
                     }
                     setSelectedElement(null);
@@ -5367,6 +6708,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               <button
                 onClick={() => {
                   const wasAdding = !editingBoxId;
+                  textSubmitLockRef.current = false;
                   setAddingBoxPos(null);
                   setEditingBoxId(null);
                   if (wasAdding && !keepToolActive) setActiveTool('select');
@@ -5601,67 +6943,73 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               <button
                 type="button"
                 onClick={() => {
-                  if (!newBoxDraft.text.trim()) return;
-                  lastBoxPrefsRef.current = {
-                    fontSize: newBoxDraft.fontSize,
-                    fontFamily: newBoxDraft.fontFamily,
-                  };
-                  const wasAdding = !editingBoxId;
-                  if (editingBoxId) {
-                    commitState((prev) => ({
-                      ...prev,
-                      addedTexts: prev.addedTexts.map((tb) =>
-                        tb.id === editingBoxId
-                          ? {
-                              ...tb,
-                              text: newBoxDraft.text,
-                              fontSize: newBoxDraft.fontSize,
-                              fontFamily: newBoxDraft.fontFamily,
-                              color: newBoxDraft.color,
-                              backgroundColor: newBoxDraft.backgroundColor,
-                              borderColor: newBoxDraft.border ? newBoxDraft.color : undefined,
-                              rotation: newBoxDraft.rotation,
-                              bold: newBoxDraft.bold,
-                              italic: newBoxDraft.italic,
-                              underline: newBoxDraft.underline,
-                              align: newBoxDraft.align,
-                              letterSpacing: newBoxDraft.letterSpacing,
-                            }
-                          : tb
-                      ),
-                    }));
-                  } else {
-                    const newId = `tb_${Date.now()}`;
-                    commitState((prev) => ({
-                      ...prev,
-                      addedTexts: [
-                        ...prev.addedTexts,
-                        {
-                          id: newId,
-                          pageNumber,
-                          text: newBoxDraft.text,
-                          x: addingBoxPos.x,
-                          y: addingBoxPos.y,
-                          width: 260,
-                          fontSize: newBoxDraft.fontSize,
-                          fontFamily: newBoxDraft.fontFamily,
-                          color: newBoxDraft.color,
-                          backgroundColor: newBoxDraft.backgroundColor,
-                          borderColor: newBoxDraft.border ? newBoxDraft.color : undefined,
-                          rotation: newBoxDraft.rotation,
-                          bold: newBoxDraft.bold,
-                          italic: newBoxDraft.italic,
-                          underline: newBoxDraft.underline,
-                          align: newBoxDraft.align,
-                          letterSpacing: newBoxDraft.letterSpacing,
-                        },
-                      ],
-                    }));
-                    setSelectedElement({ kind: 'textBox', id: newId });
+                  if (textSubmitLockRef.current || !newBoxDraft.text.trim()) return;
+                  textSubmitLockRef.current = true;
+                  try {
+                    lastBoxPrefsRef.current = {
+                      fontSize: newBoxDraft.fontSize,
+                      fontFamily: newBoxDraft.fontFamily,
+                    };
+                    const wasAdding = !editingBoxId;
+                    if (editingBoxId) {
+                      commitState((prev) => ({
+                        ...prev,
+                        addedTexts: prev.addedTexts.map((tb) =>
+                          tb.id === editingBoxId
+                            ? {
+                                ...tb,
+                                text: newBoxDraft.text,
+                                fontSize: newBoxDraft.fontSize,
+                                fontFamily: newBoxDraft.fontFamily,
+                                color: newBoxDraft.color,
+                                backgroundColor: newBoxDraft.backgroundColor,
+                                borderColor: newBoxDraft.border ? newBoxDraft.color : undefined,
+                                rotation: newBoxDraft.rotation,
+                                bold: newBoxDraft.bold,
+                                italic: newBoxDraft.italic,
+                                underline: newBoxDraft.underline,
+                                align: newBoxDraft.align,
+                                letterSpacing: newBoxDraft.letterSpacing,
+                              }
+                            : tb
+                        ),
+                      }));
+                    } else {
+                      const newId = nextElementId('tb');
+                      commitState((prev) => ({
+                        ...prev,
+                        addedTexts: [
+                          ...prev.addedTexts,
+                          {
+                            id: newId,
+                            pageNumber,
+                            text: newBoxDraft.text,
+                            x: addingBoxPos.x,
+                            y: addingBoxPos.y,
+                            width: 260,
+                            fontSize: newBoxDraft.fontSize,
+                            fontFamily: newBoxDraft.fontFamily,
+                            color: newBoxDraft.color,
+                            backgroundColor: newBoxDraft.backgroundColor,
+                            borderColor: newBoxDraft.border ? newBoxDraft.color : undefined,
+                            rotation: newBoxDraft.rotation,
+                            bold: newBoxDraft.bold,
+                            italic: newBoxDraft.italic,
+                            underline: newBoxDraft.underline,
+                            align: newBoxDraft.align,
+                            letterSpacing: newBoxDraft.letterSpacing,
+                            zIndex: getNextTopZIndex(prev, pageNumber),
+                          },
+                        ],
+                      }));
+                      setSelectedElement({ kind: 'textBox', id: newId });
+                    }
+                    setAddingBoxPos(null);
+                    setEditingBoxId(null);
+                    if (wasAdding && !keepToolActive) setActiveTool('select');
+                  } finally {
+                    textSubmitLockRef.current = false;
                   }
-                  setAddingBoxPos(null);
-                  setEditingBoxId(null);
-                  if (wasAdding && !keepToolActive) setActiveTool('select');
                 }}
                 className="w-full min-h-[46px] rounded-xl bg-[#2563EB] text-white text-sm font-semibold"
               >
@@ -5883,7 +7231,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     pageSize.width,
                     pageSize.height
                   );
-                  const newId = `sticky_${Date.now()}`;
+                  const newId = nextElementId('sticky');
                   commitState((prev) => ({
                     ...prev,
                     annotations: [
@@ -5903,6 +7251,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                         stickyArrow,
                         stickyTipX: tip.tipX,
                         stickyTipY: tip.tipY,
+                        zIndex: getNextTopZIndex(prev, pageNumber),
                       },
                     ],
                   }));
@@ -6156,11 +7505,12 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 type="button"
                 onClick={() => {
                   const baseSnap = preGestureSnapshotRef.current;
-                  if (baseSnap) {
-                    setUndoStack((prev) => [...prev.slice(-24), baseSnap]);
-                    setRedoStack([]);
-                    preGestureSnapshotRef.current = null;
+                  const curImg = stateRef.current.addedImages.find((im) => im.id === selectedImg.id);
+                  const baseImg = baseSnap?.addedImages.find((im) => im.id === selectedImg.id);
+                  if (baseSnap && curImg && baseImg && JSON.stringify(curImg) !== JSON.stringify(baseImg)) {
+                    pushUndoSnapshot(baseSnap);
                   }
+                  preGestureSnapshotRef.current = null;
                   setShowImageAdjustModal(false);
                 }}
                 className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-full"
@@ -6217,7 +7567,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       const ratio = selectedImg.width / Math.max(1, selectedImg.height);
                       const nextH =
                         selectedImg.lockAspect !== false ? Math.max(20, Math.round(nextW / ratio)) : selectedImg.height;
-                      setState((prev) => ({
+                      updateStateLive((prev) => ({
                         ...prev,
                         addedImages: prev.addedImages.map((im) =>
                           im.id === selectedImg.id ? { ...im, width: nextW, height: nextH } : im
@@ -6239,7 +7589,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       const ratio = selectedImg.width / Math.max(1, selectedImg.height);
                       const nextW =
                         selectedImg.lockAspect !== false ? Math.max(20, Math.round(nextH * ratio)) : selectedImg.width;
-                      setState((prev) => ({
+                      updateStateLive((prev) => ({
                         ...prev,
                         addedImages: prev.addedImages.map((im) =>
                           im.id === selectedImg.id ? { ...im, width: nextW, height: nextH } : im
@@ -6252,7 +7602,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 <button
                   type="button"
                   onClick={() =>
-                    setState((prev) => ({
+                    updateStateLive((prev) => ({
                       ...prev,
                       addedImages: prev.addedImages.map((im) =>
                         im.id === selectedImg.id ? { ...im, lockAspect: im.lockAspect === false } : im
@@ -6274,7 +7624,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 <button
                   type="button"
                   onClick={() =>
-                    setState((prev) => ({
+                    updateStateLive((prev) => ({
                       ...prev,
                       addedImages: prev.addedImages.map((im) =>
                         im.id === selectedImg.id
@@ -6290,7 +7640,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 <button
                   type="button"
                   onClick={() =>
-                    setState((prev) => ({
+                    updateStateLive((prev) => ({
                       ...prev,
                       addedImages: prev.addedImages.map((im) =>
                         im.id === selectedImg.id
@@ -6311,7 +7661,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       24,
                       Math.round((targetW / Math.max(1, selectedImg.width)) * selectedImg.height)
                     );
-                    setState((prev) => ({
+                    updateStateLive((prev) => ({
                       ...prev,
                       addedImages: prev.addedImages.map((im) =>
                         im.id === selectedImg.id ? { ...im, x: 24, width: targetW, height: targetH } : im
@@ -6341,7 +7691,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                         type="button"
                         aria-label={btn.label}
                         onClick={() =>
-                          setState((prev) => ({
+                          updateStateLive((prev) => ({
                             ...prev,
                             addedImages: prev.addedImages.map((im) =>
                               im.id === selectedImg.id
@@ -6378,7 +7728,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   value={selectedImg.rotation > 180 ? selectedImg.rotation - 360 : selectedImg.rotation}
                   onChange={(e) => {
                     const val = Number(e.target.value);
-                    setState((prev) => ({
+                    updateStateLive((prev) => ({
                       ...prev,
                       addedImages: prev.addedImages.map((im) =>
                         im.id === selectedImg.id ? { ...im, rotation: val } : im
@@ -6394,7 +7744,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     key={deg}
                     type="button"
                     onClick={() =>
-                      setState((prev) => ({
+                      updateStateLive((prev) => ({
                         ...prev,
                         addedImages: prev.addedImages.map((im) =>
                           im.id === selectedImg.id ? { ...im, rotation: deg } : im
@@ -6413,7 +7763,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 <button
                   type="button"
                   onClick={() =>
-                    setState((prev) => ({
+                    updateStateLive((prev) => ({
                       ...prev,
                       addedImages: prev.addedImages.map((im) =>
                         im.id === selectedImg.id ? { ...im, flipX: !im.flipX } : im
@@ -6431,7 +7781,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 <button
                   type="button"
                   onClick={() =>
-                    setState((prev) => ({
+                    updateStateLive((prev) => ({
                       ...prev,
                       addedImages: prev.addedImages.map((im) =>
                         im.id === selectedImg.id ? { ...im, flipY: !im.flipY } : im
@@ -6463,7 +7813,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   value={Math.round((selectedImg.opacity ?? 1) * 100)}
                   onChange={(e) => {
                     const op = Number(e.target.value) / 100;
-                    setState((prev) => ({
+                    updateStateLive((prev) => ({
                       ...prev,
                       addedImages: prev.addedImages.map((im) =>
                         im.id === selectedImg.id ? { ...im, opacity: op } : im
@@ -6486,7 +7836,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     value={selectedImg.brightness ?? 100}
                     onChange={(e) => {
                       const val = Number(e.target.value);
-                      setState((prev) => ({
+                      updateStateLive((prev) => ({
                         ...prev,
                         addedImages: prev.addedImages.map((im) =>
                           im.id === selectedImg.id ? { ...im, brightness: val } : im
@@ -6508,7 +7858,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     value={selectedImg.contrast ?? 100}
                     onChange={(e) => {
                       const val = Number(e.target.value);
-                      setState((prev) => ({
+                      updateStateLive((prev) => ({
                         ...prev,
                         addedImages: prev.addedImages.map((im) =>
                           im.id === selectedImg.id ? { ...im, contrast: val } : im
@@ -6523,7 +7873,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 <button
                   type="button"
                   onClick={() =>
-                    setState((prev) => ({
+                    updateStateLive((prev) => ({
                       ...prev,
                       addedImages: prev.addedImages.map((im) =>
                         im.id === selectedImg.id ? { ...im, grayscale: !im.grayscale } : im
@@ -6592,7 +7942,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   value={selectedImg.borderRadius ?? 0}
                   onChange={(e) => {
                     const val = Number(e.target.value);
-                    setState((prev) => ({
+                    updateStateLive((prev) => ({
                       ...prev,
                       addedImages: prev.addedImages.map((im) =>
                         im.id === selectedImg.id ? { ...im, borderRadius: val } : im
@@ -6613,7 +7963,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       key={bw}
                       type="button"
                       onClick={() =>
-                        setState((prev) => ({
+                        updateStateLive((prev) => ({
                           ...prev,
                           addedImages: prev.addedImages.map((im) =>
                             im.id === selectedImg.id ? { ...im, borderWidth: bw } : im
@@ -6633,7 +7983,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     type="color"
                     value={selectedImg.borderColor || '#142B4A'}
                     onChange={(e) =>
-                      setState((prev) => ({
+                      updateStateLive((prev) => ({
                         ...prev,
                         addedImages: prev.addedImages.map((im) =>
                           im.id === selectedImg.id ? { ...im, borderColor: e.target.value } : im
@@ -6650,7 +8000,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               <button
                 type="button"
                 onClick={() =>
-                  setState((prev) => ({
+                  updateStateLive((prev) => ({
                     ...prev,
                     addedImages: prev.addedImages.map((im) =>
                       im.id === selectedImg.id
@@ -6679,11 +8029,12 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 type="button"
                 onClick={() => {
                   const baseSnap = preGestureSnapshotRef.current;
-                  if (baseSnap) {
-                    setUndoStack((prev) => [...prev.slice(-24), baseSnap]);
-                    setRedoStack([]);
-                    preGestureSnapshotRef.current = null;
+                  const curImg = stateRef.current.addedImages.find((im) => im.id === selectedImg.id);
+                  const baseImg = baseSnap?.addedImages.find((im) => im.id === selectedImg.id);
+                  if (baseSnap && curImg && baseImg && JSON.stringify(curImg) !== JSON.stringify(baseImg)) {
+                    pushUndoSnapshot(baseSnap);
                   }
+                  preGestureSnapshotRef.current = null;
                   setShowImageAdjustModal(false);
                 }}
                 className="min-h-[42px] rounded-xl bg-[#2563EB] text-white font-semibold"

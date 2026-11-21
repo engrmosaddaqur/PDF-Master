@@ -36,6 +36,7 @@ import type {
 } from '../types';
 import { getT } from '../i18n/translations';
 import {
+  applyPdfEditsToBytes,
   applyPdfFormFieldValues,
   cancelCanvasRender,
   cloneBuffer,
@@ -789,6 +790,8 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
     await onUpdateDoc({
       ...doc,
       pdfBytes: rotatedBytes,
+      basePdfBytes: undefined,
+      editorState: undefined,
       sizeBytes: rotatedBytes.byteLength,
       updatedAt: Date.now(),
     });
@@ -840,7 +843,14 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
   const handleSaveFilledForm = async (flatten: boolean) => {
     setSavingForm(true);
     try {
-      const filledBytes = await applyPdfFormFieldValues(doc.pdfBytes, formValues, flatten);
+      let nextBase: ArrayBuffer | undefined;
+      let filledBytes: ArrayBuffer;
+      if (doc.basePdfBytes && doc.editorState) {
+        nextBase = await applyPdfFormFieldValues(doc.basePdfBytes, formValues, flatten);
+        filledBytes = await applyPdfEditsToBytes(nextBase, doc.editorState);
+      } else {
+        filledBytes = await applyPdfFormFieldValues(doc.pdfBytes, formValues, flatten);
+      }
       const thumb = await renderPageThumbnail(filledBytes, 1, 200).catch(() => doc.thumbnailDataUrl);
       const now = Date.now();
       await onUpdateDoc({
@@ -851,6 +861,8 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
         sizeBytes: filledBytes.byteLength,
         thumbnailDataUrl: thumb,
         pdfBytes: cloneBuffer(filledBytes),
+        basePdfBytes: nextBase ? cloneBuffer(nextBase) : undefined,
+        editorState: nextBase ? doc.editorState : undefined,
         versions: [
           {
             id: `ver_${now}`,
@@ -858,6 +870,7 @@ export const PdfViewerView: React.FC<PdfViewerViewProps> = ({
             note: flatten ? 'Saved flattened PDF form' : 'Updated fillable form fields',
             sizeBytes: filledBytes.byteLength,
             pdfBytes: cloneBuffer(filledBytes),
+            editorState: nextBase ? doc.editorState : undefined,
           },
           ...doc.versions,
         ],

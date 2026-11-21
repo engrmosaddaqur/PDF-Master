@@ -2,6 +2,7 @@ import type {
   AppSettings,
   DocumentRecord,
   FolderRecord,
+  PdfEditorState,
   SavedSignature,
 } from '../types';
 import {
@@ -106,13 +107,29 @@ export async function getAllDocuments(): Promise<DocumentRecord[]> {
 
 export const MAX_DOC_VERSIONS = 5;
 
+export function cloneEditorState(state?: PdfEditorState | null): PdfEditorState | undefined {
+  if (!state) return undefined;
+  return {
+    replacements: (state.replacements || []).map((r) => ({ ...r })),
+    addedTexts: (state.addedTexts || []).map((tb) => ({ ...tb })),
+    addedImages: (state.addedImages || []).map((im) => ({ ...im })),
+    annotations: (state.annotations || []).map((an) => ({
+      ...an,
+      points: an.points ? an.points.map((pt) => ({ ...pt })) : undefined,
+    })),
+  };
+}
+
 export async function saveDocument(doc: DocumentRecord): Promise<void> {
   const safeDoc: DocumentRecord = {
     ...doc,
     pdfBytes: cloneBuffer(doc.pdfBytes),
+    basePdfBytes: doc.basePdfBytes ? cloneBuffer(doc.basePdfBytes) : undefined,
+    editorState: cloneEditorState(doc.editorState),
     versions: (doc.versions || []).slice(0, MAX_DOC_VERSIONS).map((v) => ({
       ...v,
       pdfBytes: cloneBuffer(v.pdfBytes),
+      editorState: cloneEditorState(v.editorState),
     })),
   };
   await putInStore(STORE_DOCS, safeDoc);

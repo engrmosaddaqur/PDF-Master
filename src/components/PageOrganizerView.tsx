@@ -288,6 +288,8 @@ export const PageOrganizerView: React.FC<PageOrganizerViewProps> = ({
         sizeBytes: outBytes.byteLength,
         thumbnailDataUrl: thumb,
         pdfBytes: cloneBuffer(outBytes),
+        basePdfBytes: undefined,
+        editorState: undefined,
         versions: [
           {
             id: `ver_${now}`,

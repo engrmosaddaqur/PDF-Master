@@ -593,6 +593,8 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           vaultSalt: saltB64,
           vaultIv: ivB64,
           pdfBytes: encrypted,
+          basePdfBytes: undefined,
+          editorState: undefined,
           updatedAt: Date.now(),
         });
         setPasswordInput('');
@@ -671,6 +673,8 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
         await onUpdateExistingDoc({
           ...primaryDoc,
           pdfBytes: cloneBuffer(out),
+          basePdfBytes: undefined,
+          editorState: undefined,
           sizeBytes: out.byteLength,
           updatedAt: Date.now(),
         });

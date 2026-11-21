@@ -57,6 +57,7 @@ export interface DocumentVersion {
   note: string;
   sizeBytes: number;
   pdfBytes: ArrayBuffer;
+  editorState?: PdfEditorState;
 }
 
 export interface DocumentRecord {
@@ -74,6 +75,10 @@ export interface DocumentRecord {
   folderId: string | null;
   thumbnailDataUrl?: string;
   pdfBytes: ArrayBuffer;
+  /** Original unbaked PDF bytes preserved when non-destructive editor overlays exist */
+  basePdfBytes?: ArrayBuffer;
+  /** Persistent non-destructive Edit PDF layers so previously added items remain editable across sessions */
+  editorState?: PdfEditorState;
   editableHtml?: string;
   wordSettings?: WordPageSettings;
   bookmarks?: number[];
@@ -83,6 +88,13 @@ export interface DocumentRecord {
   isVaultLocked?: boolean;
   vaultSalt?: string;
   vaultIv?: string;
+}
+
+export interface PdfEditorState {
+  replacements: TextReplacementEdit[];
+  addedTexts: AddedTextBox[];
+  addedImages: AddedImageOverlay[];
+  annotations: AnnotationOverlay[];
 }
 
 export interface FolderRecord {
@@ -195,6 +207,8 @@ export interface AddedTextBox {
   underline: boolean;
   align: 'left' | 'center' | 'right';
   letterSpacing: number;
+  zIndex?: number;
+  layerPlacement?: 'front' | 'behind';
 }
 
 export interface AddedImageOverlay {
@@ -216,6 +230,8 @@ export interface AddedImageOverlay {
   borderColor?: string;
   borderWidth?: number;
   lockAspect?: boolean;
+  zIndex?: number;
+  layerPlacement?: 'front' | 'behind';
 }
 
 export interface AnnotationOverlay {
@@ -263,6 +279,8 @@ export interface AnnotationOverlay {
   dateStr?: string;
   signatureDataUrl?: string;
   signerName?: string;
+  zIndex?: number;
+  layerPlacement?: 'front' | 'behind';
 }
 
 export type ActiveWorkspace =

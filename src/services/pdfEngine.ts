@@ -1,6 +1,7 @@
 import * as pdfjsLib from 'pdfjs-dist';
 import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import {
+  PDFArray,
   PDFDocument,
   StandardFonts,
   rgb,
@@ -385,7 +386,8 @@ export async function renderPageToCanvas(
   pageNumber: number,
   canvas: HTMLCanvasElement,
   scale = 1.5,
-  extraRotation = 0
+  extraRotation = 0,
+  transparentBackground = false
 ): Promise<{ width: number; height: number; unscaledWidth: number; unscaledHeight: number }> {
   // Cancel any in-flight PDF.js render on this exact canvas so transforms never stack/flip
   cancelCanvasRender(canvas);
@@ -417,10 +419,19 @@ export async function renderPageToCanvas(
 
       const ctx = canvas.getContext('2d')!;
       ctx.setTransform(1, 0, 0, 1, 0, 0);
-      ctx.fillStyle = '#FFFFFF';
-      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      if (transparentBackground) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      } else {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
 
-      const renderTask = page.render({ canvasContext: ctx, viewport, canvas });
+      const renderTask = page.render({
+        canvasContext: ctx,
+        viewport,
+        canvas,
+        ...(transparentBackground ? { background: 'rgba(0,0,0,0)' } : {}),
+      });
       activeCanvasTasks.set(canvas, renderTask);
       try {
         await renderTask.promise;
@@ -1085,244 +1096,6 @@ export async function applyPdfEditsToBytes(
     return { visW, visH, swapped, mapPoint, mapRect, mapBaselineText, toPdfPoint };
   };
 
-  const pages = doc.getPages();
-
-  // 1. Existing text replacements/deletions
-  for (const rep of edits.replacements) {
-    const page = pages[rep.pageNumber - 1];
-    if (!page) continue;
-    const vm = makeVisualMapper(page);
-
-    // Clear original text bounding area cleanly using matched background color
-    const maskPt = vm.mapRect(
-      Math.max(0, rep.x - 1.5),
-      Math.max(0, rep.y - 1.5),
-      rep.width + 4,
-      rep.height + 4,
-      0
-    );
-    page.drawRectangle({
-      x: maskPt.x,
-      y: maskPt.y,
-      width: rep.width + 4,
-      height: rep.height + 4,
-      color: rep.backgroundColor ? hexToRgb(rep.backgroundColor) : rgb(1, 1, 1),
-      ...(maskPt.angleDeg !== 0 ? { rotate: degrees(maskPt.angleDeg) } : {}),
-    });
-
-    if (!rep.deleted && rep.newText.trim()) {
-      if (
-        hasNonWinAnsiChars(rep.newText) ||
-        (rep.letterSpacing || 0) !== 0 ||
-        rep.newText.includes('\n') ||
-        isCustomDesktopFont(rep.fontFamily)
-      ) {
-        const availableW = rep.newText.includes('\n')
-          ? Math.max(rep.width + 24, 320)
-          : Math.max(rep.width + 40, vm.visW - rep.x - 12);
-        const rendered = await renderUnicodeTextPng({
-          text: rep.newText,
-          fontSize: rep.fontSize,
-          fontFamily: rep.fontFamily,
-          color: rep.color,
-          bold: rep.bold,
-          italic: rep.italic,
-          underline: rep.underline,
-          align: rep.align,
-          letterSpacing: rep.letterSpacing,
-          maxWidth: availableW,
-        });
-        const img = await doc.embedPng(rendered.pngBytes);
-        const imgPt = vm.mapRect(rep.x, rep.y, rendered.widthPt, rendered.heightPt, 0);
-        page.drawImage(img, {
-          x: imgPt.x,
-          y: imgPt.y,
-          width: rendered.widthPt,
-          height: rendered.heightPt,
-          ...(imgPt.angleDeg !== 0 ? { rotate: degrees(imgPt.angleDeg) } : {}),
-        });
-      } else {
-        const font = pickStandardFont(rep.fontFamily, rep.bold, rep.italic);
-        const col = hexToRgb(rep.color);
-        const tw = font.widthOfTextAtSize(rep.newText, rep.fontSize);
-        const boxW = Math.max(rep.width, tw);
-        let drawX = rep.x;
-        if (rep.align === 'center') drawX = rep.x + (boxW - tw) / 2;
-        if (rep.align === 'right') drawX = rep.x + boxW - tw;
-        const baselineTop = rep.y + rep.fontSize * 0.9;
-        const txtPt = vm.mapBaselineText(drawX, baselineTop, 0);
-        page.drawText(rep.newText, {
-          x: txtPt.x,
-          y: txtPt.y,
-          size: rep.fontSize,
-          font,
-          color: col,
-          ...(txtPt.angleDeg !== 0 ? { rotate: degrees(txtPt.angleDeg) } : {}),
-        });
-        if (rep.underline && tw > 0) {
-          const u1 = vm.mapPoint(drawX, baselineTop + 2);
-          const u2 = vm.mapPoint(drawX + tw, baselineTop + 2);
-          page.drawLine({
-            start: { x: u1.x, y: u1.y },
-            end: { x: u2.x, y: u2.y },
-            thickness: Math.max(0.8, rep.fontSize * 0.07),
-            color: col,
-          });
-        }
-      }
-    }
-  }
-
-  // 2. Added text boxes (supports optional fill, border, and rotation around box center)
-  for (const tb of edits.addedTexts) {
-    const page = pages[tb.pageNumber - 1];
-    if (!page || !tb.text.trim()) continue;
-    const vm = makeVisualMapper(page);
-    const boxW = Math.max(80, tb.width || 260);
-    const rotCw = tb.rotation || 0;
-
-    if (
-      hasNonWinAnsiChars(tb.text) ||
-      (tb.letterSpacing || 0) !== 0 ||
-      isCustomDesktopFont(tb.fontFamily)
-    ) {
-      const rendered = await renderUnicodeTextPng({
-        text: tb.text,
-        fontSize: tb.fontSize,
-        fontFamily: tb.fontFamily,
-        color: tb.color,
-        bold: tb.bold,
-        italic: tb.italic,
-        underline: tb.underline,
-        align: tb.align,
-        letterSpacing: tb.letterSpacing,
-        maxWidth: boxW,
-      });
-      const drawW = Math.max(boxW, rendered.widthPt);
-      const drawH = rendered.heightPt + 6;
-
-      if ((tb.backgroundColor && tb.backgroundColor !== 'transparent') || tb.borderColor) {
-        const bgPt = vm.mapRect(tb.x, tb.y, drawW, drawH, rotCw);
-        page.drawRectangle({
-          x: bgPt.x,
-          y: bgPt.y,
-          width: drawW,
-          height: drawH,
-          ...(tb.backgroundColor && tb.backgroundColor !== 'transparent'
-            ? { color: hexToRgb(tb.backgroundColor), opacity: 0.96 }
-            : {}),
-          ...(tb.borderColor
-            ? { borderColor: hexToRgb(tb.borderColor), borderWidth: 1 }
-            : {}),
-          ...(bgPt.angleDeg !== 0 ? { rotate: degrees(bgPt.angleDeg) } : {}),
-        });
-      }
-
-      const img = await doc.embedPng(rendered.pngBytes);
-      const centerX = tb.x + drawW / 2;
-      const centerYTop = tb.y + drawH / 2;
-      const imgPt = vm.mapRect(
-        centerX - rendered.widthPt / 2,
-        centerYTop - rendered.heightPt / 2,
-        rendered.widthPt,
-        rendered.heightPt,
-        rotCw
-      );
-      page.drawImage(img, {
-        x: imgPt.x,
-        y: imgPt.y,
-        width: rendered.widthPt,
-        height: rendered.heightPt,
-        ...(imgPt.angleDeg !== 0 ? { rotate: degrees(imgPt.angleDeg) } : {}),
-      });
-    } else {
-      // Emit genuine editable vector PDF text for WinAnsi added text boxes (even multiline/aligned/underlined/rotated)
-      const font = pickStandardFont(tb.fontFamily, tb.bold, tb.italic);
-      const col = hexToRgb(tb.color);
-      const lineStep = tb.fontSize * 1.32;
-      const outLines: string[] = [];
-
-      for (const rawLine of tb.text.split('\n')) {
-        if (!rawLine.trim()) {
-          outLines.push('');
-          continue;
-        }
-        const words = rawLine.split(/\s+/);
-        let cur = '';
-        for (const w of words) {
-          const test = cur ? `${cur} ${w}` : w;
-          if (font.widthOfTextAtSize(test, tb.fontSize) > boxW - 8 && cur) {
-            outLines.push(cur);
-            cur = w;
-          } else {
-            cur = test;
-          }
-        }
-        if (cur) outLines.push(cur);
-      }
-
-      const boxH = Math.max(tb.fontSize * 1.5 + 6, outLines.length * lineStep + 8);
-      const centerX = tb.x + boxW / 2;
-      const centerYTop = tb.y + boxH / 2;
-
-      if ((tb.backgroundColor && tb.backgroundColor !== 'transparent') || tb.borderColor) {
-        const bgPt = vm.mapRect(tb.x, tb.y, boxW, boxH, rotCw);
-        page.drawRectangle({
-          x: bgPt.x,
-          y: bgPt.y,
-          width: boxW,
-          height: boxH,
-          ...(tb.backgroundColor && tb.backgroundColor !== 'transparent'
-            ? { color: hexToRgb(tb.backgroundColor), opacity: 0.96 }
-            : {}),
-          ...(tb.borderColor
-            ? { borderColor: hexToRgb(tb.borderColor), borderWidth: 1 }
-            : {}),
-          ...(bgPt.angleDeg !== 0 ? { rotate: degrees(bgPt.angleDeg) } : {}),
-        });
-      }
-
-      const vRad = (rotCw * Math.PI) / 180;
-      const rotScreenPt = (px: number, py: number) =>
-        rotCw === 0
-          ? { x: px, y: py }
-          : {
-              x: centerX + (px - centerX) * Math.cos(vRad) - (py - centerYTop) * Math.sin(vRad),
-              y: centerYTop + (px - centerX) * Math.sin(vRad) + (py - centerYTop) * Math.cos(vRad),
-            };
-
-      outLines.forEach((line, idx) => {
-        if (!line) return;
-        const tw = font.widthOfTextAtSize(line, tb.fontSize);
-        let drawX = tb.x + 4;
-        if (tb.align === 'center') drawX = tb.x + Math.max(4, (boxW - tw) / 2);
-        if (tb.align === 'right') drawX = tb.x + Math.max(4, boxW - tw - 4);
-        const baselineTop = tb.y + tb.fontSize + 3 + idx * lineStep;
-        const txtPt = vm.mapBaselineText(drawX, baselineTop, rotCw, centerX, centerYTop);
-        page.drawText(line, {
-          x: txtPt.x,
-          y: txtPt.y,
-          size: tb.fontSize,
-          font,
-          color: col,
-          ...(txtPt.angleDeg !== 0 ? { rotate: degrees(txtPt.angleDeg) } : {}),
-        });
-        if (tb.underline && tw > 0) {
-          const s1 = rotScreenPt(drawX, baselineTop + 2);
-          const s2 = rotScreenPt(drawX + tw, baselineTop + 2);
-          const u1 = vm.mapPoint(s1.x, s1.y);
-          const u2 = vm.mapPoint(s2.x, s2.y);
-          page.drawLine({
-            start: { x: u1.x, y: u1.y },
-            end: { x: u2.x, y: u2.y },
-            thickness: Math.max(0.8, tb.fontSize * 0.07),
-            color: col,
-          });
-        }
-      });
-    }
-  }
-
   const bakeAdjustedImageDataUrl = async (imgOv: AddedImageOverlay): Promise<string> => {
     const flipX = Boolean(imgOv.flipX);
     const flipY = Boolean(imgOv.flipY);
@@ -1410,14 +1183,239 @@ export async function applyPdfEditsToBytes(
     return c.toDataURL('image/png');
   };
 
-  // 3. Added images (rotate around center to match editor canvas preview + baked filters/flips/frames)
-  for (const imgOv of edits.addedImages) {
-    const page = pages[imgOv.pageNumber - 1];
-    if (!page) continue;
+  type PageRef = ReturnType<PDFDocument['getPages']>[number];
+  type VisualMapper = ReturnType<typeof makeVisualMapper>;
+
+  const renderReplacement = async (page: PageRef, vm: VisualMapper, rep: TextReplacementEdit) => {
+    const maskPt = vm.mapRect(
+      Math.max(0, rep.x - 1.5),
+      Math.max(0, rep.y - 1.5),
+      rep.width + 4,
+      rep.height + 4,
+      0
+    );
+    page.drawRectangle({
+      x: maskPt.x,
+      y: maskPt.y,
+      width: rep.width + 4,
+      height: rep.height + 4,
+      color: rep.backgroundColor ? hexToRgb(rep.backgroundColor) : rgb(1, 1, 1),
+      ...(maskPt.angleDeg !== 0 ? { rotate: degrees(maskPt.angleDeg) } : {}),
+    });
+
+    if (!rep.deleted && rep.newText.trim()) {
+      if (
+        hasNonWinAnsiChars(rep.newText) ||
+        (rep.letterSpacing || 0) !== 0 ||
+        rep.newText.includes('\n') ||
+        isCustomDesktopFont(rep.fontFamily)
+      ) {
+        const availableW = rep.newText.includes('\n')
+          ? Math.max(rep.width + 24, 320)
+          : Math.max(rep.width + 40, vm.visW - rep.x - 12);
+        const rendered = await renderUnicodeTextPng({
+          text: rep.newText,
+          fontSize: rep.fontSize,
+          fontFamily: rep.fontFamily,
+          color: rep.color,
+          bold: rep.bold,
+          italic: rep.italic,
+          underline: rep.underline,
+          align: rep.align,
+          letterSpacing: rep.letterSpacing,
+          maxWidth: availableW,
+        });
+        const img = await doc.embedPng(rendered.pngBytes);
+        const imgPt = vm.mapRect(rep.x, rep.y, rendered.widthPt, rendered.heightPt, 0);
+        page.drawImage(img, {
+          x: imgPt.x,
+          y: imgPt.y,
+          width: rendered.widthPt,
+          height: rendered.heightPt,
+          ...(imgPt.angleDeg !== 0 ? { rotate: degrees(imgPt.angleDeg) } : {}),
+        });
+      } else {
+        const font = pickStandardFont(rep.fontFamily, rep.bold, rep.italic);
+        const col = hexToRgb(rep.color);
+        const tw = font.widthOfTextAtSize(rep.newText, rep.fontSize);
+        const boxW = Math.max(rep.width, tw);
+        let drawX = rep.x;
+        if (rep.align === 'center') drawX = rep.x + (boxW - tw) / 2;
+        if (rep.align === 'right') drawX = rep.x + boxW - tw;
+        const baselineTop = rep.y + rep.fontSize * 0.9;
+        const txtPt = vm.mapBaselineText(drawX, baselineTop, 0);
+        page.drawText(rep.newText, {
+          x: txtPt.x,
+          y: txtPt.y,
+          size: rep.fontSize,
+          font,
+          color: col,
+          ...(txtPt.angleDeg !== 0 ? { rotate: degrees(txtPt.angleDeg) } : {}),
+        });
+        if (rep.underline && tw > 0) {
+          const u1 = vm.mapPoint(drawX, baselineTop + 2);
+          const u2 = vm.mapPoint(drawX + tw, baselineTop + 2);
+          page.drawLine({
+            start: { x: u1.x, y: u1.y },
+            end: { x: u2.x, y: u2.y },
+            thickness: Math.max(0.8, rep.fontSize * 0.07),
+            color: col,
+          });
+        }
+      }
+    }
+  };
+
+  const renderTextBox = async (page: PageRef, vm: VisualMapper, tb: AddedTextBox) => {
+    if (!tb.text.trim()) return;
+    const boxW = Math.max(80, tb.width || 260);
+    const rotCw = tb.rotation || 0;
+
+    if (
+      hasNonWinAnsiChars(tb.text) ||
+      (tb.letterSpacing || 0) !== 0 ||
+      isCustomDesktopFont(tb.fontFamily)
+    ) {
+      const rendered = await renderUnicodeTextPng({
+        text: tb.text,
+        fontSize: tb.fontSize,
+        fontFamily: tb.fontFamily,
+        color: tb.color,
+        bold: tb.bold,
+        italic: tb.italic,
+        underline: tb.underline,
+        align: tb.align,
+        letterSpacing: tb.letterSpacing,
+        maxWidth: boxW,
+      });
+      const drawW = Math.max(boxW, rendered.widthPt);
+      const drawH = rendered.heightPt + 6;
+
+      if ((tb.backgroundColor && tb.backgroundColor !== 'transparent') || tb.borderColor) {
+        const bgPt = vm.mapRect(tb.x, tb.y, drawW, drawH, rotCw);
+        page.drawRectangle({
+          x: bgPt.x,
+          y: bgPt.y,
+          width: drawW,
+          height: drawH,
+          ...(tb.backgroundColor && tb.backgroundColor !== 'transparent'
+            ? { color: hexToRgb(tb.backgroundColor), opacity: 0.96 }
+            : {}),
+          ...(tb.borderColor
+            ? { borderColor: hexToRgb(tb.borderColor), borderWidth: 1 }
+            : {}),
+          ...(bgPt.angleDeg !== 0 ? { rotate: degrees(bgPt.angleDeg) } : {}),
+        });
+      }
+
+      const img = await doc.embedPng(rendered.pngBytes);
+      const centerX = tb.x + drawW / 2;
+      const centerYTop = tb.y + drawH / 2;
+      const imgPt = vm.mapRect(
+        centerX - rendered.widthPt / 2,
+        centerYTop - rendered.heightPt / 2,
+        rendered.widthPt,
+        rendered.heightPt,
+        rotCw
+      );
+      page.drawImage(img, {
+        x: imgPt.x,
+        y: imgPt.y,
+        width: rendered.widthPt,
+        height: rendered.heightPt,
+        ...(imgPt.angleDeg !== 0 ? { rotate: degrees(imgPt.angleDeg) } : {}),
+      });
+    } else {
+      const font = pickStandardFont(tb.fontFamily, tb.bold, tb.italic);
+      const col = hexToRgb(tb.color);
+      const lineStep = tb.fontSize * 1.32;
+      const outLines: string[] = [];
+
+      for (const rawLine of tb.text.split('\n')) {
+        if (!rawLine.trim()) {
+          outLines.push('');
+          continue;
+        }
+        const words = rawLine.split(/\s+/);
+        let cur = '';
+        for (const w of words) {
+          const test = cur ? `${cur} ${w}` : w;
+          if (font.widthOfTextAtSize(test, tb.fontSize) > boxW - 8 && cur) {
+            outLines.push(cur);
+            cur = w;
+          } else {
+            cur = test;
+          }
+        }
+        if (cur) outLines.push(cur);
+      }
+
+      const boxH = Math.max(tb.fontSize * 1.5 + 6, outLines.length * lineStep + 8);
+      const centerX = tb.x + boxW / 2;
+      const centerYTop = tb.y + boxH / 2;
+
+      if ((tb.backgroundColor && tb.backgroundColor !== 'transparent') || tb.borderColor) {
+        const bgPt = vm.mapRect(tb.x, tb.y, boxW, boxH, rotCw);
+        page.drawRectangle({
+          x: bgPt.x,
+          y: bgPt.y,
+          width: boxW,
+          height: boxH,
+          ...(tb.backgroundColor && tb.backgroundColor !== 'transparent'
+            ? { color: hexToRgb(tb.backgroundColor), opacity: 0.96 }
+            : {}),
+          ...(tb.borderColor
+            ? { borderColor: hexToRgb(tb.borderColor), borderWidth: 1 }
+            : {}),
+          ...(bgPt.angleDeg !== 0 ? { rotate: degrees(bgPt.angleDeg) } : {}),
+        });
+      }
+
+      const vRad = (rotCw * Math.PI) / 180;
+      const rotScreenPt = (px: number, py: number) =>
+        rotCw === 0
+          ? { x: px, y: py }
+          : {
+              x: centerX + (px - centerX) * Math.cos(vRad) - (py - centerYTop) * Math.sin(vRad),
+              y: centerYTop + (px - centerX) * Math.sin(vRad) + (py - centerYTop) * Math.cos(vRad),
+            };
+
+      outLines.forEach((line, idx) => {
+        if (!line) return;
+        const tw = font.widthOfTextAtSize(line, tb.fontSize);
+        let drawX = tb.x + 4;
+        if (tb.align === 'center') drawX = tb.x + Math.max(4, (boxW - tw) / 2);
+        if (tb.align === 'right') drawX = tb.x + Math.max(4, boxW - tw - 4);
+        const baselineTop = tb.y + tb.fontSize + 3 + idx * lineStep;
+        const txtPt = vm.mapBaselineText(drawX, baselineTop, rotCw, centerX, centerYTop);
+        page.drawText(line, {
+          x: txtPt.x,
+          y: txtPt.y,
+          size: tb.fontSize,
+          font,
+          color: col,
+          ...(txtPt.angleDeg !== 0 ? { rotate: degrees(txtPt.angleDeg) } : {}),
+        });
+        if (tb.underline && tw > 0) {
+          const s1 = rotScreenPt(drawX, baselineTop + 2);
+          const s2 = rotScreenPt(drawX + tw, baselineTop + 2);
+          const u1 = vm.mapPoint(s1.x, s1.y);
+          const u2 = vm.mapPoint(s2.x, s2.y);
+          page.drawLine({
+            start: { x: u1.x, y: u1.y },
+            end: { x: u2.x, y: u2.y },
+            thickness: Math.max(0.8, tb.fontSize * 0.07),
+            color: col,
+          });
+        }
+      });
+    }
+  };
+
+  const renderImageOverlay = async (page: PageRef, vm: VisualMapper, imgOv: AddedImageOverlay) => {
     const processedUrl = await bakeAdjustedImageDataUrl(imgOv);
     const embedded = await embedDataUrlImage(processedUrl);
-    if (!embedded) continue;
-    const vm = makeVisualMapper(page);
+    if (!embedded) return;
     const imgPt = vm.mapRect(imgOv.x, imgOv.y, imgOv.width, imgOv.height, imgOv.rotation || 0);
     page.drawImage(embedded, {
       x: imgPt.x,
@@ -1427,13 +1425,9 @@ export async function applyPdfEditsToBytes(
       opacity: imgOv.opacity ?? 1,
       ...(imgPt.angleDeg !== 0 ? { rotate: degrees(imgPt.angleDeg) } : {}),
     });
-  }
+  };
 
-  // 4. Annotations, drawings, shapes, sticky notes, stamps, signatures
-  for (const ann of edits.annotations) {
-    const page = pages[ann.pageNumber - 1];
-    if (!page) continue;
-    const vm = makeVisualMapper(page);
+  const renderAnnotationOverlay = async (page: PageRef, vm: VisualMapper, ann: AnnotationOverlay) => {
     const color = hexToRgb(ann.color || '#2563EB');
 
     if (ann.kind === 'highlight') {
@@ -1828,6 +1822,91 @@ export async function applyPdfEditsToBytes(
           }
         }
       }
+    }
+  };
+
+  type UnifiedRenderItem =
+    | { kind: 'textBox'; z: number; order: number; behind: boolean; item: AddedTextBox }
+    | { kind: 'image'; z: number; order: number; behind: boolean; item: AddedImageOverlay }
+    | { kind: 'annotation'; z: number; order: number; behind: boolean; item: AnnotationOverlay };
+
+  const pages = doc.getPages();
+  for (let pIdx = 0; pIdx < pages.length; pIdx++) {
+    const pageNum = pIdx + 1;
+    const page = pages[pIdx];
+    const vm = makeVisualMapper(page);
+
+    const pageReps = edits.replacements.filter((r) => r.pageNumber === pageNum);
+    const items: UnifiedRenderItem[] = [];
+    edits.addedTexts.forEach((tb, i) => {
+      if (tb.pageNumber === pageNum) {
+        items.push({
+          kind: 'textBox',
+          z: tb.zIndex ?? 1000 + i,
+          order: i,
+          behind: tb.layerPlacement === 'behind',
+          item: tb,
+        });
+      }
+    });
+    edits.addedImages.forEach((im, i) => {
+      if (im.pageNumber === pageNum) {
+        items.push({
+          kind: 'image',
+          z: im.zIndex ?? 2000 + i,
+          order: 100000 + i,
+          behind: im.layerPlacement === 'behind',
+          item: im,
+        });
+      }
+    });
+    edits.annotations.forEach((an, i) => {
+      if (an.pageNumber === pageNum) {
+        items.push({
+          kind: 'annotation',
+          z: an.zIndex ?? 3000 + i,
+          order: 200000 + i,
+          behind: an.layerPlacement === 'behind',
+          item: an,
+        });
+      }
+    });
+
+    items.sort((a, b) => a.z - b.z || a.order - b.order);
+    const behindItems = items.filter((it) => it.behind);
+    const frontItems = items.filter((it) => !it.behind);
+
+    if (behindItems.length > 0) {
+      page.node.normalize();
+      const origContents = page.node.Contents();
+      const origLen = origContents instanceof PDFArray ? origContents.size() : 0;
+
+      for (const entry of behindItems) {
+        if (entry.kind === 'textBox') await renderTextBox(page, vm, entry.item);
+        else if (entry.kind === 'image') await renderImageOverlay(page, vm, entry.item);
+        else await renderAnnotationOverlay(page, vm, entry.item);
+      }
+
+      const afterContents = page.node.Contents();
+      if (afterContents instanceof PDFArray && afterContents.size() > origLen && origLen > 0) {
+        const behindStreamRef = afterContents.get(afterContents.size() - 1);
+        afterContents.remove(afterContents.size() - 1);
+        afterContents.insert(0, behindStreamRef);
+        // Wrap original content streams in q/Q so CTM resets cleanly before front overlays
+        afterContents.insert(1, doc.context.getPushGraphicsStateContentStream());
+        afterContents.push(doc.context.getPopGraphicsStateContentStream());
+      }
+      page.resetPosition();
+    }
+
+    for (const rep of pageReps) {
+      await renderReplacement(page, vm, rep);
+    }
+
+    for (const entry of frontItems) {
+      if (entry.kind === 'textBox') await renderTextBox(page, vm, entry.item);
+      else if (entry.kind === 'image') await renderImageOverlay(page, vm, entry.item);
+      else await renderAnnotationOverlay(page, vm, entry.item);
     }
   }
 
