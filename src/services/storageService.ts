@@ -30,7 +30,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   defaultPageSize: 'A4',
   defaultFont: 'DM Sans',
   scannerAutoCrop: true,
-  scannerDefaultFilter: 'magic',
+  scannerDefaultFilter: 'docPro',
   exportQuality: 'high',
   localOnlyMode: false,
 };

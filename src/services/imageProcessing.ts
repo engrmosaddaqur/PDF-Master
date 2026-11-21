@@ -1,13 +1,35 @@
-import { PDFDocument } from 'pdf-lib';
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
 
 export interface Point2D {
   x: number; // normalized 0..1
   y: number; // normalized 0..1
 }
 
-export type ScanFilter = 'color' | 'magic' | 'grayscale' | 'bw';
+export type ScanFilter = 'docPro' | 'color' | 'magic' | 'grayscale' | 'bw';
 
 export type EdgeSensitivity = 'standard' | 'high' | 'max';
+
+export type ScanResolutionTier = 'standard' | 'high' | 'ultra';
+
+export type ScanPaperSize = 'fit' | 'a4' | 'letter' | 'legal';
+
+export type ScanMarginSize = 'none' | 'narrow' | 'standard';
+
+export type ScanOrientation = 'auto' | 'portrait' | 'landscape';
+
+export interface ScanCompileOptions {
+  paperSize?: ScanPaperSize;
+  margin?: ScanMarginSize;
+  orientation?: ScanOrientation;
+  addPageNumbers?: boolean;
+  title?: string;
+}
+
+export function getResolutionMaxDim(tier: ScanResolutionTier): number {
+  if (tier === 'standard') return 1600;
+  if (tier === 'high') return 2480;
+  return 3508; // 300 DPI A4 print resolution
+}
 
 export interface DocumentBoundsResult {
   corners: [Point2D, Point2D, Point2D, Point2D];
@@ -419,11 +441,16 @@ function solveHomography(
 }
 
 /**
- * Warps a 4-corner quadrilateral from sourceCanvas into a straightened rectangular document canvas.
+ * Warps a 4-corner quadrilateral from sourceCanvas into a straightened rectangular document canvas
+ * with configurable output resolution (up to 3508px / 300 DPI A4).
  */
 export function perspectiveWarpCanvas(
   sourceCanvas: HTMLCanvasElement,
-  corners: [Point2D, Point2D, Point2D, Point2D]
+  corners: [Point2D, Point2D, Point2D, Point2D],
+  options?: {
+    maxDim?: number;
+    allowUpscale?: boolean;
+  }
 ): HTMLCanvasElement {
   const sw = sourceCanvas.width;
   const sh = sourceCanvas.height;
@@ -436,14 +463,22 @@ export function perspectiveWarpCanvas(
 
   let outW = Math.round(Math.max(topW, botW));
   let outH = Math.round(Math.max(leftH, rightH));
-  const maxDim = 1360;
+  const nativeMax = Math.max(outW, outH);
+  const maxDim = options?.maxDim ?? 2480;
+
   if (outW > maxDim || outH > maxDim) {
-    const scale = maxDim / Math.max(outW, outH);
+    const scale = maxDim / nativeMax;
     outW = Math.round(outW * scale);
     outH = Math.round(outH * scale);
+  } else if (options?.allowUpscale && nativeMax >= 640 && nativeMax < maxDim) {
+    // Allow clean up-to-1.5x super-sampling toward requested target DPI without soft over-stretching
+    const upScale = Math.min(1.5, maxDim / nativeMax);
+    outW = Math.round(outW * upScale);
+    outH = Math.round(outH * upScale);
   }
-  outW = Math.max(200, outW);
-  outH = Math.max(200, outH);
+
+  outW = Math.max(240, outW);
+  outH = Math.max(240, outH);
 
   const dstPts: Array<[number, number]> = [
     [0, 0],
@@ -513,8 +548,127 @@ export function perspectiveWarpCanvas(
 }
 
 /**
- * Applies professional document enhancement filters (Magic Color, Grayscale, B&W Adaptive Threshold,
- * Shadow Reduction, Brightness/Contrast, and optional Sharpening).
+ * Estimates the smooth paper illumination surface (shadows, lamp glare, ambient tint)
+ * using downsampled morphological local-max envelope + 2-pass separable box smoothing.
+ * Dividing pixels by this surface eliminates hand/phone shadows while preserving ink & color.
+ */
+function estimatePaperIlluminationMap(
+  data: Uint8ClampedArray,
+  w: number,
+  h: number
+): { bw: number; bh: number; bgR: Float32Array; bgG: Float32Array; bgB: Float32Array } {
+  const bw = Math.min(160, Math.max(48, Math.round(w / 10)));
+  const bh = Math.min(220, Math.max(48, Math.round((h / Math.max(1, w)) * bw)));
+  const len = bw * bh;
+
+  const r0 = new Float32Array(len);
+  const g0 = new Float32Array(len);
+  const b0 = new Float32Array(len);
+
+  for (let by = 0; by < bh; by++) {
+    const sy = Math.min(h - 1, Math.round((by / Math.max(1, bh - 1)) * (h - 1)));
+    const rowOff = sy * w;
+    for (let bx = 0; bx < bw; bx++) {
+      const sx = Math.min(w - 1, Math.round((bx / Math.max(1, bw - 1)) * (w - 1)));
+      const idx = (rowOff + sx) * 4;
+      const bi = by * bw + bx;
+      r0[bi] = data[idx];
+      g0[bi] = data[idx + 1];
+      b0[bi] = data[idx + 2];
+    }
+  }
+
+  // Separable local-maximum dilation (radius 8 on ~160px grid spans ~10% page width)
+  const rMax = 8;
+  const maxTempR = new Float32Array(len);
+  const maxTempG = new Float32Array(len);
+  const maxTempB = new Float32Array(len);
+  const maxOutR = new Float32Array(len);
+  const maxOutG = new Float32Array(len);
+  const maxOutB = new Float32Array(len);
+
+  for (let y = 0; y < bh; y++) {
+    const row = y * bw;
+    for (let x = 0; x < bw; x++) {
+      const xStart = Math.max(0, x - rMax);
+      const xEnd = Math.min(bw - 1, x + rMax);
+      let mr = 0, mg = 0, mb = 0;
+      for (let xx = xStart; xx <= xEnd; xx++) {
+        const i = row + xx;
+        if (r0[i] > mr) mr = r0[i];
+        if (g0[i] > mg) mg = g0[i];
+        if (b0[i] > mb) mb = b0[i];
+      }
+      maxTempR[row + x] = mr;
+      maxTempG[row + x] = mg;
+      maxTempB[row + x] = mb;
+    }
+  }
+
+  for (let y = 0; y < bh; y++) {
+    const yStart = Math.max(0, y - rMax);
+    const yEnd = Math.min(bh - 1, y + rMax);
+    for (let x = 0; x < bw; x++) {
+      let mr = 0, mg = 0, mb = 0;
+      for (let yy = yStart; yy <= yEnd; yy++) {
+        const i = yy * bw + x;
+        if (maxTempR[i] > mr) mr = maxTempR[i];
+        if (maxTempG[i] > mg) mg = maxTempG[i];
+        if (maxTempB[i] > mb) mb = maxTempB[i];
+      }
+      const o = y * bw + x;
+      maxOutR[o] = mr;
+      maxOutG[o] = mg;
+      maxOutB[o] = mb;
+    }
+  }
+
+  // Smooth the dilated paper surface with 2 separable box-blur passes
+  const rBlur = 6;
+  const smoothPass = (src: Float32Array, dst: Float32Array) => {
+    const tmp = new Float32Array(len);
+    for (let y = 0; y < bh; y++) {
+      const row = y * bw;
+      for (let x = 0; x < bw; x++) {
+        const x1 = Math.max(0, x - rBlur);
+        const x2 = Math.min(bw - 1, x + rBlur);
+        let sum = 0;
+        for (let xx = x1; xx <= x2; xx++) sum += src[row + xx];
+        tmp[row + x] = sum / (x2 - x1 + 1);
+      }
+    }
+    for (let y = 0; y < bh; y++) {
+      const y1 = Math.max(0, y - rBlur);
+      const y2 = Math.min(bh - 1, y + rBlur);
+      const cnt = y2 - y1 + 1;
+      for (let x = 0; x < bw; x++) {
+        let sum = 0;
+        for (let yy = y1; yy <= y2; yy++) sum += tmp[yy * bw + x];
+        dst[y * bw + x] = sum / cnt;
+      }
+    }
+  };
+
+  const pass1R = new Float32Array(len);
+  const pass1G = new Float32Array(len);
+  const pass1B = new Float32Array(len);
+  const bgR = new Float32Array(len);
+  const bgG = new Float32Array(len);
+  const bgB = new Float32Array(len);
+
+  smoothPass(maxOutR, pass1R);
+  smoothPass(maxOutG, pass1G);
+  smoothPass(maxOutB, pass1B);
+  smoothPass(pass1R, bgR);
+  smoothPass(pass1G, bgG);
+  smoothPass(pass1B, bgB);
+
+  return { bw, bh, bgR, bgG, bgB };
+}
+
+/**
+ * Applies studio document enhancement: illumination/shadow normalization, crisp text contrast,
+ * soft white-paper balance, anti-aliased B&W thresholding, and thresholded unsharp masking.
  */
 export function applyScanEnhancement(
   sourceCanvas: HTMLCanvasElement,
@@ -522,8 +676,11 @@ export function applyScanEnhancement(
     filter: ScanFilter;
     brightness: number; // -50 .. +50
     contrast: number; // -50 .. +50
+    shadowClean?: number; // 0 .. 100
     sharpen: boolean;
     rotation: number; // 0, 90, 180, 270
+    outputFormat?: 'jpeg' | 'png';
+    jpegQuality?: number;
   }
 ): string {
   const rot = ((opts.rotation % 360) + 360) % 360;
@@ -543,10 +700,73 @@ export function applyScanEnhancement(
 
   const img = ctx.getImageData(0, 0, w, h);
   const data = img.data;
+
+  const defaultShadow =
+    opts.filter === 'docPro'
+      ? 85
+      : opts.filter === 'magic'
+      ? 75
+      : opts.filter === 'bw'
+      ? 65
+      : opts.filter === 'grayscale'
+      ? 50
+      : 10;
+  const shadowStrength = Math.max(0, Math.min(1, (opts.shadowClean ?? defaultShadow) / 100));
+
+  // Illumination surface normalization removes uneven lighting & phone shadows
+  if (shadowStrength > 0.01) {
+    const { bw, bh, bgR, bgG, bgB } = estimatePaperIlluminationMap(data, w, h);
+    const scaleX = (bw - 1) / Math.max(1, w - 1);
+    const scaleY = (bh - 1) / Math.max(1, h - 1);
+
+    for (let y = 0; y < h; y++) {
+      const fy = y * scaleY;
+      const y0 = Math.min(bh - 2, fy | 0);
+      const wy = fy - y0;
+      const wy0 = 1 - wy;
+      const row0 = y0 * bw;
+      const row1 = row0 + bw;
+
+      for (let x = 0; x < w; x++) {
+        const fx = x * scaleX;
+        const x0 = Math.min(bw - 2, fx | 0);
+        const wx = fx - x0;
+        const wx0 = 1 - wx;
+
+        const w00 = wx0 * wy0;
+        const w10 = wx * wy0;
+        const w01 = wx0 * wy;
+        const w11 = wx * wy;
+
+        const i00 = row0 + x0;
+        const i10 = i00 + 1;
+        const i01 = row1 + x0;
+        const i11 = i01 + 1;
+
+        const lr = Math.max(48, bgR[i00] * w00 + bgR[i10] * w10 + bgR[i01] * w01 + bgR[i11] * w11);
+        const lg = Math.max(48, bgG[i00] * w00 + bgG[i10] * w10 + bgG[i01] * w01 + bgG[i11] * w11);
+        const lb = Math.max(48, bgB[i00] * w00 + bgB[i10] * w10 + bgB[i01] * w01 + bgB[i11] * w11);
+
+        const idx = (y * w + x) * 4;
+        const r = data[idx];
+        const g = data[idx + 1];
+        const b = data[idx + 2];
+
+        const nr = Math.min(255, (r / lr) * 252);
+        const ng = Math.min(255, (g / lg) * 252);
+        const nb = Math.min(255, (b / lb) * 252);
+
+        data[idx] = r + (nr - r) * shadowStrength;
+        data[idx + 1] = g + (ng - g) * shadowStrength;
+        data[idx + 2] = b + (nb - b) * shadowStrength;
+      }
+    }
+  }
+
   const contrastFactor = (259 * (opts.contrast + 255)) / (255 * (259 - opts.contrast));
 
   if (opts.filter === 'bw') {
-    // Adaptive integral-image local thresholding for shadow-free crisp B&W scan
+    // Anti-aliased adaptive integral-image local thresholding for razor-sharp, shadow-free B&W documents
     const gray = new Uint8ClampedArray(w * h);
     for (let i = 0; i < w * h; i++) {
       const idx = i * 4;
@@ -564,8 +784,9 @@ export function applyScanEnhancement(
       }
     }
 
-    const radius = Math.max(10, Math.round(Math.min(w, h) * 0.025));
-    const t = 0.12;
+    const radius = Math.max(12, Math.round(Math.min(w, h) * 0.024));
+    const t = 0.11;
+    const softBand = 16;
     for (let y = 0; y < h; y++) {
       const y1 = Math.max(0, y - radius);
       const y2 = Math.min(h - 1, y + radius);
@@ -579,7 +800,19 @@ export function applyScanEnhancement(
           integral[(y2 + 1) * (w + 1) + x1] +
           integral[y1 * (w + 1) + x1];
         const mean = sum / count;
-        const val = gray[y * w + x] < mean * (1 - t) ? 18 : 255;
+        const thresh = mean * (1 - t);
+        const lum = gray[y * w + x];
+
+        let val: number;
+        if (lum >= thresh + softBand * 0.5) {
+          val = 255;
+        } else if (lum <= thresh - softBand * 0.5) {
+          val = 14;
+        } else {
+          const u = (lum - (thresh - softBand * 0.5)) / softBand;
+          val = Math.round(14 + u * u * (3 - 2 * u) * (255 - 14));
+        }
+
         const idx = (y * w + x) * 4;
         data[idx] = val;
         data[idx + 1] = val;
@@ -592,14 +825,28 @@ export function applyScanEnhancement(
       let g = data[i + 1];
       let b = data[i + 2];
 
-      if (opts.filter === 'magic') {
-        // White paper background lift & shadow reduction + crisp text contrast
-        r = Math.min(255, r * 1.12 + 16);
-        g = Math.min(255, g * 1.12 + 16);
-        b = Math.min(255, b * 1.12 + 16);
-        r = 1.25 * (r - 128) + 128;
-        g = 1.25 * (g - 128) + 128;
-        b = 1.25 * (b - 128) + 128;
+      if (opts.filter === 'docPro') {
+        // Snap bright paper highlights softly to pure white & deepen ink strokes cleanly
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        if (lum > 224) {
+          const lift = Math.min(1, (lum - 224) / 22);
+          r = r + (255 - r) * lift;
+          g = g + (255 - g) * lift;
+          b = b + (255 - b) * lift;
+        } else {
+          r = 1.18 * (r - 128) + 122;
+          g = 1.18 * (g - 128) + 122;
+          b = 1.18 * (b - 128) + 122;
+        }
+      } else if (opts.filter === 'magic') {
+        // Vivid document contrast + rich colors for stamps, receipts & charts
+        r = 1.24 * (r - 128) + 132;
+        g = 1.24 * (g - 128) + 132;
+        b = 1.24 * (b - 128) + 132;
+        const lum = 0.299 * r + 0.587 * g + 0.114 * b;
+        r = lum + (r - lum) * 1.15;
+        g = lum + (g - lum) * 1.15;
+        b = lum + (b - lum) * 1.15;
       }
 
       r = contrastFactor * (r - 128) + 128 + opts.brightness;
@@ -608,7 +855,7 @@ export function applyScanEnhancement(
 
       if (opts.filter === 'grayscale') {
         const lum = 0.299 * r + 0.587 * g + 0.114 * b;
-        r = g = b = lum;
+        r = g = b = lum > 226 ? 255 : lum;
       }
 
       data[i] = Math.max(0, Math.min(255, r));
@@ -618,43 +865,166 @@ export function applyScanEnhancement(
   }
 
   if (opts.sharpen) {
+    // Edge-thresholded Gaussian Unsharp Mask: sharpens text strokes without amplifying blank-paper grain
     const copy = new Uint8ClampedArray(data);
+    const amount = opts.filter === 'bw' ? 0.5 : 0.72;
+    const edgeThresh = 6;
+    const rowStride = w * 4;
     for (let y = 1; y < h - 1; y++) {
+      const yOff = y * rowStride;
+      const ymOff = yOff - rowStride;
+      const ypOff = yOff + rowStride;
       for (let x = 1; x < w - 1; x++) {
-        const idx = (y * w + x) * 4;
+        const idx = yOff + x * 4;
+        const xL = idx - 4;
+        const xR = idx + 4;
+        const ym = ymOff + x * 4;
+        const yp = ypOff + x * 4;
         for (let c = 0; c < 3; c++) {
-          const val =
-            5 * copy[idx + c] -
-            copy[((y - 1) * w + x) * 4 + c] -
-            copy[((y + 1) * w + x) * 4 + c] -
-            copy[(y * w + (x - 1)) * 4 + c] -
-            copy[(y * w + (x + 1)) * 4 + c];
-          data[idx + c] = Math.max(0, Math.min(255, val));
+          const orig = copy[idx + c];
+          const blurred =
+            (copy[ym - 4 + c] +
+              2 * copy[ym + c] +
+              copy[ym + 4 + c] +
+              2 * copy[xL + c] +
+              4 * orig +
+              2 * copy[xR + c] +
+              copy[yp - 4 + c] +
+              2 * copy[yp + c] +
+              copy[yp + 4 + c]) /
+            16;
+          const detail = orig - blurred;
+          if (detail > edgeThresh || detail < -edgeThresh) {
+            const val = orig + detail * amount;
+            data[idx + c] = val < 0 ? 0 : val > 255 ? 255 : val;
+          }
         }
       }
     }
   }
 
   ctx.putImageData(img, 0, 0);
-  return canvas.toDataURL('image/jpeg', 0.9);
+  if (opts.outputFormat === 'png') {
+    return canvas.toDataURL('image/png');
+  }
+  return canvas.toDataURL('image/jpeg', opts.jpegQuality ?? 0.95);
 }
 
-export async function compileScannedPagesToPdf(pageDataUrls: string[]): Promise<ArrayBuffer> {
+const PAPER_DIMS_PT: Record<Exclude<ScanPaperSize, 'fit'>, [number, number]> = {
+  a4: [595.28, 841.89],
+  letter: [612, 792],
+  legal: [612, 1008],
+};
+
+export function resolveScanPageDimensions(
+  imgWidth: number,
+  imgHeight: number,
+  options?: ScanCompileOptions
+): {
+  pageW: number;
+  pageH: number;
+  drawX: number;
+  drawY: number;
+  drawW: number;
+  drawH: number;
+  footerReserve: number;
+} {
+  const paperSize = options?.paperSize ?? 'fit';
+  const marginMode = options?.margin ?? 'none';
+  const orientation = options?.orientation ?? 'auto';
+  const safeImgW = Math.max(1, imgWidth);
+  const safeImgH = Math.max(1, imgHeight);
+
+  if (paperSize === 'fit') {
+    const pageW = 595.28;
+    const pageH = (safeImgH / safeImgW) * pageW;
+    return {
+      pageW,
+      pageH,
+      drawX: 0,
+      drawY: 0,
+      drawW: pageW,
+      drawH: pageH,
+      footerReserve: 0,
+    };
+  }
+
+  const [baseW, baseH] = PAPER_DIMS_PT[paperSize];
+  const isLandscape =
+    orientation === 'landscape' || (orientation === 'auto' && safeImgW > safeImgH * 1.06);
+  const pageW = isLandscape ? baseH : baseW;
+  const pageH = isLandscape ? baseW : baseH;
+  const marginPt = marginMode === 'standard' ? 38 : marginMode === 'narrow' ? 20 : 0;
+  const footerReserve = options?.addPageNumbers ? 20 : 0;
+
+  const availW = Math.max(40, pageW - marginPt * 2);
+  const availH = Math.max(40, pageH - marginPt * 2 - footerReserve);
+  const scale = Math.min(availW / safeImgW, availH / safeImgH);
+  const drawW = safeImgW * scale;
+  const drawH = safeImgH * scale;
+  const drawX = (pageW - drawW) / 2;
+  const drawY = footerReserve + marginPt + (availH - drawH) / 2;
+
+  return { pageW, pageH, drawX, drawY, drawW, drawH, footerReserve };
+}
+
+export async function compileScannedPagesToPdf(
+  pageDataUrls: string[],
+  options?: ScanCompileOptions
+): Promise<ArrayBuffer> {
   const doc = await PDFDocument.create();
-  for (const dataUrl of pageDataUrls) {
+  const totalPages = pageDataUrls.length;
+  const font = options?.addPageNumbers ? await doc.embedFont(StandardFonts.Helvetica) : null;
+
+  for (let i = 0; i < totalPages; i++) {
+    const dataUrl = pageDataUrls[i];
     const base64 = dataUrl.split(',')[1];
+    if (!base64) continue;
     const bin = atob(base64);
     const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
     const img = dataUrl.includes('image/png')
       ? await doc.embedPng(bytes)
       : await doc.embedJpg(bytes);
-    const widthPt = 595.28;
-    const heightPt = (img.height / img.width) * widthPt;
-    const page = doc.addPage([widthPt, heightPt]);
-    page.drawImage(img, { x: 0, y: 0, width: widthPt, height: heightPt });
+
+    const layout = resolveScanPageDimensions(img.width, img.height, options);
+    const page = doc.addPage([layout.pageW, layout.pageH]);
+
+    // Crisp pure white sheet background for framed paper sizes
+    if ((options?.paperSize ?? 'fit') !== 'fit') {
+      page.drawRectangle({
+        x: 0,
+        y: 0,
+        width: layout.pageW,
+        height: layout.pageH,
+        color: rgb(1, 1, 1),
+      });
+    }
+
+    page.drawImage(img, {
+      x: layout.drawX,
+      y: layout.drawY,
+      width: layout.drawW,
+      height: layout.drawH,
+    });
+
+    if (font && options?.addPageNumbers && (options.paperSize ?? 'fit') !== 'fit') {
+      const label = `${i + 1} / ${totalPages}`;
+      const textWidth = font.widthOfTextAtSize(label, 9);
+      page.drawText(label, {
+        x: (layout.pageW - textWidth) / 2,
+        y: 10,
+        size: 9,
+        font,
+        color: rgb(0.39, 0.45, 0.54),
+      });
+    }
   }
-  doc.setProducer('PDF MASTER Smart Document Scanner');
+
+  if (options?.title?.trim()) {
+    doc.setTitle(options.title.trim());
+  }
+  doc.setProducer('PDF MASTER High-Res Document Scanner');
   const out = await doc.save();
   return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
 }

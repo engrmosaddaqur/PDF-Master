@@ -25,6 +25,7 @@ import type {
   PdfFormFieldDescriptor,
   TextReplacementEdit,
 } from '../types';
+import { resolveScanPageDimensions, type ScanCompileOptions } from './imageProcessing';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerUrl;
 
@@ -2555,12 +2556,15 @@ export async function unlockPasswordProtectedPdf(
  * Generates a Searchable PDF with the scanned page image and invisible selectable OCR text overlaid.
  */
 export async function createSearchablePdfFromOcr(
-  pages: Array<{ imageDataUrl: string; ocrText: string }>
+  pages: Array<{ imageDataUrl: string; ocrText: string }>,
+  options?: ScanCompileOptions
 ): Promise<ArrayBuffer> {
   const doc = await PDFDocument.create();
   const font = await doc.embedFont(StandardFonts.Helvetica);
+  const totalPages = pages.length;
 
-  for (const p of pages) {
+  for (let pIdx = 0; pIdx < totalPages; pIdx++) {
+    const p = pages[pIdx];
     const base64 = p.imageDataUrl.split(',')[1];
     if (!base64) continue;
     const bin = atob(base64);
@@ -2570,10 +2574,18 @@ export async function createSearchablePdfFromOcr(
       ? await doc.embedPng(bytes)
       : await doc.embedJpg(bytes);
 
-    const aspect = embedded.height / Math.max(1, embedded.width);
-    const widthPt = 595.28;
-    const heightPt = widthPt * aspect;
-    const page = doc.addPage([widthPt, heightPt]);
+    const layout = resolveScanPageDimensions(embedded.width, embedded.height, options);
+    const page = doc.addPage([layout.pageW, layout.pageH]);
+
+    if ((options?.paperSize ?? 'fit') !== 'fit') {
+      page.drawRectangle({
+        x: 0,
+        y: 0,
+        width: layout.pageW,
+        height: layout.pageH,
+        color: rgb(1, 1, 1),
+      });
+    }
 
     // Filter to characters encodable by WinAnsi Helvetica so stray symbols never throw
     let safeText = '';
@@ -2599,36 +2611,48 @@ export async function createSearchablePdfFromOcr(
       .filter(Boolean);
 
     if (lines.length > 0) {
-      const margin = 20;
-      const usableH = Math.max(40, heightPt - margin * 2);
+      const margin = 12;
+      const usableH = Math.max(40, layout.drawH - margin * 2);
       const stepY = Math.min(13, Math.max(7, usableH / lines.length));
       const fontSize = Math.min(9.5, Math.max(5.5, stepY * 0.8));
       lines.forEach((line, idx) => {
-        const y = heightPt - margin - fontSize - idx * stepY;
-        if (y < margin) return;
+        const y = layout.drawY + layout.drawH - margin - fontSize - idx * stepY;
+        if (y < layout.drawY + margin) return;
         page.drawText(line, {
-          x: margin,
+          x: layout.drawX + margin,
           y,
           size: fontSize,
           font,
           color: rgb(1, 1, 1),
           opacity: 0.01,
-          maxWidth: widthPt - margin * 2,
+          maxWidth: Math.max(40, layout.drawW - margin * 2),
           lineHeight: stepY,
         });
       });
     }
 
     page.drawImage(embedded, {
-      x: 0,
-      y: 0,
-      width: widthPt,
-      height: heightPt,
+      x: layout.drawX,
+      y: layout.drawY,
+      width: layout.drawW,
+      height: layout.drawH,
     });
+
+    if (options?.addPageNumbers && (options.paperSize ?? 'fit') !== 'fit') {
+      const label = `${pIdx + 1} / ${totalPages}`;
+      const tw = font.widthOfTextAtSize(label, 9);
+      page.drawText(label, {
+        x: (layout.pageW - tw) / 2,
+        y: 10,
+        size: 9,
+        font,
+        color: rgb(0.39, 0.45, 0.54),
+      });
+    }
   }
 
-  doc.setTitle('OCR Searchable Document');
-  doc.setProducer('PDF MASTER OCR Engine');
+  doc.setTitle(options?.title?.trim() || 'OCR Searchable Document');
+  doc.setProducer('PDF MASTER High-Res OCR Scanner');
   const out = await doc.save();
   return out.buffer.slice(out.byteOffset, out.byteOffset + out.byteLength) as ArrayBuffer;
 }

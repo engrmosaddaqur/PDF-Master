@@ -119,7 +119,7 @@ export interface AppSettings {
   defaultPageSize: PaperSizeKey;
   defaultFont: string;
   scannerAutoCrop: boolean;
-  scannerDefaultFilter: 'color' | 'magic' | 'grayscale' | 'bw';
+  scannerDefaultFilter: 'docPro' | 'color' | 'magic' | 'grayscale' | 'bw';
   exportQuality: 'standard' | 'high' | 'maximum';
   localOnlyMode: boolean;
 }

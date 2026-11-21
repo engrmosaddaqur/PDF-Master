@@ -851,13 +851,19 @@ export default function App() {
           autoCropDefault={settings.scannerAutoCrop}
           defaultFilter={settings.scannerDefaultFilter}
           onClose={() => setWorkspace({ type: 'none' })}
-          onSaveScannedPdf={async (newDoc, openOcrAfter) => {
+          onSaveScannedPdf={async (newDoc, nextAction) => {
             await upsertDoc(newDoc);
-            if (openOcrAfter) {
+            if (nextAction === true || nextAction === 'ocr') {
               setWorkspace({ type: 'ocr', docId: newDoc.id });
+            } else if (nextAction === 'editor') {
+              setWorkspace({ type: 'editor', docId: newDoc.id });
             } else {
               setWorkspace({ type: 'viewer', docId: newDoc.id });
             }
+          }}
+          onOpenInWordCreator={(html) => {
+            setCreatorTemplateHtml(html);
+            setWorkspace({ type: 'wordCreator' });
           }}
         />
       )}
