@@ -3,23 +3,33 @@ import {
   AlignCenter,
   AlignLeft,
   AlignRight,
+  ArrowDown,
   ArrowLeft,
+  ArrowRight,
+  ArrowUp,
   ArrowUpRight,
   Bold,
   Calendar,
+  Check,
   ChevronLeft,
   ChevronRight,
   Circle,
   Copy,
   Crop,
   Download,
+  Droplet,
   Eraser,
+  FlipHorizontal2,
+  FlipVertical2,
   Hand,
   Highlighter,
   ImagePlus,
   Italic,
   Layers,
+  LayoutGrid,
   Loader2,
+  Lock,
+  Maximize2,
   MessageSquare,
   MousePointer,
   MousePointer2,
@@ -28,15 +38,18 @@ import {
   Pencil,
   PenTool,
   Redo2,
+  RotateCcw,
   RotateCw,
   Save,
   ScanText,
+  SlidersHorizontal,
   Square,
   Strikethrough,
   Trash2,
   Type as TypeIcon,
   Underline,
   Undo2,
+  Unlock,
   ZoomIn,
   ZoomOut,
   X,
@@ -227,7 +240,16 @@ function distPointToSegment(
   return Math.hypot(px - (x1 + t * dx), py - (y1 + t * dy));
 }
 
-function isErasableAnnotation(ann: AnnotationOverlay): boolean {
+function tryCapturePointer(el: HTMLElement | null, pointerId: number): void {
+  try {
+    el?.setPointerCapture?.(pointerId);
+  } catch {
+    // Ignore unsupported or synthetic pointer capture
+  }
+}
+
+function isErasableAnnotation(ann: AnnotationOverlay, includeAll = false): boolean {
+  if (includeAll) return true;
   return (
     ann.kind === 'freehand' ||
     ann.kind === 'rect' ||
@@ -244,9 +266,10 @@ function doesEraserHitAnnotation(
   ann: AnnotationOverlay,
   px: number,
   py: number,
-  radius: number
+  radius: number,
+  includeAll = false
 ): boolean {
-  if (!isErasableAnnotation(ann)) return false;
+  if (!isErasableAnnotation(ann, includeAll)) return false;
   const pad = radius + (ann.strokeWidth || 2.5) / 2;
 
   if (ann.kind === 'freehand' && ann.points && ann.points.length > 0) {
@@ -299,22 +322,46 @@ function doesEraserHitAnnotation(
       ) <= pad
     );
   }
-  const minX = Math.min(ann.x, ann.x + ann.width) - pad;
-  const maxX = Math.max(ann.x, ann.x + ann.width) + pad;
-  const minY = Math.min(ann.y, ann.y + ann.height) - pad;
-  const maxY = Math.max(ann.y, ann.y + ann.height) + pad;
-  return px >= minX && px <= maxX && py >= minY && py <= maxY;
+
+  const minX = Math.min(ann.x, ann.x + ann.width);
+  const maxX = Math.max(ann.x, ann.x + ann.width);
+  const minY = Math.min(ann.y, ann.y + ann.height);
+  const maxY = Math.max(ann.y, ann.y + ann.height);
+
+  // Hollow rect: check border edges so erasing strokes inside a frame leaves the frame intact
+  if (ann.kind === 'rect' && !ann.fillColor) {
+    return (
+      distPointToSegment(px, py, minX, minY, maxX, minY) <= pad ||
+      distPointToSegment(px, py, maxX, minY, maxX, maxY) <= pad ||
+      distPointToSegment(px, py, maxX, maxY, minX, maxY) <= pad ||
+      distPointToSegment(px, py, minX, maxY, minX, minY) <= pad
+    );
+  }
+
+  // Hollow circle/ellipse: check perimeter band
+  if (ann.kind === 'circle' && !ann.fillColor) {
+    const rx = Math.max(2, (maxX - minX) / 2);
+    const ry = Math.max(2, (maxY - minY) / 2);
+    const cx = (minX + maxX) / 2;
+    const cy = (minY + maxY) / 2;
+    const norm = Math.hypot((px - cx) / rx, (py - cy) / ry);
+    const approxDist = Math.abs(norm - 1) * Math.min(rx, ry);
+    return approxDist <= pad;
+  }
+
+  return px >= minX - pad && px <= maxX + pad && py >= minY - pad && py <= maxY + pad;
 }
 
 interface EditTextRunsLayerProps {
   runs: ExtractedTextRun[];
   replacedRunIds: Set<string>;
   scale: number;
+  disabled?: boolean;
   onSelectRun: (run: ExtractedTextRun) => void;
 }
 
 const EditTextRunsLayer = React.memo<EditTextRunsLayerProps>(
-  ({ runs, replacedRunIds, scale, onSelectRun }) => {
+  ({ runs, replacedRunIds, scale, disabled, onSelectRun }) => {
     const untouched = useMemo(
       () => runs.filter((r) => !replacedRunIds.has(r.id)),
       [runs, replacedRunIds]
@@ -330,6 +377,7 @@ const EditTextRunsLayer = React.memo<EditTextRunsLayerProps>(
     return (
       <div
         onClick={(e) => {
+          if (disabled) return;
           const btn = (e.target as HTMLElement).closest<HTMLElement>('[data-run-id]');
           if (!btn) return;
           e.stopPropagation();
@@ -348,7 +396,7 @@ const EditTextRunsLayer = React.memo<EditTextRunsLayerProps>(
               top: run.y * scale,
               minWidth: Math.max(14, run.width * scale),
               minHeight: Math.max(12, run.height * scale),
-              pointerEvents: 'auto',
+              pointerEvents: disabled ? 'none' : 'auto',
             }}
             className="absolute text-left rounded bg-[#2563EB]/[0.03] active:bg-[#2563EB]/20 border border-dashed border-[#2563EB]/35"
           />
@@ -382,14 +430,33 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   // Fine-grained drawing, shape, arrow & sticky options
   const [strokeWidth, setStrokeWidth] = useState(3);
   const [drawMode, setDrawMode] = useState<'pen' | 'marker'>('pen');
+  const [penOpacity, setPenOpacity] = useState(1);
   const [shapeFilled, setShapeFilled] = useState(false);
   const [lineStyle, setLineStyle] = useState<'solid' | 'dashed'>('solid');
   const [arrowStyle, setArrowStyle] = useState<'single' | 'double' | 'line'>('single');
   const [highlightOpacity, setHighlightOpacity] = useState(0.36);
   const [eraserRadius, setEraserRadius] = useState(14);
+  const [eraserIncludeAll, setEraserIncludeAll] = useState(false);
   const [eraserCursor, setEraserCursor] = useState<{ x: number; y: number } | null>(null);
+  const [whiteoutColor, setWhiteoutColor] = useState('#FFFFFF');
+  const [eyedropperActive, setEyedropperActive] = useState(false);
   const [stampPreset, setStampPreset] = useState<string>('DATE');
   const [customStampText, setCustomStampText] = useState('');
+  const [stampSolidFill, setStampSolidFill] = useState(false);
+  const [showToolGrid, setShowToolGrid] = useState(false);
+  const [showPageJump, setShowPageJump] = useState(false);
+  const [pageJumpInput, setPageJumpInput] = useState('1');
+  const [keepToolActive, setKeepToolActive] = useState(false);
+  const [snapGuides, setSnapGuides] = useState<{ x?: number; y?: number } | null>(null);
+
+  // Preserve original base PDF buffer across saves so staying open after Save never double-bakes or freezes overlays
+  const basePdfRef = useRef<{ docId: string; bytes: ArrayBuffer }>({
+    docId: doc.id,
+    bytes: cloneBuffer(doc.pdfBytes),
+  });
+  if (basePdfRef.current.docId !== doc.id) {
+    basePdfRef.current = { docId: doc.id, bytes: cloneBuffer(doc.pdfBytes) };
+  }
 
   // Edit layers + undo/redo stack
   const [state, setState] = useState<EditorStateSnapshot>({
@@ -398,8 +465,15 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     addedImages: [],
     annotations: [],
   });
+  const [savedSnapshot, setSavedSnapshot] = useState<EditorStateSnapshot | null>(null);
+  const stateRef = useRef(state);
+  stateRef.current = state;
   const [undoStack, setUndoStack] = useState<EditorStateSnapshot[]>([]);
   const [redoStack, setRedoStack] = useState<EditorStateSnapshot[]>([]);
+  const lastBoxPrefsRef = useRef<{ fontSize: number; fontFamily: PdfFontFamily }>({
+    fontSize: 14,
+    fontFamily: 'arial',
+  });
 
   // Active modals/popovers
   const [editingRun, setEditingRun] = useState<ExtractedTextRun | null>(null);
@@ -414,6 +488,8 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     underline: false,
     align: 'left' as 'left' | 'center' | 'right',
     letterSpacing: 0,
+    dx: 0,
+    dy: 0,
   });
   const [showExitConfirm, setShowExitConfirm] = useState(false);
 
@@ -425,6 +501,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     fontFamily: 'arial' as PdfFontFamily,
     color: '#142B4A',
     backgroundColor: 'transparent',
+    border: false,
     rotation: 0,
     bold: false,
     italic: false,
@@ -441,6 +518,14 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   const [stickyBgColor, setStickyBgColor] = useState('#FEF3C7');
   const [stickyAccentColor, setStickyAccentColor] = useState('#D97706');
   const [stickyFontSize, setStickyFontSize] = useState(10);
+
+  const [editingStampId, setEditingStampId] = useState<string | null>(null);
+  const [stampEditDraft, setStampEditDraft] = useState({
+    text: '',
+    color: '#2563EB',
+    fontSize: 10,
+    solidFill: false,
+  });
 
   const [showSigModal, setShowSigModal] = useState(false);
   const [pendingSig, setPendingSig] = useState<{
@@ -459,6 +544,8 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     setSelectedElement(id ? { kind: 'image', id } : null);
   const [cropModalImg, setCropModalImg] = useState<AddedImageOverlay | null>(null);
   const [cropInsets, setCropInsets] = useState({ top: 0, right: 0, bottom: 0, left: 0 });
+  const [cropNaturalSize, setCropNaturalSize] = useState<{ w: number; h: number } | null>(null);
+  const [showImageAdjustModal, setShowImageAdjustModal] = useState(false);
   const [draggingItem, setDraggingItem] = useState<{
     kind: 'image' | 'textBox' | 'annotation';
     id: string;
@@ -466,13 +553,15 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     startClientY: number;
     origX: number;
     origY: number;
+    wasSelectedBeforeDown?: boolean;
     origPoints?: Array<{ x: number; y: number }>;
     origTipX?: number;
     origTipY?: number;
   } | null>(null);
   const [resizingImage, setResizingImage] = useState<{
     id: string;
-    corner: 'nw' | 'ne' | 'sw' | 'se';
+    handle: 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+    lockAspect: boolean;
     startClientX: number;
     startClientY: number;
     origX: number;
@@ -501,45 +590,85 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
 
   const preGestureSnapshotRef = useRef<EditorStateSnapshot | null>(null);
   const pointerMovedRef = useRef(false);
+  const lastGestureEndTsRef = useRef(0);
   const erasingActiveRef = useRef(false);
   const erasedAnythingRef = useRef(false);
   const [saving, setSaving] = useState(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const statusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Drawing interaction
+  const flashStatus = useCallback((msg: string, ms = 2400) => {
+    if (statusTimerRef.current) clearTimeout(statusTimerRef.current);
+    setStatusMessage(msg);
+    statusTimerRef.current = setTimeout(() => {
+      setStatusMessage(null);
+      statusTimerRef.current = null;
+    }, ms);
+  }, []);
+
+  // Drawing & modal textarea refs
   const editorRootRef = useRef<HTMLDivElement | null>(null);
   const canvasScrollRef = useRef<HTMLDivElement | null>(null);
   const scrollContentRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const overlayRef = useRef<HTMLDivElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const runTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const boxTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const stickyTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   const dragStartRef = useRef<{ x: number; y: number } | null>(null);
   const liveFreehandRef = useRef<Array<{ x: number; y: number }>>([]);
   const [liveFreehand, setLiveFreehand] = useState<Array<{ x: number; y: number }>>([]);
   const [liveBox, setLiveBox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const liveBoxRef = useRef<{ x: number; y: number; w: number; h: number } | null>(null);
 
-  const commitState = (updater: (prev: EditorStateSnapshot) => EditorStateSnapshot) => {
-    setUndoStack((u) => [...u.slice(-24), state]);
-    setRedoStack([]);
-    setState((prev) => updater(prev));
-  };
+  useEffect(() => {
+    setSelectedElement(null);
+    setShowImageAdjustModal(false);
+    setSnapGuides(null);
+    setEraserCursor(null);
+    setEyedropperActive(false);
+    setLiveBox(null);
+    setLiveFreehand([]);
+    setPageJumpInput(String(pageNumber));
+  }, [pageNumber]);
 
-  const handleUndo = () => {
-    if (undoStack.length === 0) return;
-    const prev = undoStack[undoStack.length - 1];
-    setRedoStack((r) => [...r, state]);
-    setUndoStack((u) => u.slice(0, -1));
-    setState(prev);
-  };
+  const commitState = useCallback(
+    (updater: (prev: EditorStateSnapshot) => EditorStateSnapshot) => {
+      const current = stateRef.current;
+      const next = updater(current);
+      if (next === current) return;
+      setUndoStack((u) => [...u.slice(-29), current]);
+      setRedoStack([]);
+      stateRef.current = next;
+      setState(next);
+    },
+    []
+  );
 
-  const handleRedo = () => {
-    if (redoStack.length === 0) return;
-    const next = redoStack[redoStack.length - 1];
-    setUndoStack((u) => [...u, state]);
-    setRedoStack((r) => r.slice(0, -1));
-    setState(next);
-  };
+  const handleUndo = useCallback(() => {
+    setUndoStack((u) => {
+      if (u.length === 0) return u;
+      const prevSnap = u[u.length - 1];
+      setRedoStack((r) => [...r, stateRef.current]);
+      stateRef.current = prevSnap;
+      setState(prevSnap);
+      setSelectedElement(null);
+      return u.slice(0, -1);
+    });
+  }, []);
+
+  const handleRedo = useCallback(() => {
+    setRedoStack((r) => {
+      if (r.length === 0) return r;
+      const nextSnap = r[r.length - 1];
+      setUndoStack((u) => [...u, stateRef.current]);
+      stateRef.current = nextSnap;
+      setState(nextSnap);
+      setSelectedElement(null);
+      return r.slice(0, -1);
+    });
+  }, []);
 
   // CRITICAL: Only enable 1-finger/left-mouse drag-pan when Pan tool is selected.
   // Spacebar + Drag & Middle-mouse drag & 2-finger pinch still work in all tools!
@@ -566,10 +695,10 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     };
   }, []);
 
-  // Keyboard arrow / PageUp / PageDown / Delete / Ctrl+Z navigation
+  // Keyboard arrow / PageUp / PageDown / Delete / Escape / Ctrl+Z navigation & nudging
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
-      if (editingRun || addingBoxPos || stickyPos || showSigModal || cropModalImg) return;
+      if (editingRun || addingBoxPos || stickyPos || showSigModal || cropModalImg || showImageAdjustModal || editingStampId) return;
       const target = e.target as HTMLElement | null;
       if (
         target &&
@@ -585,6 +714,74 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         e.preventDefault();
         if (e.shiftKey) handleRedo();
         else handleUndo();
+        return;
+      }
+
+      if (e.key === 'Escape' && selectedElement) {
+        e.preventDefault();
+        setSelectedElement(null);
+        return;
+      }
+
+      // Smooth 1pt (or 8pt with Shift) nudging when an element is selected
+      if (
+        selectedElement &&
+        (e.key === 'ArrowDown' || e.key === 'ArrowUp' || e.key === 'ArrowLeft' || e.key === 'ArrowRight')
+      ) {
+        e.preventDefault();
+        const step = e.shiftKey ? 8 : 1;
+        const dx = e.key === 'ArrowLeft' ? -step : e.key === 'ArrowRight' ? step : 0;
+        const dy = e.key === 'ArrowUp' ? -step : e.key === 'ArrowDown' ? step : 0;
+        commitState((prev) => {
+          if (selectedElement.kind === 'image') {
+            return {
+              ...prev,
+              addedImages: prev.addedImages.map((im) =>
+                im.id === selectedElement.id
+                  ? {
+                      ...im,
+                      x: Math.max(0, Math.min(pageSize.width - 10, im.x + dx)),
+                      y: Math.max(0, Math.min(pageSize.height - 10, im.y + dy)),
+                    }
+                  : im
+              ),
+            };
+          }
+          if (selectedElement.kind === 'textBox') {
+            return {
+              ...prev,
+              addedTexts: prev.addedTexts.map((tb) =>
+                tb.id === selectedElement.id
+                  ? {
+                      ...tb,
+                      x: Math.max(0, Math.min(pageSize.width - 10, tb.x + dx)),
+                      y: Math.max(0, Math.min(pageSize.height - 10, tb.y + dy)),
+                    }
+                  : tb
+              ),
+            };
+          }
+          return {
+            ...prev,
+            annotations: prev.annotations.map((an) => {
+              if (an.id !== selectedElement.id) return an;
+              if (an.kind === 'freehand' && an.points) {
+                return {
+                  ...an,
+                  points: an.points.map((pt) => ({ x: pt.x + dx, y: pt.y + dy })),
+                };
+              }
+              return {
+                ...an,
+                x: Math.max(0, Math.min(pageSize.width - 10, an.x + dx)),
+                y: Math.max(0, Math.min(pageSize.height - 10, an.y + dy)),
+                ...(an.kind === 'sticky' && an.stickyTipX !== undefined && an.stickyTipY !== undefined
+                  ? { stickyTipX: an.stickyTipX + dx, stickyTipY: an.stickyTipY + dy }
+                  : {}),
+              };
+            }),
+          };
+        });
         return;
       }
 
@@ -653,11 +850,15 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     stickyPos,
     showSigModal,
     cropModalImg,
+    showImageAdjustModal,
+    editingStampId,
     selectedElement,
     doc.pageCount,
-    undoStack,
-    redoStack,
-    state,
+    pageSize.width,
+    pageSize.height,
+    commitState,
+    handleUndo,
+    handleRedo,
   ]);
 
   const [renderScale, setRenderScale] = useState(scale);
@@ -671,7 +872,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     let active = true;
     const loadPageCanvas = async () => {
       if (canvasRef.current) {
-        const res = await renderPageToCanvas(doc.pdfBytes, pageNumber, canvasRef.current, renderScale);
+        const res = await renderPageToCanvas(basePdfRef.current.bytes, pageNumber, canvasRef.current, renderScale);
         if (active) {
           setPageSize({ width: res.unscaledWidth, height: res.unscaledHeight });
         }
@@ -681,11 +882,11 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     return () => {
       active = false;
     };
-  }, [doc.pdfBytes, pageNumber, renderScale]);
+  }, [doc.id, pageNumber, renderScale]);
 
   useEffect(() => {
     let active = true;
-    extractPageTextRuns(doc.pdfBytes, pageNumber)
+    extractPageTextRuns(basePdfRef.current.bytes, pageNumber)
       .then(({ runs }) => {
         if (active) setTextRuns(runs);
       })
@@ -693,7 +894,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     return () => {
       active = false;
     };
-  }, [doc.pdfBytes, pageNumber]);
+  }, [doc.id, pageNumber]);
 
   const toUnscaledCoords = (clientX: number, clientY: number) => {
     const rect = overlayRef.current!.getBoundingClientRect();
@@ -712,6 +913,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       fontFamily: tb.fontFamily,
       color: tb.color,
       backgroundColor: tb.backgroundColor || 'transparent',
+      border: Boolean(tb.borderColor),
       rotation: tb.rotation || 0,
       bold: tb.bold,
       italic: tb.italic,
@@ -733,6 +935,16 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     setStickyFontSize(ann.fontSize || 10);
   };
 
+  const openEditStamp = (ann: AnnotationOverlay) => {
+    setEditingStampId(ann.id);
+    setStampEditDraft({
+      text: ann.comment || ann.dateStr || 'APPROVED',
+      color: ann.color || '#2563EB',
+      fontSize: Math.round(ann.fontSize || 10),
+      solidFill: Boolean(ann.fillColor),
+    });
+  };
+
   const isDragStrokeTool =
     activeTool === 'draw' ||
     activeTool === 'highlight' ||
@@ -743,33 +955,108 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     activeTool === 'arrow' ||
     activeTool === 'whiteout';
 
+  const isPlacementTool =
+    activeTool === 'addText' ||
+    activeTool === 'sticky' ||
+    activeTool === 'stamp' ||
+    activeTool === 'signature';
+
+  const sampleCanvasPointHex = (pt: { x: number; y: number }): string => {
+    const canvas = canvasRef.current;
+    if (!canvas || !pageSize.width || !pageSize.height) return '#FFFFFF';
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return '#FFFFFF';
+    const sx = canvas.width / pageSize.width;
+    const sy = canvas.height / pageSize.height;
+    const px = Math.max(0, Math.min(canvas.width - 1, Math.round(pt.x * sx)));
+    const py = Math.max(0, Math.min(canvas.height - 1, Math.round(pt.y * sy)));
+    try {
+      const d = ctx.getImageData(px, py, 1, 1).data;
+      if (d[3] < 20) return '#FFFFFF';
+      const toHex = (n: number) =>
+        Math.max(0, Math.min(255, Math.round(n))).toString(16).padStart(2, '0');
+      return `#${toHex(d[0])}${toHex(d[1])}${toHex(d[2])}`.toUpperCase();
+    } catch {
+      return '#FFFFFF';
+    }
+  };
+
   const eraseAtPoint = (pt: { x: number; y: number }) => {
     setState((prev) => {
-      const remaining = prev.annotations.filter(
-        (an) => an.pageNumber !== pageNumber || !doesEraserHitAnnotation(an, pt.x, pt.y, eraserRadius)
+      const nextAnns = prev.annotations.filter(
+        (an) =>
+          an.pageNumber !== pageNumber ||
+          !doesEraserHitAnnotation(an, pt.x, pt.y, eraserRadius, eraserIncludeAll)
       );
-      if (remaining.length !== prev.annotations.length) {
+      const nextTexts = eraserIncludeAll
+        ? prev.addedTexts.filter((tb) => {
+            if (tb.pageNumber !== pageNumber) return true;
+            const estH = Math.max(24, tb.fontSize * 1.6);
+            return !(
+              pt.x >= tb.x - eraserRadius &&
+              pt.x <= tb.x + tb.width + eraserRadius &&
+              pt.y >= tb.y - eraserRadius &&
+              pt.y <= tb.y + estH + eraserRadius
+            );
+          })
+        : prev.addedTexts;
+      const nextImgs = eraserIncludeAll
+        ? prev.addedImages.filter((im) => {
+            if (im.pageNumber !== pageNumber) return true;
+            return !(
+              pt.x >= im.x - eraserRadius &&
+              pt.x <= im.x + im.width + eraserRadius &&
+              pt.y >= im.y - eraserRadius &&
+              pt.y <= im.y + im.height + eraserRadius
+            );
+          })
+        : prev.addedImages;
+
+      if (
+        nextAnns.length !== prev.annotations.length ||
+        nextTexts.length !== prev.addedTexts.length ||
+        nextImgs.length !== prev.addedImages.length
+      ) {
         erasedAnythingRef.current = true;
-        return { ...prev, annotations: remaining };
+        const next = {
+          ...prev,
+          annotations: nextAnns,
+          addedTexts: nextTexts,
+          addedImages: nextImgs,
+        };
+        stateRef.current = next;
+        return next;
       }
       return prev;
     });
   };
 
   const handleOverlayClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (showToolGrid) setShowToolGrid(false);
+    if (showPageJump) setShowPageJump(false);
+    if (performance.now() - lastGestureEndTsRef.current < 260) return;
     if (e.target !== overlayRef.current) return;
     setSelectedElement(null);
     const pt = toUnscaledCoords(e.clientX, e.clientY);
+
+    if (activeTool === 'whiteout' && eyedropperActive) {
+      const picked = sampleCanvasPointHex(pt);
+      setWhiteoutColor(picked);
+      setEyedropperActive(false);
+      flashStatus(`${language === 'bn' ? 'রঙ নির্বাচিত:' : 'Color picked:'} ${picked}`, 2000);
+      return;
+    }
 
     if (activeTool === 'addText') {
       setEditingBoxId(null);
       setAddingBoxPos(pt);
       setNewBoxDraft({
         text: '',
-        fontSize: 14,
-        fontFamily: 'arial',
+        fontSize: lastBoxPrefsRef.current.fontSize,
+        fontFamily: lastBoxPrefsRef.current.fontFamily,
         color: activeColor,
         backgroundColor: 'transparent',
+        border: false,
         rotation: 0,
         bold: false,
         italic: false,
@@ -799,36 +1086,47 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           : stampPreset === 'DATE'
           ? new Date().toLocaleDateString()
           : stampPreset;
-      const stampW = Math.max(96, chosenLabel.length * 7.2 + 22);
+      const stampFont = 10;
+      const stampW = Math.max(96, chosenLabel.length * 7.2 + 24);
       const stampH = 28;
+      const newId = `ann_${Date.now()}`;
       commitState((prev) => ({
         ...prev,
         annotations: [
           ...prev.annotations,
           {
-            id: `ann_${Date.now()}`,
+            id: newId,
             pageNumber,
             kind: 'stamp',
             x: Math.max(4, Math.min(pageSize.width - stampW - 4, pt.x - stampW / 2)),
             y: Math.max(4, Math.min(pageSize.height - stampH - 4, pt.y - stampH / 2)),
             width: stampW,
             height: stampH,
+            fontSize: stampFont,
             color: activeColor,
+            fillColor: stampSolidFill ? activeColor : undefined,
             dateStr: new Date().toLocaleDateString(),
             comment: chosenLabel,
           },
         ],
       }));
+      setSelectedElement({ kind: 'annotation', id: newId });
+      if (!keepToolActive) setActiveTool('select');
       return;
     }
 
-    if (activeTool === 'signature' && pendingSig) {
+    if (activeTool === 'signature') {
+      if (!pendingSig) {
+        setShowSigModal(true);
+        return;
+      }
+      const newId = `sig_${Date.now()}`;
       commitState((prev) => ({
         ...prev,
         annotations: [
           ...prev.annotations,
           {
-            id: `sig_${Date.now()}`,
+            id: newId,
             pageNumber,
             kind: 'signature',
             x: Math.max(4, Math.min(pageSize.width - 154, pt.x - 75)),
@@ -842,23 +1140,34 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           },
         ],
       }));
-      setStatusMessage(language === 'bn' ? 'স্বাক্ষর যুক্ত হয়েছে' : 'Signature placed on page');
-      setTimeout(() => setStatusMessage(null), 2000);
+      setSelectedElement({ kind: 'annotation', id: newId });
+      if (!keepToolActive) setActiveTool('select');
+      flashStatus(language === 'bn' ? 'স্বাক্ষর যুক্ত হয়েছে' : 'Signature placed on page', 2000);
     }
   };
 
   const handleOverlayPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!e.isPrimary) {
-      // Multi-touch pinch started — abort active stroke cleanly
       handleOverlayPointerCancel();
+      return;
+    }
+
+    if (activeTool === 'whiteout' && eyedropperActive) {
+      e.preventDefault();
+      e.stopPropagation();
+      const pt = toUnscaledCoords(e.clientX, e.clientY);
+      const picked = sampleCanvasPointHex(pt);
+      setWhiteoutColor(picked);
+      setEyedropperActive(false);
+      flashStatus(`${language === 'bn' ? 'রঙ নির্বাচিত:' : 'Color picked:'} ${picked}`, 2000);
       return;
     }
 
     if (activeTool === 'eraser') {
       e.preventDefault();
       e.stopPropagation();
-      e.currentTarget.setPointerCapture(e.pointerId);
-      preGestureSnapshotRef.current = state;
+      tryCapturePointer(e.currentTarget, e.pointerId);
+      preGestureSnapshotRef.current = stateRef.current;
       erasingActiveRef.current = true;
       erasedAnythingRef.current = false;
       const pt = toUnscaledCoords(e.clientX, e.clientY);
@@ -876,7 +1185,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       e.stopPropagation();
       setSelectedElement(null);
       const pt = toUnscaledCoords(e.clientX, e.clientY);
-      e.currentTarget.setPointerCapture(e.pointerId);
+      tryCapturePointer(e.currentTarget, e.pointerId);
       dragStartRef.current = pt;
       const initialBox = { x: pt.x, y: pt.y, w: 0, h: 0 };
       liveBoxRef.current = initialBox;
@@ -890,7 +1199,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     setSelectedElement(null);
     const pt = toUnscaledCoords(e.clientX, e.clientY);
 
-    e.currentTarget.setPointerCapture(e.pointerId);
+    tryCapturePointer(e.currentTarget, e.pointerId);
     dragStartRef.current = pt;
     if (activeTool === 'draw') {
       const initialPts = [pt];
@@ -926,7 +1235,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     if (resizingTextBox) {
       pointerMovedRef.current = true;
       const dx = (e.clientX - resizingTextBox.startClientX) / scale;
-      const newW = Math.round(Math.max(80, Math.min(pageSize.width - 20, resizingTextBox.origW + dx)));
+      const newW = Math.round(Math.max(70, Math.min(pageSize.width - 20, resizingTextBox.origW + dx)));
       setState((prev) => ({
         ...prev,
         addedTexts: prev.addedTexts.map((tb) =>
@@ -940,46 +1249,75 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       pointerMovedRef.current = true;
       const dx = (e.clientX - resizingImage.startClientX) / scale;
       const dy = (e.clientY - resizingImage.startClientY) / scale;
-      const aspect = resizingImage.origW / Math.max(1, resizingImage.origH);
-      let newW = resizingImage.origW;
-      let newX = resizingImage.origX;
-      let newY = resizingImage.origY;
+      const { handle, lockAspect, origX, origY, origW, origH } = resizingImage;
+      const aspect = origW / Math.max(1, origH);
+      const isEdge = handle === 'n' || handle === 's' || handle === 'e' || handle === 'w';
 
-      if (resizingImage.corner === 'se') {
-        newW = Math.max(
-          24,
-          Math.min(
-            pageSize.width - resizingImage.origX,
-            resizingImage.origW + (Math.abs(dx) >= Math.abs(dy) ? dx : dy * aspect)
-          )
-        );
-      } else if (resizingImage.corner === 'ne') {
-        newW = Math.max(
-          24,
-          Math.min(
-            pageSize.width - resizingImage.origX,
-            resizingImage.origW + (Math.abs(dx) >= Math.abs(dy) ? dx : -dy * aspect)
-          )
-        );
-      } else if (resizingImage.corner === 'sw') {
-        const deltaW = Math.abs(dx) >= Math.abs(dy) ? -dx : dy * aspect;
-        newW = Math.max(24, Math.min(resizingImage.origX + resizingImage.origW, resizingImage.origW + deltaW));
-        newX = resizingImage.origX + (resizingImage.origW - newW);
-      } else if (resizingImage.corner === 'nw') {
-        const deltaW = Math.abs(dx) >= Math.abs(dy) ? -dx : -dy * aspect;
-        newW = Math.max(24, Math.min(resizingImage.origX + resizingImage.origW, resizingImage.origW + deltaW));
-        newX = resizingImage.origX + (resizingImage.origW - newW);
-      }
-      const newH = Math.max(24, newW / aspect);
-      if (resizingImage.corner === 'ne' || resizingImage.corner === 'nw') {
-        newY = Math.max(0, resizingImage.origY + (resizingImage.origH - newH));
+      let newX = origX;
+      let newY = origY;
+      let newW = origW;
+      let newH = origH;
+
+      if (isEdge || !lockAspect) {
+        if (handle.includes('e')) {
+          newW = Math.max(20, Math.min(pageSize.width - origX, origW + dx));
+        }
+        if (handle.includes('s')) {
+          newH = Math.max(20, Math.min(pageSize.height - origY, origH + dy));
+        }
+        if (handle.includes('w')) {
+          const clampedX = Math.max(0, Math.min(origX + origW - 20, origX + dx));
+          newW = origW + (origX - clampedX);
+          newX = clampedX;
+        }
+        if (handle.includes('n')) {
+          const clampedY = Math.max(0, Math.min(origY + origH - 20, origY + dy));
+          newH = origH + (origY - clampedY);
+          newY = clampedY;
+        }
+      } else {
+        if (handle === 'se') {
+          newW = Math.max(
+            24,
+            Math.min(
+              pageSize.width - origX,
+              origW + (Math.abs(dx) >= Math.abs(dy) ? dx : dy * aspect)
+            )
+          );
+        } else if (handle === 'ne') {
+          newW = Math.max(
+            24,
+            Math.min(
+              pageSize.width - origX,
+              origW + (Math.abs(dx) >= Math.abs(dy) ? dx : -dy * aspect)
+            )
+          );
+        } else if (handle === 'sw') {
+          const deltaW = Math.abs(dx) >= Math.abs(dy) ? -dx : dy * aspect;
+          newW = Math.max(24, Math.min(origX + origW, origW + deltaW));
+          newX = origX + (origW - newW);
+        } else if (handle === 'nw') {
+          const deltaW = Math.abs(dx) >= Math.abs(dy) ? -dx : -dy * aspect;
+          newW = Math.max(24, Math.min(origX + origW, origW + deltaW));
+          newX = origX + (origW - newW);
+        }
+        newH = Math.max(24, newW / aspect);
+        if (handle === 'ne' || handle === 'nw') {
+          newY = Math.max(0, origY + (origH - newH));
+        }
       }
 
       setState((prev) => ({
         ...prev,
         addedImages: prev.addedImages.map((im) =>
           im.id === resizingImage.id
-            ? { ...im, x: newX, y: newY, width: Math.round(newW), height: Math.round(newH) }
+            ? {
+                ...im,
+                x: Math.round(newX),
+                y: Math.round(newY),
+                width: Math.round(newW),
+                height: Math.round(newH),
+              }
             : im
         ),
       }));
@@ -1017,8 +1355,15 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             };
           }
 
-          const minW = an.kind === 'sticky' ? 92 : 14;
-          const minH = an.kind === 'sticky' ? 44 : 10;
+          if (an.kind === 'signature') {
+            const aspect = origW / Math.max(1, origH);
+            const nw = Math.max(40, Math.min(pageSize.width - origX, origW + (Math.abs(dx) >= Math.abs(dy) ? dx : dy * aspect)));
+            const nh = Math.max(20, nw / aspect);
+            return { ...an, width: Math.round(nw), height: Math.round(nh) };
+          }
+
+          const minW = an.kind === 'sticky' ? 92 : an.kind === 'stamp' ? 68 : 14;
+          const minH = an.kind === 'sticky' ? 44 : an.kind === 'stamp' ? 22 : 10;
           let nx = origX;
           let ny = origY;
           let nw = origW;
@@ -1048,13 +1393,59 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     if (draggingItem) {
       const rawDx = e.clientX - draggingItem.startClientX;
       const rawDy = e.clientY - draggingItem.startClientY;
-      if (Math.hypot(rawDx, rawDy) > 5) {
+      if (Math.hypot(rawDx, rawDy) > 4) {
         pointerMovedRef.current = true;
       }
       const dx = rawDx / scale;
       const dy = rawDy / scale;
-      const nx = Math.max(0, Math.min(pageSize.width - 20, draggingItem.origX + dx));
-      const ny = Math.max(0, Math.min(pageSize.height - 20, draggingItem.origY + dy));
+      let nx = Math.max(0, Math.min(pageSize.width - 20, draggingItem.origX + dx));
+      let ny = Math.max(0, Math.min(pageSize.height - 20, draggingItem.origY + dy));
+
+      // Gentle magnetic snap to page center & 24pt margins for crisp placement
+      let itemW = 0;
+      let itemH = 0;
+      let canSnap = true;
+      if (draggingItem.kind === 'image') {
+        const im = stateRef.current.addedImages.find((x) => x.id === draggingItem.id);
+        itemW = im?.width || 0;
+        itemH = im?.height || 0;
+      } else if (draggingItem.kind === 'textBox') {
+        const tb = stateRef.current.addedTexts.find((x) => x.id === draggingItem.id);
+        itemW = tb?.width || 0;
+        itemH = tb ? tb.fontSize * 1.4 : 0;
+      } else {
+        const an = stateRef.current.annotations.find((x) => x.id === draggingItem.id);
+        if (!an || an.kind === 'freehand' || an.kind === 'arrow') canSnap = false;
+        else {
+          itemW = Math.abs(an.width || 0);
+          itemH = Math.abs(an.height || 0);
+        }
+      }
+
+      let gx: number | undefined;
+      let gy: number | undefined;
+      if (canSnap && itemW > 0 && pointerMovedRef.current) {
+        const cx = nx + itemW / 2;
+        const pageCx = pageSize.width / 2;
+        if (Math.abs(cx - pageCx) <= 4.5) {
+          nx = pageCx - itemW / 2;
+          gx = pageCx;
+        } else if (Math.abs(nx - 24) <= 4) {
+          nx = 24;
+          gx = 24;
+        } else if (Math.abs(nx + itemW - (pageSize.width - 24)) <= 4) {
+          nx = pageSize.width - 24 - itemW;
+          gx = pageSize.width - 24;
+        }
+        const cy = ny + itemH / 2;
+        const pageCy = pageSize.height / 2;
+        if (itemH > 0 && Math.abs(cy - pageCy) <= 4.5) {
+          ny = pageCy - itemH / 2;
+          gy = pageCy;
+        }
+      }
+      setSnapGuides(gx !== undefined || gy !== undefined ? { x: gx, y: gy } : null);
+
       const actualDx = nx - draggingItem.origX;
       const actualDy = ny - draggingItem.origY;
       setState((prev) => {
@@ -1062,7 +1453,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           return {
             ...prev,
             addedImages: prev.addedImages.map((im) =>
-              im.id === draggingItem.id ? { ...im, x: nx, y: ny } : im
+              im.id === draggingItem.id ? { ...im, x: Math.round(nx), y: Math.round(ny) } : im
             ),
           };
         }
@@ -1070,7 +1461,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           return {
             ...prev,
             addedTexts: prev.addedTexts.map((tb) =>
-              tb.id === draggingItem.id ? { ...tb, x: nx, y: ny } : tb
+              tb.id === draggingItem.id ? { ...tb, x: Math.round(nx), y: Math.round(ny) } : tb
             ),
           };
         }
@@ -1090,8 +1481,8 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             if (an.kind === 'sticky') {
               return {
                 ...an,
-                x: nx,
-                y: ny,
+                x: Math.round(nx),
+                y: Math.round(ny),
                 ...(draggingItem.origTipX !== undefined && draggingItem.origTipY !== undefined
                   ? {
                       stickyTipX: Math.max(4, Math.min(pageSize.width - 4, draggingItem.origTipX + actualDx)),
@@ -1100,7 +1491,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   : {}),
               };
             }
-            return { ...an, x: nx, y: ny };
+            return { ...an, x: Math.round(nx), y: Math.round(ny) };
           }),
         };
       });
@@ -1142,12 +1533,20 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       let box: { x: number; y: number; w: number; h: number };
       if (activeTool === 'arrow') {
         box = { x: sx, y: sy, w: pt.x - sx, h: pt.y - sy };
-      } else if (activeTool === 'underline' || activeTool === 'strike') {
+      } else if (activeTool === 'underline') {
+        // Keep underline strictly horizontal at the traced finger/cursor Y line
         box = {
           x: Math.min(sx, pt.x),
-          y: Math.min(sy, pt.y),
+          y: pt.y - 2,
           w: Math.abs(pt.x - sx),
-          h: Math.max(2, Math.abs(pt.y - sy)),
+          h: 2,
+        };
+      } else if (activeTool === 'strike') {
+        box = {
+          x: Math.min(sx, pt.x),
+          y: pt.y - 1,
+          w: Math.abs(pt.x - sx),
+          h: 2,
         };
       } else {
         box = {
@@ -1168,6 +1567,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     setResizingImage(null);
     setResizingAnnotation(null);
     setDraggingItem(null);
+    setSnapGuides(null);
     erasingActiveRef.current = false;
     erasedAnythingRef.current = false;
     setEraserCursor(null);
@@ -1180,9 +1580,11 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   };
 
   const handleOverlayPointerUp = () => {
+    setSnapGuides(null);
     if (draggingStickyTip) {
+      lastGestureEndTsRef.current = performance.now();
       if (pointerMovedRef.current && preGestureSnapshotRef.current) {
-        setUndoStack((u) => [...u.slice(-24), preGestureSnapshotRef.current!]);
+        setUndoStack((u) => [...u.slice(-29), preGestureSnapshotRef.current!]);
         setRedoStack([]);
       }
       preGestureSnapshotRef.current = null;
@@ -1190,8 +1592,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       return;
     }
     if (resizingTextBox) {
+      lastGestureEndTsRef.current = performance.now();
       if (pointerMovedRef.current && preGestureSnapshotRef.current) {
-        setUndoStack((u) => [...u.slice(-24), preGestureSnapshotRef.current!]);
+        setUndoStack((u) => [...u.slice(-29), preGestureSnapshotRef.current!]);
         setRedoStack([]);
       }
       preGestureSnapshotRef.current = null;
@@ -1199,8 +1602,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       return;
     }
     if (resizingImage) {
+      lastGestureEndTsRef.current = performance.now();
       if (pointerMovedRef.current && preGestureSnapshotRef.current) {
-        setUndoStack((u) => [...u.slice(-24), preGestureSnapshotRef.current!]);
+        setUndoStack((u) => [...u.slice(-29), preGestureSnapshotRef.current!]);
         setRedoStack([]);
       }
       preGestureSnapshotRef.current = null;
@@ -1208,8 +1612,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       return;
     }
     if (resizingAnnotation) {
+      lastGestureEndTsRef.current = performance.now();
       if (pointerMovedRef.current && preGestureSnapshotRef.current) {
-        setUndoStack((u) => [...u.slice(-24), preGestureSnapshotRef.current!]);
+        setUndoStack((u) => [...u.slice(-29), preGestureSnapshotRef.current!]);
         setRedoStack([]);
       }
       preGestureSnapshotRef.current = null;
@@ -1217,30 +1622,39 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       return;
     }
     if (draggingItem) {
+      lastGestureEndTsRef.current = performance.now();
       const wasTap = !pointerMovedRef.current;
       const item = draggingItem;
       if (!wasTap && preGestureSnapshotRef.current) {
-        setUndoStack((u) => [...u.slice(-24), preGestureSnapshotRef.current!]);
+        setUndoStack((u) => [...u.slice(-29), preGestureSnapshotRef.current!]);
         setRedoStack([]);
       }
       preGestureSnapshotRef.current = null;
       setDraggingItem(null);
       if (wasTap) {
         setSelectedElement({ kind: item.kind, id: item.id });
-        if (item.kind === 'textBox') {
-          const tb = state.addedTexts.find((x) => x.id === item.id);
-          if (tb) openEditAddedTextBox(tb);
-        } else if (item.kind === 'annotation') {
-          const ann = state.annotations.find((x) => x.id === item.id);
-          if (ann?.kind === 'sticky') openEditStickyNote(ann);
+        // Tap once to select & reveal resize/editing controls; tap again (already selected) to open quick editor
+        if (item.wasSelectedBeforeDown) {
+          if (item.kind === 'image') {
+            preGestureSnapshotRef.current = stateRef.current;
+            setShowImageAdjustModal(true);
+          } else if (item.kind === 'textBox') {
+            const tb = stateRef.current.addedTexts.find((x) => x.id === item.id);
+            if (tb) openEditAddedTextBox(tb);
+          } else if (item.kind === 'annotation') {
+            const ann = stateRef.current.annotations.find((x) => x.id === item.id);
+            if (ann?.kind === 'sticky') openEditStickyNote(ann);
+            else if (ann?.kind === 'stamp') openEditStamp(ann);
+          }
         }
       }
       return;
     }
     if (erasingActiveRef.current) {
+      lastGestureEndTsRef.current = performance.now();
       erasingActiveRef.current = false;
       if (erasedAnythingRef.current && preGestureSnapshotRef.current) {
-        setUndoStack((u) => [...u.slice(-24), preGestureSnapshotRef.current!]);
+        setUndoStack((u) => [...u.slice(-29), preGestureSnapshotRef.current!]);
         setRedoStack([]);
       }
       erasedAnythingRef.current = false;
@@ -1253,6 +1667,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     const finalBox = liveBoxRef.current;
 
     if (activeTool === 'editText' && finalBox && Math.abs(finalBox.w) > 8 && Math.abs(finalBox.h) > 6) {
+      lastGestureEndTsRef.current = performance.now();
       const bx = Math.min(finalBox.x, finalBox.x + finalBox.w);
       const by = Math.min(finalBox.y, finalBox.y + finalBox.h);
       const bw = Math.abs(finalBox.w);
@@ -1278,6 +1693,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     }
 
     if (activeTool === 'draw' && finalPts.length >= 1) {
+      lastGestureEndTsRef.current = performance.now();
       const strokePts =
         finalPts.length === 1
           ? [finalPts[0], { x: finalPts[0].x + 0.5, y: finalPts[0].y + 0.5 }]
@@ -1296,12 +1712,13 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             height: 0,
             color: activeColor,
             strokeWidth,
-            opacity: drawMode === 'marker' ? 0.42 : 1,
+            opacity: penOpacity,
             points: strokePts,
           },
         ],
       }));
     } else if (finalBox && (Math.abs(finalBox.w) > 5 || Math.abs(finalBox.h) > 5)) {
+      lastGestureEndTsRef.current = performance.now();
       const kindMap: Record<string, AnnotationOverlay['kind']> = {
         highlight: 'highlight',
         underline: 'underline',
@@ -1317,23 +1734,24 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           kind === 'highlight'
             ? Math.max(12, finalBox.h)
             : kind === 'underline' || kind === 'strikethrough'
-            ? Math.max(2, finalBox.h)
+            ? 2
             : kind === 'arrow'
             ? finalBox.h
             : Math.max(10, finalBox.h);
+        const newAnnId = `ann_${Date.now()}`;
         commitState((prev) => ({
           ...prev,
           annotations: [
             ...prev.annotations,
             {
-              id: `ann_${Date.now()}`,
+              id: newAnnId,
               pageNumber,
               kind,
               x: finalBox.x,
               y: finalBox.y,
               width: kind === 'arrow' ? finalBox.w : Math.max(10, finalBox.w),
               height: finalH,
-              color: kind === 'whiteout' ? '#FFFFFF' : activeColor,
+              color: kind === 'whiteout' ? whiteoutColor : activeColor,
               strokeWidth,
               opacity: kind === 'highlight' ? highlightOpacity : 1,
               lineStyle:
@@ -1341,13 +1759,17 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               arrowStyle: kind === 'arrow' ? arrowStyle : undefined,
               fillColor:
                 kind === 'whiteout'
-                  ? '#FFFFFF'
+                  ? whiteoutColor
                   : (kind === 'rect' || kind === 'circle') && shapeFilled
                   ? activeColor
                   : undefined,
             },
           ],
         }));
+        setSelectedElement({ kind: 'annotation', id: newAnnId });
+        if (!keepToolActive) {
+          setActiveTool('select');
+        }
       }
     }
     dragStartRef.current = null;
@@ -1398,7 +1820,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   };
 
   const handleOpenTextRunEditor = (run: ExtractedTextRun) => {
-    const existing = state.replacements.find((r) => r.runId === run.id);
+    const existing = stateRef.current.replacements.find((r) => r.runId === run.id);
     setEditingRun(run);
     setRunDraft({
       text: existing ? existing.newText : run.str,
@@ -1411,6 +1833,8 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       underline: existing?.underline || false,
       align: existing?.align || 'left',
       letterSpacing: existing?.letterSpacing || 0,
+      dx: existing ? Math.round(existing.x - run.x) : 0,
+      dy: existing ? Math.round(existing.y - run.y) : 0,
     });
   };
 
@@ -1428,7 +1852,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     );
     try {
       const offscreen = document.createElement('canvas');
-      const res = await renderPageToCanvas(doc.pdfBytes, pageNumber, offscreen, 2.0);
+      const res = await renderPageToCanvas(basePdfRef.current.bytes, pageNumber, offscreen, 2.0);
       const existingAll = [...textRuns, ...(ocrScannedPages[pageNumber] || [])];
       const found = await detectOcrLineRuns(
         offscreen,
@@ -1443,22 +1867,22 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           ...prev,
           [pageNumber]: [...(prev[pageNumber] || []), ...found],
         }));
-        setStatusMessage(
+        flashStatus(
           language === 'bn'
             ? `আরও ${found.length}টি টেক্সট লাইন পাওয়া গেছে`
-            : `Found ${found.length} more editable lines`
+            : `Found ${found.length} more editable lines`,
+          3200
         );
       } else {
-        setStatusMessage(
+        flashStatus(
           language === 'bn'
             ? 'সব টেক্সট চিহ্নিত আছে — প্রয়োজনে "বক্স এঁকে এডিট" ব্যবহার করুন'
-            : 'All text detected — use Box Select for any custom area'
+            : 'All text detected — use Box Select for any custom area',
+          3200
         );
       }
-      setTimeout(() => setStatusMessage(null), 3200);
     } catch {
-      setStatusMessage(language === 'bn' ? 'টেক্সট স্ক্যান ব্যর্থ হয়েছে' : 'OCR scan failed');
-      setTimeout(() => setStatusMessage(null), 2500);
+      flashStatus(language === 'bn' ? 'টেক্সট স্ক্যান ব্যর্থ হয়েছে' : 'OCR scan failed', 2600);
     } finally {
       setOcrScanning(false);
     }
@@ -1466,6 +1890,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
 
   const handleApplyRunReplacement = (deleted: boolean) => {
     if (!editingRun) return;
+    const baseRun = textRuns.find((r) => r.id === editingRun.id) || (ocrScannedPages[pageNumber] || []).find((r) => r.id === editingRun.id) || editingRun;
     commitState((prev) => {
       const filtered = prev.replacements.filter((r) => r.runId !== editingRun.id);
       return {
@@ -1476,11 +1901,11 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             id: `rep_${Date.now()}`,
             runId: editingRun.id,
             pageNumber,
-            originalText: editingRun.str,
+            originalText: baseRun.str,
             newText: runDraft.text,
             deleted,
-            x: editingRun.x,
-            y: editingRun.y,
+            x: Math.max(0, baseRun.x + runDraft.dx),
+            y: Math.max(0, baseRun.y + runDraft.dy),
             width: editingRun.width,
             height: editingRun.height,
             fontSize: runDraft.fontSize,
@@ -1499,16 +1924,39 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
     setEditingRun(null);
   };
 
+  const handleRestoreRunOriginal = () => {
+    if (!editingRun) return;
+    commitState((prev) => ({
+      ...prev,
+      replacements: prev.replacements.filter((r) => r.runId !== editingRun.id),
+    }));
+    setEditingRun(null);
+  };
+
   const handleImageFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
-      const dataUrl = reader.result as string;
+      const rawUrl = reader.result as string;
       const img = new Image();
       img.onload = () => {
-        const w = Math.min(220, img.naturalWidth || 180);
-        const h = Math.round((w / (img.naturalWidth || 180)) * (img.naturalHeight || 140));
+        const natW = Math.max(1, img.naturalWidth || 180);
+        const natH = Math.max(1, img.naturalHeight || 140);
+        const maxDim = 1800;
+        const ratio = Math.min(1, maxDim / Math.max(natW, natH));
+        const cw = Math.max(1, Math.round(natW * ratio));
+        const ch = Math.max(1, Math.round(natH * ratio));
+        let finalUrl = rawUrl;
+        if (!rawUrl.startsWith('data:image/png') && !rawUrl.startsWith('data:image/jpeg') || ratio < 1) {
+          const c = document.createElement('canvas');
+          c.width = cw;
+          c.height = ch;
+          c.getContext('2d')!.drawImage(img, 0, 0, cw, ch);
+          finalUrl = c.toDataURL('image/png');
+        }
+        const w = Math.min(220, natW);
+        const h = Math.max(24, Math.round((w / natW) * natH));
         const newId = `img_${Date.now()}`;
         commitState((prev) => ({
           ...prev,
@@ -1517,28 +1965,29 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             {
               id: newId,
               pageNumber,
-              dataUrl,
-              x: 80,
-              y: 120,
+              dataUrl: finalUrl,
+              x: Math.max(16, Math.round((pageSize.width - w) / 2)),
+              y: Math.max(24, Math.round((pageSize.height - h) / 3)),
               width: w,
               height: h,
               rotation: 0,
             },
           ],
         }));
-        setSelectedImageId(newId);
+        setSelectedElement({ kind: 'image', id: newId });
         setActiveTool('select');
+        flashStatus(t.editor.tapSelectedHint, 2400);
       };
-      img.src = dataUrl;
+      img.src = rawUrl;
     };
     reader.readAsDataURL(file);
     e.target.value = '';
   };
 
-  const handleSave = async (mode: 'version' | 'copy' | 'download') => {
+  const handleSave = async (mode: 'version' | 'copy' | 'download', closeAfter = false) => {
     setSaving(true);
     try {
-      const editedBytes = await applyPdfEditsToBytes(doc.pdfBytes, state);
+      const editedBytes = await applyPdfEditsToBytes(basePdfRef.current.bytes, stateRef.current);
       const seal = pendingSig?.attachIntegritySeal
         ? await computeSha256Hex(editedBytes)
         : doc.sha256Seal;
@@ -1549,7 +1998,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           doc.name.replace(/\.pdf$/i, '_edited.pdf'),
           'application/pdf'
         );
-        setStatusMessage(language === 'bn' ? 'এক্সপোর্ট সম্পন্ন হয়েছে' : 'Exported modified PDF');
+        flashStatus(language === 'bn' ? 'এক্সপোর্ট সম্পন্ন হয়েছে' : 'Exported modified PDF', 2600);
         return;
       }
 
@@ -1569,7 +2018,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             {
               id: `ver_${now}`,
               timestamp: now,
-              note: `Edited (${state.replacements.length} text edits, ${state.annotations.length} annotations)`,
+              note: `Edited (${stateRef.current.replacements.length} text edits, ${stateRef.current.annotations.length} annotations)`,
               sizeBytes: editedBytes.byteLength,
               pdfBytes: cloneBuffer(editedBytes),
             },
@@ -1577,7 +2026,12 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           ],
         };
         await onSaveNewVersion(updated);
-        onClose();
+        setSavedSnapshot(stateRef.current);
+        if (closeAfter) {
+          onClose();
+        } else {
+          flashStatus(t.editor.savedStayHint, 3200);
+        }
       } else {
         const copyDoc: DocumentRecord = {
           ...doc,
@@ -1602,20 +2056,30 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           ],
         };
         await onSaveAsCopy(copyDoc);
-        onClose();
+        if (closeAfter) {
+          onClose();
+        } else {
+          flashStatus(t.editor.savedCopyStayHint, 3200);
+        }
       }
     } catch (err) {
-      setStatusMessage(err instanceof Error ? err.message : 'Failed to save PDF edits');
+      flashStatus(err instanceof Error ? err.message : 'Failed to save PDF edits', 3200);
     } finally {
       setSaving(false);
     }
   };
 
-  const hasUnsavedChanges =
+  const hasAnyEdits =
     state.replacements.length > 0 ||
     state.addedTexts.length > 0 ||
     state.addedImages.length > 0 ||
     state.annotations.length > 0;
+  const hasUnsavedChanges = savedSnapshot
+    ? state.replacements !== savedSnapshot.replacements ||
+      state.addedTexts !== savedSnapshot.addedTexts ||
+      state.addedImages !== savedSnapshot.addedImages ||
+      state.annotations !== savedSnapshot.annotations
+    : hasAnyEdits;
 
   const handleRequestClose = () => {
     if (hasUnsavedChanges) {
@@ -1640,7 +2104,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
   const pageAddedTexts = state.addedTexts.filter((tb) => tb.pageNumber === pageNumber);
   const pageAddedImages = state.addedImages.filter((im) => im.pageNumber === pageNumber);
   const pageAnnotations = state.annotations.filter((an) => an.pageNumber === pageNumber);
-  const pageErasableCount = pageAnnotations.filter(isErasableAnnotation).length;
+  const pageErasableCount = pageAnnotations.filter((a) => isErasableAnnotation(a, eraserIncludeAll)).length;
 
   const selectedImg = pageAddedImages.find((i) => i.id === selectedImageId);
   const selectedTextBox =
@@ -1652,41 +2116,37 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       ? pageAnnotations.find((an) => an.id === selectedElement.id)
       : undefined;
 
-  const toolsList: Array<{ id: EditorTool; label: string; icon: React.ReactNode }> = [
-    { id: 'select', label: t.editor.tools.select, icon: <MousePointer2 className="w-4 h-4" /> },
-    { id: 'pan', label: t.editor.tools.pan, icon: <Hand className="w-4 h-4" /> },
-    { id: 'editText', label: t.editor.tools.selectText, icon: <MousePointer className="w-4 h-4" /> },
-    { id: 'addText', label: t.editor.tools.addText, icon: <TypeIcon className="w-4 h-4" /> },
-    { id: 'draw', label: t.editor.tools.draw, icon: <Pen className="w-4 h-4" /> },
-    { id: 'eraser', label: t.editor.tools.eraser, icon: <Eraser className="w-4 h-4" /> },
-    { id: 'highlight', label: t.editor.tools.highlight, icon: <Highlighter className="w-4 h-4" /> },
-    { id: 'underline', label: t.editor.tools.underline, icon: <Underline className="w-4 h-4" /> },
-    { id: 'strike', label: t.editor.tools.strike, icon: <Strikethrough className="w-4 h-4" /> },
-    { id: 'rect', label: t.editor.tools.rect, icon: <Square className="w-4 h-4" /> },
-    { id: 'circle', label: t.editor.tools.circle, icon: <Circle className="w-4 h-4" /> },
-    { id: 'arrow', label: t.editor.tools.arrow, icon: <ArrowUpRight className="w-4 h-4" /> },
-    { id: 'whiteout', label: t.editor.tools.whiteout, icon: <Square className="w-4 h-4 fill-current" /> },
-    { id: 'addImage', label: t.editor.tools.addImage, icon: <ImagePlus className="w-4 h-4" /> },
-    { id: 'sticky', label: t.editor.tools.sticky, icon: <MessageSquare className="w-4 h-4" /> },
-    { id: 'signature', label: t.editor.tools.signature, icon: <PenTool className="w-4 h-4" /> },
-    { id: 'stamp', label: t.editor.tools.stamp, icon: <Calendar className="w-4 h-4" /> },
+  const toolsList: Array<{ id: EditorTool; label: string; category: 'core' | 'draw' | 'markup' | 'shapes' | 'insert'; icon: React.ReactNode }> = [
+    { id: 'select', label: t.editor.tools.select, category: 'core', icon: <MousePointer2 className="w-4 h-4" /> },
+    { id: 'pan', label: t.editor.tools.pan, category: 'core', icon: <Hand className="w-4 h-4" /> },
+    { id: 'editText', label: t.editor.tools.selectText, category: 'core', icon: <MousePointer className="w-4 h-4" /> },
+    { id: 'addText', label: t.editor.tools.addText, category: 'core', icon: <TypeIcon className="w-4 h-4" /> },
+    { id: 'draw', label: t.editor.tools.draw, category: 'draw', icon: <Pen className="w-4 h-4" /> },
+    { id: 'eraser', label: t.editor.tools.eraser, category: 'draw', icon: <Eraser className="w-4 h-4" /> },
+    { id: 'highlight', label: t.editor.tools.highlight, category: 'markup', icon: <Highlighter className="w-4 h-4" /> },
+    { id: 'underline', label: t.editor.tools.underline, category: 'markup', icon: <Underline className="w-4 h-4" /> },
+    { id: 'strike', label: t.editor.tools.strike, category: 'markup', icon: <Strikethrough className="w-4 h-4" /> },
+    { id: 'rect', label: t.editor.tools.rect, category: 'shapes', icon: <Square className="w-4 h-4" /> },
+    { id: 'circle', label: t.editor.tools.circle, category: 'shapes', icon: <Circle className="w-4 h-4" /> },
+    { id: 'arrow', label: t.editor.tools.arrow, category: 'shapes', icon: <ArrowUpRight className="w-4 h-4" /> },
+    { id: 'whiteout', label: t.editor.tools.whiteout, category: 'shapes', icon: <Square className="w-4 h-4 fill-current" /> },
+    { id: 'addImage', label: t.editor.tools.addImage, category: 'insert', icon: <ImagePlus className="w-4 h-4" /> },
+    { id: 'sticky', label: t.editor.tools.sticky, category: 'insert', icon: <MessageSquare className="w-4 h-4" /> },
+    { id: 'signature', label: t.editor.tools.signature, category: 'insert', icon: <PenTool className="w-4 h-4" /> },
+    { id: 'stamp', label: t.editor.tools.stamp, category: 'insert', icon: <Calendar className="w-4 h-4" /> },
   ];
 
-  // Existing elements ignore pointers while drawing/stroking/erasing so you can draw smoothly over anything
+  const handleFitWidth = () => {
+    const sc = canvasScrollRef.current;
+    const avail = sc ? Math.max(240, sc.clientWidth - 28) : (typeof window !== 'undefined' ? window.innerWidth - 28 : 595);
+    const next = Math.max(0.4, Math.min(2.5, Number((avail / Math.max(100, pageSize.width)).toFixed(2))));
+    setScale(next);
+  };
+
+  // Existing elements ignore pointers while drawing/stroking/erasing/eyedropper so you can draw smoothly over anything
   const lockExistingElements = isDragStrokeTool || activeTool === 'eraser';
 
-  const showContextualSubBar =
-    activeTool === 'editText' ||
-    activeTool === 'draw' ||
-    activeTool === 'eraser' ||
-    activeTool === 'rect' ||
-    activeTool === 'circle' ||
-    activeTool === 'arrow' ||
-    activeTool === 'highlight' ||
-    activeTool === 'underline' ||
-    activeTool === 'strike' ||
-    activeTool === 'stamp' ||
-    activeTool === 'signature';
+  const showContextualSubBar = Boolean(selectedImg || selectedTextBox || selectedAnn) || activeTool !== 'pan';
 
   const duplicateSelectedElement = () => {
     if (!selectedElement) return;
@@ -1765,9 +2225,48 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             <h1 className="text-sm font-bold text-[#142B4A] dark:text-white truncate">
               {t.editor.title}
             </h1>
-            <p className="text-[11px] font-mono-nums text-slate-500">
-              {t.viewer.page} {pageNumber}/{doc.pageCount}
-            </p>
+            <div className="relative">
+              <button
+                type="button"
+                onClick={() => {
+                  setPageJumpInput(String(pageNumber));
+                  setShowPageJump((v) => !v);
+                }}
+                className="text-[11px] font-mono-nums text-slate-600 dark:text-slate-300 hover:text-[#2563EB] flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-slate-100 dark:bg-slate-800"
+              >
+                <span>{t.viewer.page} {pageNumber}/{doc.pageCount}</span>
+              </button>
+              {showPageJump && (
+                <form
+                  onSubmit={(e) => {
+                    e.preventDefault();
+                    const parsed = parseInt(pageJumpInput, 10);
+                    if (!Number.isNaN(parsed)) {
+                      setPageNumber(Math.max(1, Math.min(doc.pageCount, parsed)));
+                    }
+                    setShowPageJump(false);
+                  }}
+                  className="absolute left-0 top-full mt-1.5 z-40 p-2 rounded-xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-xl flex items-center gap-1.5"
+                >
+                  <input
+                    type="number"
+                    min={1}
+                    max={doc.pageCount}
+                    value={pageJumpInput}
+                    onChange={(e) => setPageJumpInput(e.target.value)}
+                    autoFocus
+                    className="w-16 h-8 px-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-mono-nums"
+                  />
+                  <button
+                    type="submit"
+                    aria-label="Go to page"
+                    className="h-8 px-2.5 rounded-lg bg-[#2563EB] text-white text-xs font-semibold flex items-center justify-center"
+                  >
+                    <Check className="w-3.5 h-3.5" />
+                  </button>
+                </form>
+              )}
+            </div>
           </div>
         </div>
 
@@ -1808,15 +2307,30 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         </div>
       </header>
 
-      {/* Genuine Text Layer Diagnostic Banner & Zoom */}
+      {/* Diagnostic Banner & Zoom */}
       <div className="px-3 py-1.5 bg-slate-100 dark:bg-slate-900/70 border-b border-slate-200 dark:border-slate-800 flex items-center justify-between gap-2 text-[11px] text-slate-600 dark:text-slate-300">
-        <span className="truncate">
-          {textRuns.length > 0 ? t.editor.nativeTextDetected : t.editor.scannedOnlyNotice}
-        </span>
-        <div className="flex items-center gap-1.5 shrink-0">
-          {statusMessage && (
-            <span className="font-semibold text-[#2563EB] mr-1">{statusMessage}</span>
+        <span className="truncate font-medium">
+          {statusMessage ? (
+            <span className="font-semibold text-[#2563EB]">{statusMessage}</span>
+          ) : eyedropperActive ? (
+            <span className="font-semibold text-[#2563EB]">{t.editor.pickFromPageHint}</span>
+          ) : selectedElement ? (
+            t.editor.tapSelectedHint
+          ) : textRuns.length > 0 ? (
+            t.editor.nativeTextDetected
+          ) : (
+            t.editor.scannedOnlyNotice
           )}
+        </span>
+        <div className="flex items-center gap-1 shrink-0">
+          <button
+            type="button"
+            onClick={handleFitWidth}
+            title={t.editor.fitWidth}
+            className="h-7 px-2 rounded-lg bg-white dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-[10px] font-semibold"
+          >
+            {t.editor.fitWidth}
+          </button>
           <button
             type="button"
             onClick={() => setScale((s) => Math.max(0.4, Number((s - 0.15).toFixed(2))))}
@@ -1825,7 +2339,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           >
             <ZoomOut className="w-3.5 h-3.5" />
           </button>
-          <span className="font-mono-nums text-[11px] min-w-[38px] text-center">
+          <span className="font-mono-nums text-[11px] min-w-[36px] text-center">
             {Math.round(scale * 100)}%
           </span>
           <button
@@ -1839,473 +2353,8 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         </div>
       </div>
 
-      {/* Main Editable Page Canvas Area with non-shifting floating element toolbar */}
+      {/* Main Editable Page Canvas Area */}
       <div className="relative flex-1 flex flex-col overflow-hidden">
-        {(selectedImg || selectedTextBox || selectedAnn) && (
-          <div className="absolute top-2 left-1/2 -translate-x-1/2 z-30 max-w-[94vw] overflow-x-auto no-scrollbar px-3 py-1.5 rounded-2xl bg-[#142B4A]/95 backdrop-blur-md text-white shadow-xl border border-white/15 flex items-center gap-1.5 text-xs">
-            {selectedImg && (
-              <>
-                <span className="font-semibold text-cyan-300 pr-1 whitespace-nowrap">
-                  {language === 'bn' ? 'ছবি' : 'Image'}
-                </span>
-                <button
-                  type="button"
-                  onClick={() =>
-                    commitState((prev) => ({
-                      ...prev,
-                      addedImages: prev.addedImages.map((im) =>
-                        im.id === selectedImg.id
-                          ? { ...im, width: Math.round(im.width * 1.15), height: Math.round(im.height * 1.15) }
-                          : im
-                      ),
-                    }))
-                  }
-                  className="px-2.5 py-1 rounded-lg bg-white/15 whitespace-nowrap"
-                >
-                  + {language === 'bn' ? 'বড়' : 'Size'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    commitState((prev) => ({
-                      ...prev,
-                      addedImages: prev.addedImages.map((im) =>
-                        im.id === selectedImg.id
-                          ? { ...im, width: Math.max(32, Math.round(im.width * 0.85)), height: Math.max(32, Math.round(im.height * 0.85)) }
-                          : im
-                      ),
-                    }))
-                  }
-                  className="px-2.5 py-1 rounded-lg bg-white/15 whitespace-nowrap"
-                >
-                  - {language === 'bn' ? 'ছোট' : 'Size'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCropInsets({ top: 0, right: 0, bottom: 0, left: 0 });
-                    setCropModalImg(selectedImg);
-                  }}
-                  className="px-2.5 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
-                >
-                  <Crop className="w-3.5 h-3.5" /> {language === 'bn' ? 'ক্রপ' : 'Crop'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    commitState((prev) => ({
-                      ...prev,
-                      addedImages: prev.addedImages.map((im) =>
-                        im.id === selectedImg.id ? { ...im, rotation: (im.rotation + 90) % 360 } : im
-                      ),
-                    }))
-                  }
-                  className="px-2.5 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
-                >
-                  <RotateCw className="w-3.5 h-3.5" /> 90°
-                </button>
-                <button
-                  type="button"
-                  onClick={duplicateSelectedElement}
-                  title={t.editor.duplicate}
-                  className="px-2 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
-                >
-                  <Copy className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={bringSelectedToFront}
-                  title={t.editor.bringFront}
-                  className="px-2 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
-                >
-                  <Layers className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    commitState((prev) => ({
-                      ...prev,
-                      addedImages: prev.addedImages.filter((im) => im.id !== selectedImg.id),
-                    }));
-                    setSelectedElement(null);
-                  }}
-                  aria-label="Delete selected image"
-                  className="px-2.5 py-1 rounded-lg bg-rose-500 text-white"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
-              </>
-            )}
-
-            {selectedTextBox && (
-              <>
-                <span className="font-semibold text-cyan-300 pr-1 whitespace-nowrap">
-                  {language === 'bn' ? 'টেক্সট' : 'Text'}
-                </span>
-                <button
-                  type="button"
-                  onClick={() => openEditAddedTextBox(selectedTextBox)}
-                  className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white font-semibold flex items-center gap-1 whitespace-nowrap"
-                >
-                  <Pencil className="w-3 h-3" /> {language === 'bn' ? 'এডিট' : 'Edit'}
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    commitState((prev) => ({
-                      ...prev,
-                      addedTexts: prev.addedTexts.map((tb) =>
-                        tb.id === selectedTextBox.id ? { ...tb, fontSize: Math.min(64, tb.fontSize + 2) } : tb
-                      ),
-                    }))
-                  }
-                  className="px-2 py-1 rounded-lg bg-white/15 whitespace-nowrap"
-                >
-                  A+
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    commitState((prev) => ({
-                      ...prev,
-                      addedTexts: prev.addedTexts.map((tb) =>
-                        tb.id === selectedTextBox.id ? { ...tb, fontSize: Math.max(8, tb.fontSize - 2) } : tb
-                      ),
-                    }))
-                  }
-                  className="px-2 py-1 rounded-lg bg-white/15 whitespace-nowrap"
-                >
-                  A-
-                </button>
-                <button
-                  type="button"
-                  onClick={() =>
-                    commitState((prev) => ({
-                      ...prev,
-                      addedTexts: prev.addedTexts.map((tb) =>
-                        tb.id === selectedTextBox.id ? { ...tb, rotation: ((tb.rotation || 0) + 90) % 360 } : tb
-                      ),
-                    }))
-                  }
-                  className="px-2 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
-                >
-                  <RotateCw className="w-3 h-3" /> 90°
-                </button>
-                <button
-                  type="button"
-                  onClick={duplicateSelectedElement}
-                  title={t.editor.duplicate}
-                  className="px-2 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
-                >
-                  <Copy className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={bringSelectedToFront}
-                  title={t.editor.bringFront}
-                  className="px-2 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
-                >
-                  <Layers className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    commitState((prev) => ({
-                      ...prev,
-                      addedTexts: prev.addedTexts.filter((tb) => tb.id !== selectedTextBox.id),
-                    }));
-                    setSelectedElement(null);
-                  }}
-                  aria-label="Delete text box"
-                  className="px-2.5 py-1 rounded-lg bg-rose-500 text-white"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
-              </>
-            )}
-
-            {selectedAnn && (
-              <>
-                <span className="font-semibold text-cyan-300 pr-1 capitalize whitespace-nowrap">
-                  {selectedAnn.kind}
-                </span>
-                {selectedAnn.kind === 'sticky' && (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => openEditStickyNote(selectedAnn)}
-                      className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white font-semibold flex items-center gap-1 whitespace-nowrap"
-                    >
-                      <Pencil className="w-3 h-3" /> {language === 'bn' ? 'এডিট' : 'Edit'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        commitState((prev) => ({
-                          ...prev,
-                          annotations: prev.annotations.map((an) =>
-                            an.id === selectedAnn.id
-                              ? { ...an, fontSize: Math.min(22, (an.fontSize || 10) + 1.5) }
-                              : an
-                          ),
-                        }))
-                      }
-                      className="px-2 py-1 rounded-lg bg-white/15 whitespace-nowrap"
-                    >
-                      A+
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        commitState((prev) => ({
-                          ...prev,
-                          annotations: prev.annotations.map((an) =>
-                            an.id === selectedAnn.id
-                              ? { ...an, fontSize: Math.max(7, (an.fontSize || 10) - 1.5) }
-                              : an
-                          ),
-                        }))
-                      }
-                      className="px-2 py-1 rounded-lg bg-white/15 whitespace-nowrap"
-                    >
-                      A-
-                    </button>
-                  </>
-                )}
-                {selectedAnn.kind === 'stamp' && (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        commitState((prev) => ({
-                          ...prev,
-                          annotations: prev.annotations.map((an) => {
-                            if (an.id !== selectedAnn.id) return an;
-                            const nextFs = Math.min(24, (an.fontSize || 10) + 2);
-                            const scaleF = nextFs / (an.fontSize || 10);
-                            return {
-                              ...an,
-                              fontSize: nextFs,
-                              width: Math.round((an.width || 96) * scaleF),
-                              height: Math.round((an.height || 28) * scaleF),
-                            };
-                          }),
-                        }))
-                      }
-                      className="px-2 py-1 rounded-lg bg-white/15 whitespace-nowrap"
-                    >
-                      A+
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        commitState((prev) => ({
-                          ...prev,
-                          annotations: prev.annotations.map((an) => {
-                            if (an.id !== selectedAnn.id) return an;
-                            const nextFs = Math.max(8, (an.fontSize || 10) - 2);
-                            const scaleF = nextFs / (an.fontSize || 10);
-                            return {
-                              ...an,
-                              fontSize: nextFs,
-                              width: Math.max(72, Math.round((an.width || 96) * scaleF)),
-                              height: Math.max(22, Math.round((an.height || 28) * scaleF)),
-                            };
-                          }),
-                        }))
-                      }
-                      className="px-2 py-1 rounded-lg bg-white/15 whitespace-nowrap"
-                    >
-                      A-
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        commitState((prev) => ({
-                          ...prev,
-                          annotations: prev.annotations.map((an) =>
-                            an.id === selectedAnn.id ? { ...an, rotation: ((an.rotation || 0) + 90) % 360 } : an
-                          ),
-                        }))
-                      }
-                      className="px-2 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
-                    >
-                      <RotateCw className="w-3 h-3" /> 90°
-                    </button>
-                  </>
-                )}
-                {selectedAnn.kind === 'arrow' && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      commitState((prev) => ({
-                        ...prev,
-                        annotations: prev.annotations.map((an) => {
-                          if (an.id !== selectedAnn.id) return an;
-                          const order: Array<'single' | 'double' | 'line'> = ['single', 'double', 'line'];
-                          const cur = an.arrowStyle || 'single';
-                          return { ...an, arrowStyle: order[(order.indexOf(cur) + 1) % order.length] };
-                        }),
-                      }))
-                    }
-                    className="px-2.5 py-1 rounded-lg bg-white/15 whitespace-nowrap"
-                  >
-                    {(selectedAnn.arrowStyle || 'single') === 'double'
-                      ? t.editor.arrowDouble
-                      : (selectedAnn.arrowStyle || 'single') === 'line'
-                      ? t.editor.arrowLine
-                      : t.editor.arrowSingle}
-                  </button>
-                )}
-                {(selectedAnn.kind === 'rect' || selectedAnn.kind === 'circle' || selectedAnn.kind === 'arrow') && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      commitState((prev) => ({
-                        ...prev,
-                        annotations: prev.annotations.map((an) =>
-                          an.id === selectedAnn.id
-                            ? { ...an, lineStyle: an.lineStyle === 'dashed' ? 'solid' : 'dashed' }
-                            : an
-                        ),
-                      }))
-                    }
-                    className="px-2.5 py-1 rounded-lg bg-white/15 whitespace-nowrap"
-                  >
-                    {selectedAnn.lineStyle === 'dashed' ? t.editor.dashed : t.editor.solid}
-                  </button>
-                )}
-                {(selectedAnn.kind === 'rect' || selectedAnn.kind === 'circle') && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      commitState((prev) => ({
-                        ...prev,
-                        annotations: prev.annotations.map((an) =>
-                          an.id === selectedAnn.id
-                            ? { ...an, fillColor: an.fillColor ? undefined : an.color }
-                            : an
-                        ),
-                      }))
-                    }
-                    className="px-2.5 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
-                  >
-                    <PaintBucket className="w-3 h-3" /> {t.editor.fillShape}
-                  </button>
-                )}
-                {(selectedAnn.kind === 'freehand' ||
-                  selectedAnn.kind === 'rect' ||
-                  selectedAnn.kind === 'circle' ||
-                  selectedAnn.kind === 'arrow' ||
-                  selectedAnn.kind === 'underline' ||
-                  selectedAnn.kind === 'strikethrough') && (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        commitState((prev) => ({
-                          ...prev,
-                          annotations: prev.annotations.map((an) =>
-                            an.id === selectedAnn.id
-                              ? { ...an, strokeWidth: Math.min(18, (an.strokeWidth || 2.5) + 1.5) }
-                              : an
-                          ),
-                        }))
-                      }
-                      className="px-2 py-1 rounded-lg bg-white/15 whitespace-nowrap"
-                    >
-                      + px
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() =>
-                        commitState((prev) => ({
-                          ...prev,
-                          annotations: prev.annotations.map((an) =>
-                            an.id === selectedAnn.id
-                              ? { ...an, strokeWidth: Math.max(1, (an.strokeWidth || 2.5) - 1.5) }
-                              : an
-                          ),
-                        }))
-                      }
-                      className="px-2 py-1 rounded-lg bg-white/15 whitespace-nowrap"
-                    >
-                      - px
-                    </button>
-                  </>
-                )}
-                {selectedAnn.kind !== 'whiteout' && selectedAnn.kind !== 'signature' && (
-                  <button
-                    type="button"
-                    onClick={() =>
-                      commitState((prev) => ({
-                        ...prev,
-                        annotations: prev.annotations.map((an) =>
-                          an.id === selectedAnn.id
-                            ? {
-                                ...an,
-                                color: activeColor,
-                                fillColor:
-                                  an.kind === 'sticky'
-                                    ? an.fillColor
-                                    : an.fillColor
-                                    ? activeColor
-                                    : undefined,
-                              }
-                            : an
-                        ),
-                      }))
-                    }
-                    className="px-2.5 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
-                  >
-                    <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ backgroundColor: activeColor }} />
-                    {language === 'bn' ? 'রঙ' : 'Color'}
-                  </button>
-                )}
-                <button
-                  type="button"
-                  onClick={duplicateSelectedElement}
-                  title={t.editor.duplicate}
-                  className="px-2 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
-                >
-                  <Copy className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={bringSelectedToFront}
-                  title={t.editor.bringFront}
-                  className="px-2 py-1 rounded-lg bg-white/15 flex items-center gap-1 whitespace-nowrap"
-                >
-                  <Layers className="w-3.5 h-3.5" />
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    commitState((prev) => ({
-                      ...prev,
-                      annotations: prev.annotations.filter((an) => an.id !== selectedAnn.id),
-                    }));
-                    setSelectedElement(null);
-                  }}
-                  aria-label="Delete annotation"
-                  className="px-2.5 py-1 rounded-lg bg-rose-500 text-white"
-                >
-                  <Trash2 className="w-3.5 h-3.5" />
-                </button>
-              </>
-            )}
-
-            <button
-              type="button"
-              onClick={() => setSelectedElement(null)}
-              aria-label="Deselect element"
-              className="px-1.5 py-1 rounded-lg hover:bg-white/10 text-slate-300"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        )}
-
         <div
           ref={canvasScrollRef}
           style={{
@@ -2321,10 +2370,12 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             className="min-w-full min-h-full w-fit p-3 sm:p-6 flex items-start justify-center"
           >
             <div
-              className="relative bg-white shadow-xl rounded-md overflow-hidden select-none shrink-0"
+              className="relative bg-white shadow-xl rounded-md overflow-visible select-none shrink-0"
               style={{ width: pageSize.width * scale, height: pageSize.height * scale }}
             >
-              <canvas ref={canvasRef} className="block w-full h-full" />
+              <div className="absolute inset-0 rounded-md overflow-hidden pointer-events-none">
+                <canvas ref={canvasRef} className="block w-full h-full" />
+              </div>
 
               {/* Interactive Vector & Text Overlay Layer */}
               <div
@@ -2342,16 +2393,18 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     activeTool === 'pan' ||
                     isDragStrokeTool ||
                     activeTool === 'eraser' ||
+                    eyedropperActive ||
                     (activeTool === 'editText' && editBoxDrawMode)
                       ? 'none'
                       : 'pan-x pan-y',
                   pointerEvents: activeTool === 'pan' ? 'none' : 'auto',
                   cursor:
+                    eyedropperActive ||
                     isDragStrokeTool ||
                     activeTool === 'eraser' ||
                     (activeTool === 'editText' && editBoxDrawMode)
                       ? 'crosshair'
-                      : activeTool === 'addText' || activeTool === 'sticky' || activeTool === 'stamp' || activeTool === 'signature'
+                      : isPlacementTool
                       ? 'copy'
                       : 'default',
                 }}
@@ -2389,9 +2442,15 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                         minWidth: Math.max(16, rep.width * scale),
                         minHeight: Math.max(14, rep.height * scale),
                         backgroundColor: rep.backgroundColor || '#FFFFFF',
-                        pointerEvents: lockExistingElements ? 'none' : 'auto',
+                        pointerEvents: lockExistingElements || isPlacementTool || eyedropperActive ? 'none' : 'auto',
                       }}
-                      className="absolute text-left rounded border border-[#2563EB]/80 z-10"
+                      className={`absolute text-left rounded z-10 ${
+                        activeTool === 'editText'
+                          ? 'border border-[#2563EB]/80'
+                          : rep.deleted
+                          ? 'border-0'
+                          : 'border border-transparent hover:border-[#2563EB]/60'
+                      }`}
                     >
                       {!rep.deleted && (
                         <span
@@ -2419,6 +2478,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     runs={displayedTextRuns}
                     replacedRunIds={replacedRunIds}
                     scale={scale}
+                    disabled={editBoxDrawMode}
                     onSelectRun={handleSelectRunStable}
                   />
                 )}
@@ -2429,17 +2489,17 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   const bgStyle =
                     tb.backgroundColor && tb.backgroundColor !== 'transparent'
                       ? tb.backgroundColor
-                      : 'rgba(255,255,255,0.22)';
+                      : 'rgba(255,255,255,0.12)';
                   return (
                     <div
                       key={tb.id}
                       onPointerDown={(e) => {
-                        if (lockExistingElements) return;
+                        if (lockExistingElements || eyedropperActive) return;
                         e.stopPropagation();
                         pointerMovedRef.current = false;
-                        preGestureSnapshotRef.current = state;
+                        preGestureSnapshotRef.current = stateRef.current;
                         setSelectedElement({ kind: 'textBox', id: tb.id });
-                        overlayRef.current?.setPointerCapture?.(e.pointerId);
+                        tryCapturePointer(overlayRef.current, e.pointerId);
                         setDraggingItem({
                           kind: 'textBox',
                           id: tb.id,
@@ -2447,16 +2507,22 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                           startClientY: e.clientY,
                           origX: tb.x,
                           origY: tb.y,
+                          wasSelectedBeforeDown: isSelected,
                         });
                       }}
                       style={{
                         left: tb.x * scale,
                         top: tb.y * scale,
                         width: tb.width * scale,
+                        padding: `${2 * scale}px ${4 * scale}px`,
+                        lineHeight: 1.32,
                         fontSize: tb.fontSize * scale,
                         fontFamily: getFontCssStack(tb.fontFamily),
                         color: tb.color,
                         backgroundColor: bgStyle,
+                        borderColor: isSelected ? '#2563EB' : tb.borderColor || 'rgba(37,99,235,0.55)',
+                        borderStyle: tb.borderColor || isSelected ? 'solid' : 'dashed',
+                        borderWidth: isSelected ? 2 : 1,
                         transform: tb.rotation ? `rotate(${tb.rotation}deg)` : undefined,
                         transformOrigin: 'center center',
                         fontWeight: tb.bold ? 700 : 400,
@@ -2465,17 +2531,15 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                         textAlign: tb.align,
                         letterSpacing: `${tb.letterSpacing * scale}px`,
                         touchAction: 'none',
-                        pointerEvents: lockExistingElements ? 'none' : 'auto',
+                        pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
                       }}
-                      title="Drag to move · Tap to edit text"
-                      className={`group absolute px-1.5 py-0.5 rounded whitespace-pre-wrap cursor-move z-10 ${
-                        isSelected
-                          ? 'border-2 border-[#2563EB] ring-2 ring-[#2563EB]/30'
-                          : 'border border-dashed border-[#2563EB]/70'
+                      title="Drag to move · Tap again to edit text"
+                      className={`group absolute rounded whitespace-pre-wrap cursor-move z-10 ${
+                        isSelected ? 'ring-2 ring-[#2563EB]/30 z-20' : ''
                       }`}
                     >
                       {tb.text}
-                      {!lockExistingElements && (
+                      {isSelected && !lockExistingElements && (
                         <>
                           <button
                             type="button"
@@ -2486,7 +2550,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                               openEditAddedTextBox(tb);
                             }}
                             aria-label="Edit text box"
-                            className="absolute -top-3 right-5 w-6 h-6 rounded-full bg-[#2563EB] text-white flex items-center justify-center shadow-md"
+                            className="absolute -top-3 right-5 w-6 h-6 rounded-full bg-[#2563EB] text-white flex items-center justify-center shadow-md z-30"
                           >
                             <Pencil className="w-3 h-3" />
                           </button>
@@ -2500,10 +2564,10 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                                 ...prev,
                                 addedTexts: prev.addedTexts.filter((x) => x.id !== tb.id),
                               }));
-                              if (isSelected) setSelectedElement(null);
+                              setSelectedElement(null);
                             }}
                             aria-label="Delete text box"
-                            className="absolute -top-3 -right-2.5 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md"
+                            className="absolute -top-3 -right-2.5 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md z-30"
                           >
                             <X className="w-3.5 h-3.5" />
                           </button>
@@ -2512,9 +2576,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                             onPointerDown={(e) => {
                               e.stopPropagation();
                               pointerMovedRef.current = false;
-                              preGestureSnapshotRef.current = state;
+                              preGestureSnapshotRef.current = stateRef.current;
                               setSelectedElement({ kind: 'textBox', id: tb.id });
-                              overlayRef.current?.setPointerCapture?.(e.pointerId);
+                              tryCapturePointer(overlayRef.current, e.pointerId);
                               setResizingTextBox({
                                 id: tb.id,
                                 startClientX: e.clientX,
@@ -2522,7 +2586,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                               });
                             }}
                             title="Drag to resize text box width"
-                            className="absolute top-1/2 -right-2 -translate-y-1/2 w-4 h-7 rounded-full bg-white border-2 border-[#2563EB] shadow cursor-ew-resize"
+                            className="absolute top-1/2 -right-2 -translate-y-1/2 w-4 h-7 rounded-full bg-white border-2 border-[#2563EB] shadow cursor-ew-resize z-30"
                           />
                         </>
                       )}
@@ -2533,16 +2597,35 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 {/* Added images */}
                 {pageAddedImages.map((im) => {
                   const isSelected = selectedImageId === im.id;
+                  const radiusPx =
+                    Math.min(im.width, im.height) * ((im.borderRadius || 0) / 100) * scale;
+                  const filters: string[] = [];
+                  if ((im.brightness ?? 100) !== 100) filters.push(`brightness(${im.brightness}%)`);
+                  if ((im.contrast ?? 100) !== 100) filters.push(`contrast(${im.contrast}%)`);
+                  if (im.grayscale) filters.push('grayscale(100%)');
+                  const handleList: Array<{
+                    handle: 'nw' | 'n' | 'ne' | 'e' | 'se' | 's' | 'sw' | 'w';
+                    cls: string;
+                  }> = [
+                    { handle: 'nw', cls: '-top-2.5 -left-2.5 w-5 h-5 rounded-full cursor-nwse-resize' },
+                    { handle: 'ne', cls: '-top-2.5 -right-2.5 w-5 h-5 rounded-full cursor-nesw-resize' },
+                    { handle: 'sw', cls: '-bottom-2.5 -left-2.5 w-5 h-5 rounded-full cursor-nesw-resize' },
+                    { handle: 'se', cls: '-bottom-2.5 -right-2.5 w-5 h-5 rounded-full cursor-nwse-resize' },
+                    { handle: 'n', cls: '-top-2 left-1/2 -translate-x-1/2 w-6 h-3.5 rounded-full cursor-ns-resize' },
+                    { handle: 's', cls: '-bottom-2 left-1/2 -translate-x-1/2 w-6 h-3.5 rounded-full cursor-ns-resize' },
+                    { handle: 'w', cls: 'top-1/2 -left-2 -translate-y-1/2 w-3.5 h-6 rounded-full cursor-ew-resize' },
+                    { handle: 'e', cls: 'top-1/2 -right-2 -translate-y-1/2 w-3.5 h-6 rounded-full cursor-ew-resize' },
+                  ];
                   return (
                     <div
                       key={im.id}
                       onPointerDown={(e) => {
-                        if (lockExistingElements) return;
+                        if (lockExistingElements || eyedropperActive) return;
                         e.stopPropagation();
                         pointerMovedRef.current = false;
-                        preGestureSnapshotRef.current = state;
+                        preGestureSnapshotRef.current = stateRef.current;
                         setSelectedImageId(im.id);
-                        overlayRef.current?.setPointerCapture?.(e.pointerId);
+                        tryCapturePointer(overlayRef.current, e.pointerId);
                         setDraggingItem({
                           kind: 'image',
                           id: im.id,
@@ -2550,6 +2633,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                           startClientY: e.clientY,
                           origX: im.x,
                           origY: im.y,
+                          wasSelectedBeforeDown: isSelected,
                         });
                       }}
                       style={{
@@ -2558,22 +2642,53 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                         width: im.width * scale,
                         height: im.height * scale,
                         touchAction: 'none',
-                        pointerEvents: lockExistingElements ? 'none' : 'auto',
+                        pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
                       }}
                       className={`group absolute cursor-move select-none z-10 ${
-                        isSelected ? 'ring-2 ring-[#2563EB]' : 'hover:ring-1 hover:ring-[#2563EB]/60'
+                        isSelected ? 'ring-2 ring-[#2563EB] z-20' : 'hover:ring-1 hover:ring-[#2563EB]/60'
                       }`}
                     >
-                      <img
-                        src={im.dataUrl}
-                        alt="Inserted"
-                        draggable={false}
-                        style={{ transform: `rotate(${im.rotation}deg)` }}
-                        className="w-full h-full object-contain pointer-events-none block"
-                      />
+                      <div
+                        style={{
+                          opacity: im.opacity ?? 1,
+                          transform: `rotate(${im.rotation || 0}deg)`,
+                          borderRadius: `${radiusPx}px`,
+                          border:
+                            im.borderWidth && im.borderWidth > 0
+                              ? `${im.borderWidth * scale}px solid ${im.borderColor || '#142B4A'}`
+                              : undefined,
+                          overflow: 'hidden',
+                        }}
+                        className="w-full h-full pointer-events-none"
+                      >
+                        <img
+                          src={im.dataUrl}
+                          alt="Inserted"
+                          draggable={false}
+                          style={{
+                            transform: `scale(${im.flipX ? -1 : 1}, ${im.flipY ? -1 : 1})`,
+                            filter: filters.length > 0 ? filters.join(' ') : undefined,
+                          }}
+                          className="w-full h-full object-fill pointer-events-none block"
+                        />
+                      </div>
 
-                      {!lockExistingElements && (
+                      {isSelected && !lockExistingElements && (
                         <>
+                          <button
+                            type="button"
+                            style={{ touchAction: 'none' }}
+                            onPointerDown={(e) => e.stopPropagation()}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              preGestureSnapshotRef.current = stateRef.current;
+                              setShowImageAdjustModal(true);
+                            }}
+                            aria-label="Adjust image"
+                            className="absolute -top-3 right-5 z-30 w-6 h-6 rounded-full bg-[#2563EB] text-white flex items-center justify-center shadow-md"
+                          >
+                            <SlidersHorizontal className="w-3 h-3" />
+                          </button>
                           <button
                             type="button"
                             style={{ touchAction: 'none' }}
@@ -2584,47 +2699,40 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                                 ...prev,
                                 addedImages: prev.addedImages.filter((x) => x.id !== im.id),
                               }));
-                              if (isSelected) setSelectedImageId(null);
+                              setSelectedImageId(null);
                             }}
                             aria-label="Delete image"
-                            className="absolute -top-3 -right-3 z-20 w-7 h-7 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md"
+                            className="absolute -top-3 -right-2.5 z-30 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md"
                           >
-                            <X className="w-4 h-4" />
+                            <X className="w-3.5 h-3.5" />
                           </button>
 
-                          {(['nw', 'sw', 'se'] as const).map((corner) => {
-                            const posClass =
-                              corner === 'nw'
-                                ? '-top-2.5 -left-2.5 cursor-nwse-resize'
-                                : corner === 'sw'
-                                ? '-bottom-2.5 -left-2.5 cursor-nesw-resize'
-                                : '-bottom-2.5 -right-2.5 cursor-nwse-resize';
-                            return (
-                              <div
-                                key={corner}
-                                style={{ touchAction: 'none' }}
-                                onPointerDown={(e) => {
-                                  e.stopPropagation();
-                                  pointerMovedRef.current = false;
-                                  preGestureSnapshotRef.current = state;
-                                  setSelectedImageId(im.id);
-                                  overlayRef.current?.setPointerCapture?.(e.pointerId);
-                                  setResizingImage({
-                                    id: im.id,
-                                    corner,
-                                    startClientX: e.clientX,
-                                    startClientY: e.clientY,
-                                    origX: im.x,
-                                    origY: im.y,
-                                    origW: im.width,
-                                    origH: im.height,
-                                  });
-                                }}
-                                title="Drag to resize picture"
-                                className={`absolute ${posClass} z-20 w-6 h-6 rounded-full bg-white border-2 border-[#2563EB] shadow-md`}
-                              />
-                            );
-                          })}
+                          {handleList.map(({ handle, cls }) => (
+                            <div
+                              key={handle}
+                              style={{ touchAction: 'none' }}
+                              onPointerDown={(e) => {
+                                e.stopPropagation();
+                                pointerMovedRef.current = false;
+                                preGestureSnapshotRef.current = stateRef.current;
+                                setSelectedImageId(im.id);
+                                tryCapturePointer(overlayRef.current, e.pointerId);
+                                setResizingImage({
+                                  id: im.id,
+                                  handle,
+                                  lockAspect: im.lockAspect !== false,
+                                  startClientX: e.clientX,
+                                  startClientY: e.clientY,
+                                  origX: im.x,
+                                  origY: im.y,
+                                  origW: im.width,
+                                  origH: im.height,
+                                });
+                              }}
+                              title="Drag to resize picture"
+                              className={`absolute ${cls} z-30 bg-white border-2 border-[#2563EB] shadow-md`}
+                            />
+                          ))}
                         </>
                       )}
                     </div>
@@ -2832,7 +2940,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       fill="none"
                       stroke={activeColor}
                       strokeWidth={strokeWidth}
-                      strokeOpacity={drawMode === 'marker' ? 0.42 : 1}
+                      strokeOpacity={penOpacity}
                       strokeLinecap="round"
                       strokeLinejoin="round"
                     />
@@ -2907,7 +3015,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       y={liveBox.y}
                       width={Math.abs(liveBox.w)}
                       height={Math.max(10, Math.abs(liveBox.h))}
-                      fill="#FFFFFF"
+                      fill={whiteoutColor}
                       stroke="#94A3B8"
                       strokeWidth={1}
                       strokeDasharray="3 2"
@@ -2991,9 +3099,33 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       strokeDasharray="3 2"
                     />
                   )}
+
+                  {/* Magnetic Alignment Snap Guides */}
+                  {snapGuides?.x !== undefined && (
+                    <line
+                      x1={snapGuides.x}
+                      y1={0}
+                      x2={snapGuides.x}
+                      y2={pageSize.height}
+                      stroke="#2563EB"
+                      strokeWidth={1.2}
+                      strokeDasharray="5 3"
+                    />
+                  )}
+                  {snapGuides?.y !== undefined && (
+                    <line
+                      x1={0}
+                      y1={snapGuides.y}
+                      x2={pageSize.width}
+                      y2={snapGuides.y}
+                      stroke="#2563EB"
+                      strokeWidth={1.2}
+                      strokeDasharray="5 3"
+                    />
+                  )}
                 </svg>
 
-                {/* Live Angle & Length Readout Badge when drawing or adjusting an arrow / sticky arrow */}
+                {/* Live Angle & Length Readout Badge when drawing arrow */}
                 {(liveBox && activeTool === 'arrow' && Math.hypot(liveBox.w, liveBox.h) > 6) && (
                   <div
                     style={{
@@ -3003,6 +3135,30 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     className="pointer-events-none absolute z-30 px-2 py-0.5 rounded-full bg-slate-900/90 text-white font-mono-nums text-[10px] shadow"
                   >
                     {Math.round((Math.atan2(liveBox.h, liveBox.w) * 180) / Math.PI)}° · {Math.round(Math.hypot(liveBox.w, liveBox.h))}pt
+                  </div>
+                )}
+
+                {/* Live Image Resize & Position HUD */}
+                {resizingImage && selectedImg && (
+                  <div
+                    style={{
+                      left: Math.min(pageSize.width - 110, Math.max(6, selectedImg.x)) * scale,
+                      top: Math.max(6, selectedImg.y * scale - 26),
+                    }}
+                    className="pointer-events-none absolute z-30 px-2 py-0.5 rounded-full bg-[#142B4A]/95 text-white font-mono-nums text-[10px] shadow"
+                  >
+                    {Math.round(selectedImg.width)} × {Math.round(selectedImg.height)} pt
+                  </div>
+                )}
+                {draggingItem?.kind === 'image' && selectedImg && pointerMovedRef.current && (
+                  <div
+                    style={{
+                      left: Math.min(pageSize.width - 100, Math.max(6, selectedImg.x)) * scale,
+                      top: Math.max(6, selectedImg.y * scale - 26),
+                    }}
+                    className="pointer-events-none absolute z-30 px-2 py-0.5 rounded-full bg-[#142B4A]/95 text-white font-mono-nums text-[10px] shadow"
+                  >
+                    {Math.round(selectedImg.x)}, {Math.round(selectedImg.y)} pt
                   </div>
                 )}
 
@@ -3044,9 +3200,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                           onPointerDown={(e) => {
                             e.stopPropagation();
                             pointerMovedRef.current = false;
-                            preGestureSnapshotRef.current = state;
+                            preGestureSnapshotRef.current = stateRef.current;
                             setSelectedElement({ kind: 'annotation', id: ann.id });
-                            overlayRef.current?.setPointerCapture?.(e.pointerId);
+                            tryCapturePointer(overlayRef.current, e.pointerId);
                             setDraggingItem({
                               kind: 'annotation',
                               id: ann.id,
@@ -3054,6 +3210,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                               startClientY: e.clientY,
                               origX: ann.x,
                               origY: ann.y,
+                              wasSelectedBeforeDown: isSel,
                               origPoints: ann.points ? ann.points.map((p) => ({ ...p })) : undefined,
                             });
                           }}
@@ -3063,6 +3220,10 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                             width: bw * scale,
                             height: bh * scale,
                             touchAction: 'none',
+                            pointerEvents:
+                              lockExistingElements || isPlacementTool || eyedropperActive
+                                ? 'none'
+                                : 'auto',
                           }}
                           className={`absolute cursor-move ${
                             isSel ? 'ring-2 ring-[#2563EB] rounded bg-[#2563EB]/5 z-20' : ''
@@ -3107,8 +3268,8 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                                   onPointerDown={(e) => {
                                     e.stopPropagation();
                                     pointerMovedRef.current = false;
-                                    preGestureSnapshotRef.current = state;
-                                    overlayRef.current?.setPointerCapture?.(e.pointerId);
+                                    preGestureSnapshotRef.current = stateRef.current;
+                                    tryCapturePointer(overlayRef.current, e.pointerId);
                                     setResizingAnnotation({
                                       id: ann.id,
                                       handle: corner,
@@ -3134,18 +3295,18 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                                   touchAction: 'none',
                                   left:
                                     ann.kind === 'arrow'
-                                      ? (ann.x - bx) * scale - 9
-                                      : -9,
+                                      ? (ann.x - bx) * scale - 10
+                                      : -10,
                                   top:
                                     ann.kind === 'arrow'
-                                      ? (ann.y - by) * scale - 9
-                                      : (bh * scale) / 2 - 9,
+                                      ? (ann.y - by) * scale - 10
+                                      : (bh * scale) / 2 - 10,
                                 }}
                                 onPointerDown={(e) => {
                                   e.stopPropagation();
                                   pointerMovedRef.current = false;
-                                  preGestureSnapshotRef.current = state;
-                                  overlayRef.current?.setPointerCapture?.(e.pointerId);
+                                  preGestureSnapshotRef.current = stateRef.current;
+                                  tryCapturePointer(overlayRef.current, e.pointerId);
                                   setResizingAnnotation({
                                     id: ann.id,
                                     handle: 'start',
@@ -3157,25 +3318,25 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                                     origH: ann.height,
                                   });
                                 }}
-                                className="absolute w-4.5 h-4.5 rounded-full bg-white border-2 border-[#2563EB] shadow cursor-grab z-30"
+                                className="absolute w-5 h-5 rounded-full bg-white border-2 border-[#2563EB] shadow cursor-grab z-30"
                               />
                               <div
                                 style={{
                                   touchAction: 'none',
                                   left:
                                     ann.kind === 'arrow'
-                                      ? (ann.x + ann.width - bx) * scale - 9
-                                      : bw * scale - 9,
+                                      ? (ann.x + ann.width - bx) * scale - 10
+                                      : bw * scale - 10,
                                   top:
                                     ann.kind === 'arrow'
-                                      ? (ann.y + ann.height - by) * scale - 9
-                                      : (bh * scale) / 2 - 9,
+                                      ? (ann.y + ann.height - by) * scale - 10
+                                      : (bh * scale) / 2 - 10,
                                 }}
                                 onPointerDown={(e) => {
                                   e.stopPropagation();
                                   pointerMovedRef.current = false;
-                                  preGestureSnapshotRef.current = state;
-                                  overlayRef.current?.setPointerCapture?.(e.pointerId);
+                                  preGestureSnapshotRef.current = stateRef.current;
+                                  tryCapturePointer(overlayRef.current, e.pointerId);
                                   setResizingAnnotation({
                                     id: ann.id,
                                     handle: 'end',
@@ -3187,7 +3348,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                                     origH: ann.height,
                                   });
                                 }}
-                                className="absolute w-4.5 h-4.5 rounded-full bg-white border-2 border-[#2563EB] shadow cursor-grab z-30"
+                                className="absolute w-5 h-5 rounded-full bg-white border-2 border-[#2563EB] shadow cursor-grab z-30"
                               />
                               {ann.kind === 'arrow' && (
                                 <div className="pointer-events-none -bottom-6 left-1/2 -translate-x-1/2 absolute px-1.5 py-0.5 rounded bg-slate-900/85 text-white font-mono-nums text-[9px] whitespace-nowrap">
@@ -3206,12 +3367,12 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   .map((ann) => {
                     const isSel = selectedElement?.kind === 'annotation' && selectedElement.id === ann.id;
                     const startDrag = (e: React.PointerEvent) => {
-                      if (lockExistingElements) return;
+                      if (lockExistingElements || eyedropperActive) return;
                       e.stopPropagation();
                       pointerMovedRef.current = false;
-                      preGestureSnapshotRef.current = state;
+                      preGestureSnapshotRef.current = stateRef.current;
                       setSelectedElement({ kind: 'annotation', id: ann.id });
-                      overlayRef.current?.setPointerCapture?.(e.pointerId);
+                      tryCapturePointer(overlayRef.current, e.pointerId);
                       setDraggingItem({
                         kind: 'annotation',
                         id: ann.id,
@@ -3219,11 +3380,12 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                         startClientY: e.clientY,
                         origX: ann.x,
                         origY: ann.y,
+                        wasSelectedBeforeDown: isSel,
                         origTipX: ann.stickyTipX,
                         origTipY: ann.stickyTipY,
                       });
                     };
-                    const removeBtn = !lockExistingElements && (
+                    const removeBtn = isSel && !lockExistingElements && (
                       <button
                         type="button"
                         style={{ touchAction: 'none' }}
@@ -3234,10 +3396,10 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                             ...prev,
                             annotations: prev.annotations.filter((x) => x.id !== ann.id),
                           }));
-                          if (isSel) setSelectedElement(null);
+                          setSelectedElement(null);
                         }}
                         aria-label="Delete annotation"
-                        className="absolute -top-3 -right-3 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md z-20"
+                        className="absolute -top-3 -right-3 w-6 h-6 rounded-full bg-rose-600 text-white flex items-center justify-center shadow-md z-30"
                       >
                         <X className="w-3.5 h-3.5" />
                       </button>
@@ -3263,9 +3425,9 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                               borderColor: isSel ? '#2563EB' : noteAccent,
                               fontSize: fontSize * scale,
                               touchAction: 'none',
-                              pointerEvents: lockExistingElements ? 'none' : 'auto',
+                              pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
                             }}
-                            title="Drag to move · Tap to edit note · Pull corners to resize"
+                            title="Drag to move · Tap again to edit note · Pull corners to resize"
                             className={`absolute p-2 rounded-lg border-2 text-slate-900 shadow-md cursor-move z-10 overflow-visible ${
                               isSel ? 'ring-2 ring-[#2563EB]/30 z-20' : ''
                             }`}
@@ -3279,12 +3441,12 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                               (['nw', 'ne', 'sw', 'se'] as const).map((corner) => {
                                 const posClass =
                                   corner === 'nw'
-                                    ? '-top-2 -left-2 cursor-nwse-resize'
+                                    ? '-top-2.5 -left-2.5 cursor-nwse-resize'
                                     : corner === 'ne'
-                                    ? '-top-2 -right-2 cursor-nesw-resize'
+                                    ? '-top-2.5 -right-2.5 cursor-nesw-resize'
                                     : corner === 'sw'
-                                    ? '-bottom-2 -left-2 cursor-nesw-resize'
-                                    : '-bottom-2 -right-2 cursor-nwse-resize';
+                                    ? '-bottom-2.5 -left-2.5 cursor-nesw-resize'
+                                    : '-bottom-2.5 -right-2.5 cursor-nwse-resize';
                                 return (
                                   <div
                                     key={corner}
@@ -3292,8 +3454,8 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                                     onPointerDown={(e) => {
                                       e.stopPropagation();
                                       pointerMovedRef.current = false;
-                                      preGestureSnapshotRef.current = state;
-                                      overlayRef.current?.setPointerCapture?.(e.pointerId);
+                                      preGestureSnapshotRef.current = stateRef.current;
+                                      tryCapturePointer(overlayRef.current, e.pointerId);
                                       setResizingAnnotation({
                                         id: ann.id,
                                         handle: corner,
@@ -3306,36 +3468,40 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                                       });
                                     }}
                                     title="Drag corner to resize sticky note"
-                                    className={`absolute ${posClass} w-4.5 h-4.5 rounded-full bg-white border-2 border-[#2563EB] shadow-md z-30`}
+                                    className={`absolute ${posClass} w-5 h-5 rounded-full bg-white border-2 border-[#2563EB] shadow-md z-30`}
                                   />
                                 );
                               })}
-                            {isSel && removeBtn}
+                            {removeBtn}
                           </div>
 
-                          {/* Draggable Free-Angle & Any-Length Callout Arrow Tip Handle */}
+                          {/* Draggable Free-Angle & Any-Length Callout Arrow Tip Handle with enlarged mobile touch hit area */}
                           {isSel && !lockExistingElements && geo.hasArrow && (
                             <div
                               style={{
                                 touchAction: 'none',
-                                left: geo.tipX * scale - 10,
-                                top: geo.tipY * scale - 10,
-                                borderColor: noteAccent,
+                                left: geo.tipX * scale - 16,
+                                top: geo.tipY * scale - 16,
                               }}
                               onPointerDown={(e) => {
                                 e.stopPropagation();
                                 pointerMovedRef.current = false;
-                                preGestureSnapshotRef.current = state;
-                                overlayRef.current?.setPointerCapture?.(e.pointerId);
+                                preGestureSnapshotRef.current = stateRef.current;
+                                tryCapturePointer(overlayRef.current, e.pointerId);
                                 setDraggingStickyTip({ id: ann.id });
                               }}
                               title={t.editor.dragTipHint}
-                              className="absolute w-5 h-5 rounded-full bg-white border-[2.5px] shadow-lg cursor-crosshair z-30 flex items-center justify-center"
+                              className="absolute w-8 h-8 cursor-crosshair z-30 flex items-center justify-center"
                             >
                               <span
-                                className="w-2 h-2 rounded-full"
-                                style={{ backgroundColor: noteAccent }}
-                              />
+                                style={{ borderColor: noteAccent }}
+                                className="w-5 h-5 rounded-full bg-white border-[2.5px] shadow-lg flex items-center justify-center"
+                              >
+                                <span
+                                  className="w-2 h-2 rounded-full"
+                                  style={{ backgroundColor: noteAccent }}
+                                />
+                              </span>
                               {draggingStickyTip?.id === ann.id && (
                                 <span className="pointer-events-none absolute -top-6 left-1/2 -translate-x-1/2 px-1.5 py-0.5 rounded bg-slate-900/90 text-white font-mono-nums text-[9px] whitespace-nowrap shadow">
                                   {geo.angleDeg}° · {Math.round(geo.length)}pt
@@ -3349,6 +3515,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     if (ann.kind === 'stamp') {
                       const label = ann.comment || ann.dateStr || '';
                       const stampFont = Math.max(8, Math.min(26, ann.fontSize || 10));
+                      const isSolid = Boolean(ann.fillColor);
                       return (
                         <div
                           key={ann.id}
@@ -3359,15 +3526,16 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                             minWidth: (ann.width || 96) * scale,
                             height: (ann.height || 28) * scale,
                             borderColor: ann.color,
-                            color: ann.color,
+                            backgroundColor: isSolid ? ann.fillColor : 'rgba(255,255,255,0.95)',
+                            color: isSolid ? '#FFFFFF' : ann.color,
                             fontSize: stampFont * scale,
                             transform: ann.rotation ? `rotate(${ann.rotation}deg)` : undefined,
                             transformOrigin: 'center center',
                             touchAction: 'none',
-                            pointerEvents: lockExistingElements ? 'none' : 'auto',
+                            pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
                           }}
-                          className={`absolute px-2.5 rounded border-2 bg-white/95 font-extrabold tracking-wide flex items-center justify-center cursor-move z-10 whitespace-nowrap ${
-                            isSel ? 'ring-2 ring-[#2563EB]' : ''
+                          className={`absolute px-2.5 rounded border-2 font-extrabold tracking-wide flex items-center justify-center cursor-move z-10 whitespace-nowrap ${
+                            isSel ? 'ring-2 ring-[#2563EB] z-20' : ''
                           }`}
                         >
                           {label}
@@ -3383,11 +3551,13 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                           left: ann.x * scale,
                           top: ann.y * scale,
                           width: ann.width * scale,
+                          transform: ann.rotation ? `rotate(${ann.rotation}deg)` : undefined,
+                          transformOrigin: 'center center',
                           touchAction: 'none',
-                          pointerEvents: lockExistingElements ? 'none' : 'auto',
+                          pointerEvents: lockExistingElements || eyedropperActive ? 'none' : 'auto',
                         }}
                         className={`absolute cursor-move z-10 ${
-                          isSel ? 'ring-2 ring-[#2563EB] rounded' : ''
+                          isSel ? 'ring-2 ring-[#2563EB] rounded z-20' : ''
                         }`}
                       >
                         <img
@@ -3407,8 +3577,8 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                             onPointerDown={(e) => {
                               e.stopPropagation();
                               pointerMovedRef.current = false;
-                              preGestureSnapshotRef.current = state;
-                              overlayRef.current?.setPointerCapture?.(e.pointerId);
+                              preGestureSnapshotRef.current = stateRef.current;
+                              tryCapturePointer(overlayRef.current, e.pointerId);
                               setResizingAnnotation({
                                 id: ann.id,
                                 handle: 'se',
@@ -3421,7 +3591,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                               });
                             }}
                             title="Drag to resize signature"
-                            className="absolute -bottom-2.5 -right-2.5 w-5 h-5 rounded-full bg-white border-2 border-[#2563EB] shadow-md cursor-nwse-resize z-20"
+                            className="absolute -bottom-2.5 -right-2.5 w-5 h-5 rounded-full bg-white border-2 border-[#2563EB] shadow-md cursor-nwse-resize z-30"
                           />
                         )}
                         {removeBtn}
@@ -3434,11 +3604,835 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         </div>
       </div>
 
-      {/* Bottom Editing Toolbar + Contextual Sub-bar */}
-      <div className="bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 pb-safe shrink-0">
+      {/* Bottom Editing Toolbar + Always-Visible Contextual Sub-bar + Categorized All-Tools Grid */}
+      <div className="relative bg-white dark:bg-slate-900 border-t border-slate-200 dark:border-slate-800 pb-safe shrink-0">
+        {showToolGrid && (
+          <div className="absolute bottom-full left-2 right-2 sm:left-4 sm:right-auto sm:w-[440px] mb-2 z-40 rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shadow-2xl p-3 space-y-3 max-h-[62vh] overflow-y-auto">
+            <div className="flex items-center justify-between">
+              <span className="text-xs font-bold text-[#142B4A] dark:text-white flex items-center gap-1.5">
+                <LayoutGrid className="w-3.5 h-3.5 text-[#2563EB]" />
+                {t.editor.allTools}
+              </span>
+              <button
+                type="button"
+                onClick={() => setShowToolGrid(false)}
+                className="p-1 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800"
+                aria-label="Close all tools"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            {[
+              { key: 'core', title: t.editor.catCore, cats: ['core'] },
+              { key: 'insert', title: t.editor.catInsert, cats: ['insert'] },
+              { key: 'markup', title: t.editor.catMarkup, cats: ['draw', 'markup'] },
+              { key: 'shapes', title: t.editor.catShapes, cats: ['shapes'] },
+            ].map((group) => {
+              const items = toolsList.filter((tl) => group.cats.includes(tl.category));
+              return (
+                <div key={group.key} className="space-y-1.5">
+                  <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 dark:text-slate-500 px-0.5">
+                    {group.title}
+                  </p>
+                  <div className="grid grid-cols-3 sm:grid-cols-4 gap-1.5">
+                    {items.map((tool) => {
+                      const active = activeTool === tool.id;
+                      return (
+                        <button
+                          key={`grid_${tool.id}`}
+                          type="button"
+                          onClick={() => {
+                            setShowToolGrid(false);
+                            setEyedropperActive(false);
+                            if (tool.id === 'addImage') {
+                              imageInputRef.current?.click();
+                              return;
+                            }
+                            setSelectedElement(null);
+                            if (tool.id === 'signature') {
+                              setActiveTool('signature');
+                              if (!pendingSig) setShowSigModal(true);
+                              else flashStatus(t.editor.tapToPlaceSig, 2200);
+                              return;
+                            }
+                            if (tool.id === 'highlight' && activeColor === '#2563EB') {
+                              setActiveColor('#FACC15');
+                            }
+                            if (tool.id === 'stamp') {
+                              flashStatus(t.editor.tapToPlaceStamp, 2000);
+                            } else if (tool.id === 'addText') {
+                              flashStatus(t.editor.tapToPlaceText, 2000);
+                            } else if (tool.id === 'sticky') {
+                              flashStatus(t.editor.tapToPlaceSticky, 2000);
+                            }
+                            setActiveTool(tool.id);
+                          }}
+                          className={`p-2 rounded-xl flex flex-col items-center justify-center gap-1 text-[11px] font-semibold border transition-colors ${
+                            active
+                              ? 'bg-[#2563EB] text-white border-[#2563EB] shadow-sm'
+                              : 'bg-slate-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700'
+                          }`}
+                        >
+                          {tool.icon}
+                          <span className="truncate max-w-full">{tool.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         {showContextualSubBar && (
           <div className="flex items-center justify-between gap-2 px-3 py-1.5 bg-slate-50 dark:bg-slate-800/70 border-b border-slate-200 dark:border-slate-800 overflow-x-auto no-scrollbar text-xs">
-            {activeTool === 'editText' && (
+            {selectedImg ? (
+              <div className="flex items-center gap-1.5 w-full">
+                <button
+                  type="button"
+                  onClick={() => {
+                    preGestureSnapshotRef.current = stateRef.current;
+                    setShowImageAdjustModal(true);
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white font-semibold flex items-center gap-1 whitespace-nowrap shrink-0"
+                >
+                  <SlidersHorizontal className="w-3.5 h-3.5" /> {t.editor.adjustImage}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setCropInsets({ top: 0, right: 0, bottom: 0, left: 0 });
+                    setCropNaturalSize(null);
+                    setCropModalImg(selectedImg);
+                  }}
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold flex items-center gap-1 whitespace-nowrap shrink-0"
+                >
+                  <Crop className="w-3.5 h-3.5" /> {language === 'bn' ? 'ক্রপ' : 'Crop'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, rotation: (im.rotation + 90) % 360 } : im
+                      ),
+                    }))
+                  }
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold flex items-center gap-1 whitespace-nowrap shrink-0"
+                >
+                  <RotateCw className="w-3.5 h-3.5" /> 90°
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, flipX: !im.flipX } : im
+                      ),
+                    }))
+                  }
+                  title={t.editor.flipH}
+                  className={`px-2 py-1 rounded-lg border flex items-center gap-1 whitespace-nowrap shrink-0 ${
+                    selectedImg.flipX
+                      ? 'bg-cyan-600 text-white border-cyan-600'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  <FlipHorizontal2 className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, flipY: !im.flipY } : im
+                      ),
+                    }))
+                  }
+                  title={t.editor.flipV}
+                  className={`px-2 py-1 rounded-lg border flex items-center gap-1 whitespace-nowrap shrink-0 ${
+                    selectedImg.flipY
+                      ? 'bg-cyan-600 text-white border-cyan-600'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  <FlipVertical2 className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, lockAspect: im.lockAspect === false } : im
+                      ),
+                    }))
+                  }
+                  title={selectedImg.lockAspect !== false ? t.editor.lockAspect : t.editor.freeAspect}
+                  className={`px-2 py-1 rounded-lg border flex items-center gap-1 whitespace-nowrap shrink-0 ${
+                    selectedImg.lockAspect === false
+                      ? 'bg-amber-500 text-white border-amber-500 font-semibold'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {selectedImg.lockAspect === false ? <Unlock className="w-3.5 h-3.5" /> : <Lock className="w-3.5 h-3.5" />}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id
+                          ? { ...im, x: Math.max(0, Math.round((pageSize.width - im.width) / 2)) }
+                          : im
+                      ),
+                    }))
+                  }
+                  title={t.editor.centerH}
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold whitespace-nowrap shrink-0"
+                >
+                  ↔
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const targetW = Math.max(80, Math.round(pageSize.width - 48));
+                    const targetH = Math.max(24, Math.round((targetW / Math.max(1, selectedImg.width)) * selectedImg.height));
+                    commitState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, x: 24, width: targetW, height: targetH } : im
+                      ),
+                    }));
+                  }}
+                  title={t.editor.fitPageWidth}
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 flex items-center gap-1 whitespace-nowrap shrink-0"
+                >
+                  <Maximize2 className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const steps = [1, 0.75, 0.5, 0.25];
+                    const cur = selectedImg.opacity ?? 1;
+                    const idx = steps.findIndex((s) => Math.abs(s - cur) < 0.08);
+                    const nextOp = steps[(idx + 1) % steps.length];
+                    commitState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, opacity: nextOp } : im
+                      ),
+                    }));
+                  }}
+                  title={t.editor.opacity}
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-mono-nums text-[11px] font-semibold whitespace-nowrap shrink-0"
+                >
+                  {Math.round((selectedImg.opacity ?? 1) * 100)}%
+                </button>
+                <button
+                  type="button"
+                  onClick={() => imageInputRef.current?.click()}
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold flex items-center gap-1 whitespace-nowrap shrink-0"
+                >
+                  <ImagePlus className="w-3.5 h-3.5" /> +
+                </button>
+                <button
+                  type="button"
+                  onClick={duplicateSelectedElement}
+                  title={t.editor.duplicate}
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shrink-0"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={bringSelectedToFront}
+                  title={t.editor.bringFront}
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shrink-0"
+                >
+                  <Layers className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    commitState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.filter((im) => im.id !== selectedImg.id),
+                    }));
+                    setSelectedElement(null);
+                  }}
+                  aria-label="Delete selected image"
+                  className="px-2 py-1 rounded-lg bg-rose-500 text-white shrink-0"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedElement(null)}
+                  className="ml-auto px-2.5 py-1 rounded-lg bg-[#142B4A] text-white font-semibold whitespace-nowrap shrink-0"
+                >
+                  {t.editor.doneSelect}
+                </button>
+              </div>
+            ) : selectedTextBox ? (
+              <div className="flex items-center gap-1.5 w-full">
+                <button
+                  type="button"
+                  onClick={() => openEditAddedTextBox(selectedTextBox)}
+                  className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white font-semibold flex items-center gap-1 whitespace-nowrap shrink-0"
+                >
+                  <Pencil className="w-3 h-3" /> {language === 'bn' ? 'এডিট' : 'Edit'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedTexts: prev.addedTexts.map((tb) =>
+                        tb.id === selectedTextBox.id ? { ...tb, fontSize: Math.min(64, tb.fontSize + 2) } : tb
+                      ),
+                    }))
+                  }
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-bold shrink-0"
+                >
+                  A+
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedTexts: prev.addedTexts.map((tb) =>
+                        tb.id === selectedTextBox.id ? { ...tb, fontSize: Math.max(8, tb.fontSize - 2) } : tb
+                      ),
+                    }))
+                  }
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-bold shrink-0"
+                >
+                  A-
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedTexts: prev.addedTexts.map((tb) =>
+                        tb.id === selectedTextBox.id ? { ...tb, bold: !tb.bold } : tb
+                      ),
+                    }))
+                  }
+                  className={`px-2 py-1 rounded-lg border shrink-0 ${
+                    selectedTextBox.bold
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  <Bold className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedTexts: prev.addedTexts.map((tb) =>
+                        tb.id === selectedTextBox.id ? { ...tb, italic: !tb.italic } : tb
+                      ),
+                    }))
+                  }
+                  className={`px-2 py-1 rounded-lg border shrink-0 ${
+                    selectedTextBox.italic
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  <Italic className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedTexts: prev.addedTexts.map((tb) =>
+                        tb.id === selectedTextBox.id ? { ...tb, rotation: ((tb.rotation || 0) + 90) % 360 } : tb
+                      ),
+                    }))
+                  }
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 flex items-center gap-1 whitespace-nowrap shrink-0"
+                >
+                  <RotateCw className="w-3 h-3" /> 90°
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    commitState((prev) => ({
+                      ...prev,
+                      addedTexts: prev.addedTexts.map((tb) =>
+                        tb.id === selectedTextBox.id ? { ...tb, color: activeColor } : tb
+                      ),
+                    }))
+                  }
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 flex items-center gap-1 whitespace-nowrap shrink-0"
+                >
+                  <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ backgroundColor: activeColor }} />
+                  {language === 'bn' ? 'রঙ' : 'Color'}
+                </button>
+                <button
+                  type="button"
+                  onClick={duplicateSelectedElement}
+                  title={t.editor.duplicate}
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shrink-0"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={bringSelectedToFront}
+                  title={t.editor.bringFront}
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shrink-0"
+                >
+                  <Layers className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    commitState((prev) => ({
+                      ...prev,
+                      addedTexts: prev.addedTexts.filter((tb) => tb.id !== selectedTextBox.id),
+                    }));
+                    setSelectedElement(null);
+                  }}
+                  aria-label="Delete text box"
+                  className="px-2 py-1 rounded-lg bg-rose-500 text-white shrink-0"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedElement(null)}
+                  className="ml-auto px-2.5 py-1 rounded-lg bg-[#142B4A] text-white font-semibold whitespace-nowrap shrink-0"
+                >
+                  {t.editor.doneSelect}
+                </button>
+              </div>
+            ) : selectedAnn ? (
+              <div className="flex items-center gap-1.5 w-full">
+                <span className="font-bold text-[#142B4A] dark:text-cyan-300 capitalize whitespace-nowrap shrink-0 px-1">
+                  {selectedAnn.kind}
+                </span>
+                {selectedAnn.kind === 'sticky' && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => openEditStickyNote(selectedAnn)}
+                      className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white font-semibold flex items-center gap-1 whitespace-nowrap shrink-0"
+                    >
+                      <Pencil className="w-3 h-3" /> {language === 'bn' ? 'এডিট' : 'Edit'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        commitState((prev) => ({
+                          ...prev,
+                          annotations: prev.annotations.map((an) =>
+                            an.id === selectedAnn.id ? { ...an, fontSize: Math.min(22, (an.fontSize || 10) + 1.5) } : an
+                          ),
+                        }))
+                      }
+                      className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-bold shrink-0"
+                    >
+                      A+
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        commitState((prev) => ({
+                          ...prev,
+                          annotations: prev.annotations.map((an) =>
+                            an.id === selectedAnn.id ? { ...an, fontSize: Math.max(7, (an.fontSize || 10) - 1.5) } : an
+                          ),
+                        }))
+                      }
+                      className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-bold shrink-0"
+                    >
+                      A-
+                    </button>
+                    {STICKY_THEMES.slice(0, 4).map((th) => (
+                      <button
+                        key={th.id}
+                        type="button"
+                        onClick={() =>
+                          commitState((prev) => ({
+                            ...prev,
+                            annotations: prev.annotations.map((an) =>
+                              an.id === selectedAnn.id ? { ...an, fillColor: th.bg, color: th.accent } : an
+                            ),
+                          }))
+                        }
+                        title={th.name}
+                        style={{ backgroundColor: th.bg, borderColor: th.accent }}
+                        className="w-5 h-5 rounded-full border shrink-0"
+                      />
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() =>
+                        commitState((prev) => ({
+                          ...prev,
+                          annotations: prev.annotations.map((an) => {
+                            if (an.id !== selectedAnn.id) return an;
+                            if (an.stickyArrow && an.stickyArrow !== 'none') {
+                              return { ...an, stickyArrow: 'none', stickyTipX: undefined, stickyTipY: undefined };
+                            }
+                            const boxW = Math.max(84, an.width || 165);
+                            const boxH = Math.max(44, an.height || 76);
+                            const tip = computeDefaultStickyTip(an.x, an.y, boxW, boxH, 'top-left', 44, pageSize.width, pageSize.height);
+                            return { ...an, stickyArrow: 'top-left', stickyTipX: tip.tipX, stickyTipY: tip.tipY };
+                          }),
+                        }))
+                      }
+                      className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 whitespace-nowrap shrink-0"
+                    >
+                      {selectedAnn.stickyArrow === 'none'
+                        ? (language === 'bn' ? 'তীর যুক্ত' : '+ Arrow')
+                        : (language === 'bn' ? 'তীর বাদ' : 'No Arrow')}
+                    </button>
+                  </>
+                )}
+                {selectedAnn.kind === 'stamp' && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => openEditStamp(selectedAnn)}
+                      className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white font-semibold flex items-center gap-1 whitespace-nowrap shrink-0"
+                    >
+                      <Pencil className="w-3 h-3" /> {language === 'bn' ? 'এডিট' : 'Edit'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        commitState((prev) => ({
+                          ...prev,
+                          annotations: prev.annotations.map((an) => {
+                            if (an.id !== selectedAnn.id) return an;
+                            const nextFs = Math.min(24, (an.fontSize || 10) + 2);
+                            const scaleF = nextFs / (an.fontSize || 10);
+                            return {
+                              ...an,
+                              fontSize: nextFs,
+                              width: Math.round((an.width || 96) * scaleF),
+                              height: Math.round((an.height || 28) * scaleF),
+                            };
+                          }),
+                        }))
+                      }
+                      className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-bold shrink-0"
+                    >
+                      A+
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        commitState((prev) => ({
+                          ...prev,
+                          annotations: prev.annotations.map((an) => {
+                            if (an.id !== selectedAnn.id) return an;
+                            const nextFs = Math.max(8, (an.fontSize || 10) - 2);
+                            const scaleF = nextFs / (an.fontSize || 10);
+                            return {
+                              ...an,
+                              fontSize: nextFs,
+                              width: Math.max(72, Math.round((an.width || 96) * scaleF)),
+                              height: Math.max(22, Math.round((an.height || 28) * scaleF)),
+                            };
+                          }),
+                        }))
+                      }
+                      className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-bold shrink-0"
+                    >
+                      A-
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        commitState((prev) => ({
+                          ...prev,
+                          annotations: prev.annotations.map((an) =>
+                            an.id === selectedAnn.id ? { ...an, rotation: ((an.rotation || 0) + 90) % 360 } : an
+                          ),
+                        }))
+                      }
+                      className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 flex items-center gap-1 shrink-0"
+                    >
+                      <RotateCw className="w-3 h-3" /> 90°
+                    </button>
+                  </>
+                )}
+                {selectedAnn.kind === 'signature' && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      commitState((prev) => ({
+                        ...prev,
+                        annotations: prev.annotations.map((an) =>
+                          an.id === selectedAnn.id ? { ...an, rotation: ((an.rotation || 0) + 90) % 360 } : an
+                        ),
+                      }))
+                    }
+                    className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 flex items-center gap-1 shrink-0"
+                  >
+                    <RotateCw className="w-3 h-3" /> 90°
+                  </button>
+                )}
+                {selectedAnn.kind === 'whiteout' && (
+                  <>
+                    {(['#FFFFFF', '#F8FAFC', '#FEFCE8'] as const).map((wc) => (
+                      <button
+                        key={wc}
+                        type="button"
+                        onClick={() =>
+                          commitState((prev) => ({
+                            ...prev,
+                            annotations: prev.annotations.map((an) =>
+                              an.id === selectedAnn.id ? { ...an, color: wc, fillColor: wc } : an
+                            ),
+                          }))
+                        }
+                        style={{ backgroundColor: wc }}
+                        className="w-5 h-5 rounded-full border border-slate-400 shrink-0"
+                        aria-label={`Whiteout color ${wc}`}
+                      />
+                    ))}
+                  </>
+                )}
+                {selectedAnn.kind === 'arrow' && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      commitState((prev) => ({
+                        ...prev,
+                        annotations: prev.annotations.map((an) => {
+                          if (an.id !== selectedAnn.id) return an;
+                          const order: Array<'single' | 'double' | 'line'> = ['single', 'double', 'line'];
+                          const cur = an.arrowStyle || 'single';
+                          return { ...an, arrowStyle: order[(order.indexOf(cur) + 1) % order.length] };
+                        }),
+                      }))
+                    }
+                    className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 whitespace-nowrap shrink-0"
+                  >
+                    {(selectedAnn.arrowStyle || 'single') === 'double'
+                      ? t.editor.arrowDouble
+                      : (selectedAnn.arrowStyle || 'single') === 'line'
+                      ? t.editor.arrowLine
+                      : t.editor.arrowSingle}
+                  </button>
+                )}
+                {(selectedAnn.kind === 'rect' || selectedAnn.kind === 'circle' || selectedAnn.kind === 'arrow') && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      commitState((prev) => ({
+                        ...prev,
+                        annotations: prev.annotations.map((an) =>
+                          an.id === selectedAnn.id
+                            ? { ...an, lineStyle: an.lineStyle === 'dashed' ? 'solid' : 'dashed' }
+                            : an
+                        ),
+                      }))
+                    }
+                    className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 whitespace-nowrap shrink-0"
+                  >
+                    {selectedAnn.lineStyle === 'dashed' ? t.editor.dashed : t.editor.solid}
+                  </button>
+                )}
+                {(selectedAnn.kind === 'rect' || selectedAnn.kind === 'circle') && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      commitState((prev) => ({
+                        ...prev,
+                        annotations: prev.annotations.map((an) =>
+                          an.id === selectedAnn.id ? { ...an, fillColor: an.fillColor ? undefined : an.color } : an
+                        ),
+                      }))
+                    }
+                    className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 flex items-center gap-1 whitespace-nowrap shrink-0"
+                  >
+                    <PaintBucket className="w-3 h-3" /> {t.editor.fillShape}
+                  </button>
+                )}
+                {(selectedAnn.kind === 'freehand' ||
+                  selectedAnn.kind === 'rect' ||
+                  selectedAnn.kind === 'circle' ||
+                  selectedAnn.kind === 'arrow' ||
+                  selectedAnn.kind === 'underline' ||
+                  selectedAnn.kind === 'strikethrough') && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        commitState((prev) => ({
+                          ...prev,
+                          annotations: prev.annotations.map((an) =>
+                            an.id === selectedAnn.id
+                              ? { ...an, strokeWidth: Math.min(18, (an.strokeWidth || 2.5) + 1.5) }
+                              : an
+                          ),
+                        }))
+                      }
+                      className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 whitespace-nowrap shrink-0"
+                    >
+                      + px
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        commitState((prev) => ({
+                          ...prev,
+                          annotations: prev.annotations.map((an) =>
+                            an.id === selectedAnn.id
+                              ? { ...an, strokeWidth: Math.max(1, (an.strokeWidth || 2.5) - 1.5) }
+                              : an
+                          ),
+                        }))
+                      }
+                      className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 whitespace-nowrap shrink-0"
+                    >
+                      - px
+                    </button>
+                  </>
+                )}
+                {selectedAnn.kind !== 'whiteout' && selectedAnn.kind !== 'signature' && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      commitState((prev) => ({
+                        ...prev,
+                        annotations: prev.annotations.map((an) =>
+                          an.id === selectedAnn.id
+                            ? {
+                                ...an,
+                                color: activeColor,
+                                fillColor:
+                                  an.kind === 'sticky' ? an.fillColor : an.fillColor ? activeColor : undefined,
+                              }
+                            : an
+                        ),
+                      }))
+                    }
+                    className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 flex items-center gap-1 whitespace-nowrap shrink-0"
+                  >
+                    <span className="w-2.5 h-2.5 rounded-full inline-block" style={{ backgroundColor: activeColor }} />
+                    {language === 'bn' ? 'রঙ' : 'Color'}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={duplicateSelectedElement}
+                  title={t.editor.duplicate}
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shrink-0"
+                >
+                  <Copy className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={bringSelectedToFront}
+                  title={t.editor.bringFront}
+                  className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 shrink-0"
+                >
+                  <Layers className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    commitState((prev) => ({
+                      ...prev,
+                      annotations: prev.annotations.filter((an) => an.id !== selectedAnn.id),
+                    }));
+                    setSelectedElement(null);
+                  }}
+                  aria-label="Delete annotation"
+                  className="px-2 py-1 rounded-lg bg-rose-500 text-white shrink-0"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSelectedElement(null)}
+                  className="ml-auto px-2.5 py-1 rounded-lg bg-[#142B4A] text-white font-semibold whitespace-nowrap shrink-0"
+                >
+                  {t.editor.doneSelect}
+                </button>
+              </div>
+            ) : (activeTool === 'select' || activeTool === 'addImage') ? (
+              <div className="flex items-center justify-between gap-2 w-full">
+                <span className="text-[11px] font-medium text-slate-600 dark:text-slate-300 truncate">
+                  {t.editor.tapSelectedHint}
+                </span>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => imageInputRef.current?.click()}
+                    className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white font-semibold flex items-center gap-1 whitespace-nowrap"
+                  >
+                    <ImagePlus className="w-3.5 h-3.5" /> {t.editor.tapChooseImage}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedElement(null);
+                      setActiveTool('addText');
+                      flashStatus(t.editor.tapToPlaceText, 2000);
+                    }}
+                    className="px-2.5 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold flex items-center gap-1 whitespace-nowrap"
+                  >
+                    <TypeIcon className="w-3.5 h-3.5" /> + {t.editor.tools.addText}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedElement(null);
+                      setActiveTool('sticky');
+                      flashStatus(t.editor.tapToPlaceSticky, 2000);
+                    }}
+                    className="px-2 py-1 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold whitespace-nowrap"
+                  >
+                    + {t.editor.tools.sticky}
+                  </button>
+                </div>
+              </div>
+            ) : activeTool === 'addText' || activeTool === 'sticky' ? (
+              <div className="flex items-center justify-between gap-2 w-full">
+                <span className="text-[11px] font-semibold text-[#2563EB] dark:text-cyan-300 truncate">
+                  {activeTool === 'addText' ? t.editor.tapToPlaceText : t.editor.tapToPlaceSticky}
+                </span>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setKeepToolActive((v) => !v)}
+                    className={`px-2 py-1 rounded-lg font-semibold text-[11px] border whitespace-nowrap ${
+                      keepToolActive
+                        ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                        : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    {t.editor.keepToolActive}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTool('select')}
+                    className="px-2.5 py-1 rounded-lg bg-[#142B4A] text-white font-semibold whitespace-nowrap"
+                  >
+                    {t.editor.doneSelect}
+                  </button>
+                </div>
+              </div>
+            ) : activeTool === 'editText' ? (
               <div className="flex items-center justify-between gap-2 w-full">
                 <span className="text-[11px] font-mono-nums font-semibold text-slate-600 dark:text-slate-300 whitespace-nowrap">
                   {displayedTextRuns.length} {language === 'bn' ? 'লাইন' : 'lines'}
@@ -3469,16 +4463,25 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     )}
                     {language === 'bn' ? 'সব টেক্সট ধরুন (OCR)' : 'Scan Missing Text'}
                   </button>
-                </div>
-              </div>
-            )}
-            {activeTool === 'draw' && (
-              <div className="flex items-center gap-2 w-full justify-between">
-                <div className="flex items-center gap-1.5">
                   <button
                     type="button"
-                    onClick={() => setDrawMode('pen')}
-                    className={`px-2.5 py-1 rounded-lg font-semibold whitespace-nowrap ${
+                    onClick={() => setActiveTool('select')}
+                    className="px-2.5 py-1 rounded-lg bg-[#142B4A] text-white font-semibold whitespace-nowrap"
+                  >
+                    {t.editor.doneSelect}
+                  </button>
+                </div>
+              </div>
+            ) : activeTool === 'draw' ? (
+              <div className="flex items-center gap-2 w-full justify-between">
+                <div className="flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDrawMode('pen');
+                      setPenOpacity(1);
+                    }}
+                    className={`px-2 py-1 rounded-lg font-semibold whitespace-nowrap ${
                       drawMode === 'pen'
                         ? 'bg-[#2563EB] text-white'
                         : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700'
@@ -3488,8 +4491,11 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   </button>
                   <button
                     type="button"
-                    onClick={() => setDrawMode('marker')}
-                    className={`px-2.5 py-1 rounded-lg font-semibold whitespace-nowrap ${
+                    onClick={() => {
+                      setDrawMode('marker');
+                      setPenOpacity(0.42);
+                    }}
+                    className={`px-2 py-1 rounded-lg font-semibold whitespace-nowrap ${
                       drawMode === 'marker'
                         ? 'bg-[#2563EB] text-white'
                         : 'bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700'
@@ -3505,7 +4511,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       type="button"
                       onClick={() => setStrokeWidth(sz)}
                       title={`${sz}px`}
-                      className={`h-7 min-w-[28px] px-1.5 rounded-lg flex items-center justify-center border ${
+                      className={`h-7 min-w-[26px] px-1 rounded-lg flex items-center justify-center border ${
                         strokeWidth === sz
                           ? 'bg-[#2563EB]/15 border-[#2563EB] text-[#2563EB]'
                           : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
@@ -3517,8 +4523,25 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                           width: Math.min(14, Math.max(3, sz)),
                           height: Math.min(14, Math.max(3, sz)),
                           backgroundColor: activeColor,
+                          opacity: penOpacity,
                         }}
                       />
+                    </button>
+                  ))}
+                </div>
+                <div className="flex items-center gap-1 shrink-0">
+                  {[1, 0.7, 0.42].map((op) => (
+                    <button
+                      key={op}
+                      type="button"
+                      onClick={() => setPenOpacity(op)}
+                      className={`px-1.5 py-1 rounded-lg font-mono-nums text-[10px] border ${
+                        Math.abs(penOpacity - op) < 0.05
+                          ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                          : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      {Math.round(op * 100)}%
                     </button>
                   ))}
                 </div>
@@ -3533,19 +4556,45 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                         ),
                       }))
                     }
-                    className="px-2 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/50 text-rose-600 dark:text-rose-300 font-semibold whitespace-nowrap"
+                    className="px-2 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/50 text-rose-600 dark:text-rose-300 font-semibold whitespace-nowrap shrink-0"
                   >
                     {t.editor.clearPageAnnots}
                   </button>
                 )}
+                <button
+                  type="button"
+                  onClick={() => setActiveTool('select')}
+                  className="px-2.5 py-1 rounded-lg bg-[#142B4A] text-white font-semibold whitespace-nowrap shrink-0"
+                >
+                  {t.editor.doneSelect}
+                </button>
               </div>
-            )}
-
-            {activeTool === 'eraser' && (
+            ) : activeTool === 'eraser' ? (
               <div className="flex items-center justify-between gap-2 w-full">
-                <span className="text-[11px] text-slate-500 dark:text-slate-300 truncate">
-                  {t.editor.eraserHint}
-                </span>
+                <div className="flex items-center gap-1 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setEraserIncludeAll(false)}
+                    className={`px-2 py-1 rounded-lg font-semibold text-[11px] whitespace-nowrap border ${
+                      !eraserIncludeAll
+                        ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                        : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    {t.editor.eraserInkOnly}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setEraserIncludeAll(true)}
+                    className={`px-2 py-1 rounded-lg font-semibold text-[11px] whitespace-nowrap border ${
+                      eraserIncludeAll
+                        ? 'bg-rose-600 text-white border-rose-600'
+                        : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    {t.editor.eraserAllOverlays}
+                  </button>
+                </div>
                 <div className="flex items-center gap-1 shrink-0">
                   {[10, 18, 28].map((r) => (
                     <button
@@ -3561,15 +4610,21 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       {r}px
                     </button>
                   ))}
-                  {pageErasableCount > 0 && (
+                  {(pageErasableCount > 0 || (eraserIncludeAll && (pageAddedTexts.length > 0 || pageAddedImages.length > 0))) && (
                     <button
                       type="button"
                       onClick={() =>
                         commitState((prev) => ({
                           ...prev,
                           annotations: prev.annotations.filter(
-                            (a) => a.pageNumber !== pageNumber || !isErasableAnnotation(a)
+                            (a) => a.pageNumber !== pageNumber || !isErasableAnnotation(a, eraserIncludeAll)
                           ),
+                          addedTexts: eraserIncludeAll
+                            ? prev.addedTexts.filter((tb) => tb.pageNumber !== pageNumber)
+                            : prev.addedTexts,
+                          addedImages: eraserIncludeAll
+                            ? prev.addedImages.filter((im) => im.pageNumber !== pageNumber)
+                            : prev.addedImages,
                         }))
                       }
                       className="px-2 py-1 rounded-lg bg-rose-50 dark:bg-rose-950/50 text-rose-600 dark:text-rose-300 font-semibold whitespace-nowrap"
@@ -3577,11 +4632,82 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       {t.editor.clearPageAnnots}
                     </button>
                   )}
+                  <button
+                    type="button"
+                    onClick={() => setActiveTool('select')}
+                    className="px-2.5 py-1 rounded-lg bg-[#142B4A] text-white font-semibold whitespace-nowrap"
+                  >
+                    {t.editor.doneSelect}
+                  </button>
                 </div>
               </div>
-            )}
-
-            {(activeTool === 'rect' || activeTool === 'circle' || activeTool === 'arrow' || activeTool === 'underline' || activeTool === 'strike') && (
+            ) : activeTool === 'whiteout' ? (
+              <div className="flex items-center justify-between gap-2 w-full">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] text-slate-500 font-semibold whitespace-nowrap">
+                    {t.editor.whiteoutBg}
+                  </span>
+                  {(['#FFFFFF', '#F8FAFC', '#FEFCE8'] as const).map((wc) => (
+                    <button
+                      key={wc}
+                      type="button"
+                      onClick={() => {
+                        setWhiteoutColor(wc);
+                        setEyedropperActive(false);
+                      }}
+                      style={{ backgroundColor: wc }}
+                      className={`w-6 h-6 rounded-full border-2 shrink-0 ${
+                        whiteoutColor.toUpperCase() === wc
+                          ? 'border-[#2563EB] scale-110'
+                          : 'border-slate-300 dark:border-slate-600'
+                      }`}
+                      aria-label={`Whiteout ${wc}`}
+                    />
+                  ))}
+                  <input
+                    type="color"
+                    value={whiteoutColor}
+                    onChange={(e) => {
+                      setWhiteoutColor(e.target.value.toUpperCase());
+                      setEyedropperActive(false);
+                    }}
+                    className="w-6 h-6 rounded-full border border-slate-300 dark:border-slate-600 cursor-pointer p-0 bg-transparent shrink-0"
+                  />
+                </div>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setEyedropperActive((v) => !v)}
+                    className={`px-2 py-1 rounded-lg font-semibold text-[11px] whitespace-nowrap flex items-center gap-1 border ${
+                      eyedropperActive
+                        ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                        : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    <Droplet className="w-3.5 h-3.5" />
+                    {t.editor.pickFromPage}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setKeepToolActive((v) => !v)}
+                    className={`px-2 py-1 rounded-lg font-semibold text-[11px] border whitespace-nowrap ${
+                      keepToolActive
+                        ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                        : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    {t.editor.keepToolActive}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTool('select')}
+                    className="px-2.5 py-1 rounded-lg bg-[#142B4A] text-white font-semibold whitespace-nowrap"
+                  >
+                    {t.editor.doneSelect}
+                  </button>
+                </div>
+              </div>
+            ) : (activeTool === 'rect' || activeTool === 'circle' || activeTool === 'arrow' || activeTool === 'underline' || activeTool === 'strike') ? (
               <div className="flex items-center justify-between gap-2 w-full">
                 <div className="flex items-center gap-1.5">
                   <span className="text-[11px] text-slate-500 font-semibold">{t.editor.thickness}:</span>
@@ -3639,7 +4765,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   <button
                     type="button"
                     onClick={() => setShapeFilled((f) => !f)}
-                    className={`px-2.5 py-1 rounded-lg font-semibold flex items-center gap-1 whitespace-nowrap border ${
+                    className={`px-2 py-1 rounded-lg font-semibold flex items-center gap-1 whitespace-nowrap border ${
                       shapeFilled
                         ? 'bg-[#2563EB] text-white border-[#2563EB]'
                         : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
@@ -3648,21 +4774,37 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     <PaintBucket className="w-3.5 h-3.5" /> {t.editor.fillShape}
                   </button>
                 )}
+                <button
+                  type="button"
+                  onClick={() => setKeepToolActive((v) => !v)}
+                  className={`px-2 py-1 rounded-lg font-semibold text-[11px] border whitespace-nowrap shrink-0 ${
+                    keepToolActive
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {t.editor.keepToolActive}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveTool('select')}
+                  className="px-2.5 py-1 rounded-lg bg-[#142B4A] text-white font-semibold whitespace-nowrap shrink-0"
+                >
+                  {t.editor.doneSelect}
+                </button>
               </div>
-            )}
-
-            {activeTool === 'highlight' && (
+            ) : activeTool === 'highlight' ? (
               <div className="flex items-center justify-between gap-2 w-full">
-                <span className="text-[11px] font-semibold text-slate-500">
-                  {t.editor.tools.highlight}:
+                <span className="text-[11px] font-semibold text-slate-500 whitespace-nowrap">
+                  {t.editor.tools.highlight} · {t.editor.opacity}:
                 </span>
-                <div className="flex items-center gap-1.5">
+                <div className="flex items-center gap-1.5 shrink-0">
                   {[0.25, 0.36, 0.55].map((op) => (
                     <button
                       key={op}
                       type="button"
                       onClick={() => setHighlightOpacity(op)}
-                      className={`px-2.5 py-1 rounded-lg font-mono-nums text-[11px] border ${
+                      className={`px-2 py-1 rounded-lg font-mono-nums text-[11px] border ${
                         highlightOpacity === op
                           ? 'bg-[#2563EB] text-white border-[#2563EB]'
                           : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
@@ -3671,11 +4813,27 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       {Math.round(op * 100)}%
                     </button>
                   ))}
+                  <button
+                    type="button"
+                    onClick={() => setKeepToolActive((v) => !v)}
+                    className={`px-2 py-1 rounded-lg font-semibold text-[11px] border whitespace-nowrap ${
+                      keepToolActive
+                        ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                        : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    {t.editor.keepToolActive}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTool('select')}
+                    className="px-2.5 py-1 rounded-lg bg-[#142B4A] text-white font-semibold whitespace-nowrap"
+                  >
+                    {t.editor.doneSelect}
+                  </button>
                 </div>
               </div>
-            )}
-
-            {activeTool === 'stamp' && (
+            ) : activeTool === 'stamp' ? (
               <div className="flex items-center gap-1.5 w-full">
                 {STAMP_PRESETS.map((sp) => (
                   <button
@@ -3694,6 +4852,17 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     {sp.label}
                   </button>
                 ))}
+                <button
+                  type="button"
+                  onClick={() => setStampSolidFill((v) => !v)}
+                  className={`px-2 py-1 rounded-lg font-semibold text-[10px] border whitespace-nowrap ${
+                    stampSolidFill
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {stampSolidFill ? t.editor.stampSolid : t.editor.stampOutline}
+                </button>
                 <input
                   type="text"
                   value={customStampText}
@@ -3702,26 +4871,62 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                     setStampPreset('CUSTOM');
                     setCustomStampText(e.target.value);
                   }}
-                  placeholder={language === 'bn' ? 'কাস্টম স্ট্যাম্প...' : 'Custom...'}
-                  className="h-7 w-24 px-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-[11px]"
+                  placeholder={language === 'bn' ? 'কাস্টম...' : 'Custom...'}
+                  className="h-7 w-20 px-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-[11px]"
                 />
+                <button
+                  type="button"
+                  onClick={() => setKeepToolActive((v) => !v)}
+                  className={`px-2 py-1 rounded-lg font-semibold text-[11px] border whitespace-nowrap shrink-0 ${
+                    keepToolActive
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {t.editor.keepToolActive}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setActiveTool('select')}
+                  className="px-2.5 py-1 rounded-lg bg-[#142B4A] text-white font-semibold whitespace-nowrap shrink-0"
+                >
+                  {t.editor.doneSelect}
+                </button>
               </div>
-            )}
-
-            {activeTool === 'signature' && (
+            ) : activeTool === 'signature' ? (
               <div className="flex items-center justify-between gap-2 w-full">
                 <span className="text-[11px] text-slate-600 dark:text-slate-300 truncate">
                   {pendingSig ? t.editor.tapToPlaceSig : ''}
                 </span>
-                <button
-                  type="button"
-                  onClick={() => setShowSigModal(true)}
-                  className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white font-semibold whitespace-nowrap"
-                >
-                  {t.editor.changeSig}
-                </button>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => setShowSigModal(true)}
+                    className="px-2.5 py-1 rounded-lg bg-[#2563EB] text-white font-semibold whitespace-nowrap"
+                  >
+                    {t.editor.changeSig}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setKeepToolActive((v) => !v)}
+                    className={`px-2 py-1 rounded-lg font-semibold text-[11px] border whitespace-nowrap ${
+                      keepToolActive
+                        ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                        : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    {t.editor.keepToolActive}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTool('select')}
+                    className="px-2.5 py-1 rounded-lg bg-[#142B4A] text-white font-semibold whitespace-nowrap"
+                  >
+                    {t.editor.doneSelect}
+                  </button>
+                </div>
               </div>
-            )}
+            ) : null}
           </div>
         )}
 
@@ -3735,9 +4940,16 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
             >
               <ChevronLeft className="w-4 h-4" />
             </button>
-            <span className="text-xs font-mono-nums px-1">
+            <button
+              type="button"
+              onClick={() => {
+                setPageJumpInput(String(pageNumber));
+                setShowPageJump((v) => !v);
+              }}
+              className="text-xs font-mono-nums px-1.5 py-1 rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800"
+            >
               {pageNumber}/{doc.pageCount}
-            </span>
+            </button>
             <button
               onClick={() => setPageNumber((p) => Math.min(doc.pageCount, p + 1))}
               disabled={pageNumber >= doc.pageCount}
@@ -3779,47 +4991,66 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
           </button>
         </div>
 
-        {/* Scrollable Horizontal Tools */}
-        <div className="flex items-center gap-1.5 px-3 py-2 overflow-x-auto no-scrollbar">
-          {toolsList.map((tool) => {
-            const active = activeTool === tool.id;
-            return (
-              <button
-                key={tool.id}
-                onClick={() => {
-                  if (tool.id === 'addImage') {
-                    imageInputRef.current?.click();
-                    return;
-                  }
-                  if (tool.id === 'signature') {
-                    setActiveTool('signature');
-                    if (!pendingSig) setShowSigModal(true);
-                    else {
-                      setStatusMessage(t.editor.tapToPlaceSig);
-                      setTimeout(() => setStatusMessage(null), 2200);
+        {/* Pinned All-Tools button + Scrollable Horizontal Tools */}
+        <div className="flex items-center gap-1.5 px-2.5 py-2">
+          <button
+            type="button"
+            onClick={() => setShowToolGrid((v) => !v)}
+            title={t.editor.allTools}
+            aria-label={t.editor.allTools}
+            className={`min-h-[42px] min-w-[42px] px-2.5 rounded-xl flex items-center justify-center gap-1 text-xs font-semibold shrink-0 border transition-colors ${
+              showToolGrid
+                ? 'bg-[#142B4A] text-white border-[#142B4A]'
+                : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 border-slate-200 dark:border-slate-700'
+            }`}
+          >
+            <LayoutGrid className="w-4 h-4" />
+          </button>
+
+          <div className="flex items-center gap-1.5 overflow-x-auto no-scrollbar flex-1">
+            {toolsList.map((tool) => {
+              const active = activeTool === tool.id;
+              return (
+                <button
+                  key={tool.id}
+                  onClick={() => {
+                    setShowToolGrid(false);
+                    setEyedropperActive(false);
+                    if (tool.id === 'addImage') {
+                      imageInputRef.current?.click();
+                      return;
                     }
-                    return;
-                  }
-                  if (tool.id === 'highlight' && activeColor === '#2563EB') {
-                    setActiveColor('#FACC15');
-                  }
-                  if (tool.id === 'stamp') {
-                    setStatusMessage(t.editor.tapToPlaceStamp);
-                    setTimeout(() => setStatusMessage(null), 2000);
-                  }
-                  setActiveTool(tool.id);
-                }}
-                className={`min-h-[42px] px-3 rounded-xl flex items-center gap-1.5 text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
-                  active
-                    ? 'bg-[#2563EB] text-white shadow-sm'
-                    : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200'
-                }`}
-              >
-                {tool.icon}
-                <span>{tool.label}</span>
-              </button>
-            );
-          })}
+                    setSelectedElement(null);
+                    if (tool.id === 'signature') {
+                      setActiveTool('signature');
+                      if (!pendingSig) setShowSigModal(true);
+                      else flashStatus(t.editor.tapToPlaceSig, 2200);
+                      return;
+                    }
+                    if (tool.id === 'highlight' && activeColor === '#2563EB') {
+                      setActiveColor('#FACC15');
+                    }
+                    if (tool.id === 'stamp') {
+                      flashStatus(t.editor.tapToPlaceStamp, 2000);
+                    } else if (tool.id === 'addText') {
+                      flashStatus(t.editor.tapToPlaceText, 2000);
+                    } else if (tool.id === 'sticky') {
+                      flashStatus(t.editor.tapToPlaceSticky, 2000);
+                    }
+                    setActiveTool(tool.id);
+                  }}
+                  className={`min-h-[42px] px-3 rounded-xl flex items-center gap-1.5 text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
+                    active
+                      ? 'bg-[#2563EB] text-white shadow-sm'
+                      : 'bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200'
+                  }`}
+                >
+                  {tool.icon}
+                  <span>{tool.label}</span>
+                </button>
+              );
+            })}
+          </div>
         </div>
       </div>
 
@@ -3834,7 +5065,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       {/* Existing Text Run Editor Modal */}
       {editingRun && (
         <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-4">
+          <div className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-3.5 max-h-[92vh] overflow-y-auto">
             <div className="flex items-center justify-between">
               <h3 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
                 {t.editor.modifyText}
@@ -3847,7 +5078,48 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               </button>
             </div>
 
+            {editingRun.str && (
+              <p className="px-2.5 py-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-[11px] text-slate-500 dark:text-slate-400 truncate">
+                {editingRun.str}
+              </p>
+            )}
+
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    runTextareaRef.current?.focus();
+                    runTextareaRef.current?.select();
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 text-[11px] font-semibold text-slate-700 dark:text-slate-200"
+                >
+                  {t.editor.selectAllText}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRunDraft((d) => ({ ...d, text: '' }));
+                    runTextareaRef.current?.focus();
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 text-[11px] font-semibold text-slate-700 dark:text-slate-200"
+                >
+                  {t.editor.clearText}
+                </button>
+              </div>
+              {replacedRunIds.has(editingRun.id) && (
+                <button
+                  type="button"
+                  onClick={handleRestoreRunOriginal}
+                  className="px-2.5 py-1 rounded-lg bg-amber-50 dark:bg-amber-950/50 text-amber-700 dark:text-amber-300 text-[11px] font-semibold"
+                >
+                  {t.editor.restoreOriginal}
+                </button>
+              )}
+            </div>
+
             <textarea
+              ref={runTextareaRef}
               rows={2}
               value={runDraft.text}
               onChange={(e) => setRunDraft((d) => ({ ...d, text: e.target.value }))}
@@ -3871,14 +5143,30 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   </option>
                 ))}
               </select>
-              <input
-                type="number"
-                min={6}
-                max={72}
-                value={runDraft.fontSize}
-                onChange={(e) => setRunDraft((d) => ({ ...d, fontSize: Number(e.target.value) || 12 }))}
-                className="w-16 h-10 px-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-mono-nums"
-              />
+              <div className="flex items-center border border-slate-200 dark:border-slate-700 rounded-xl bg-slate-50 dark:bg-slate-800 overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setRunDraft((d) => ({ ...d, fontSize: Math.max(6, d.fontSize - 1) }))}
+                  className="h-10 px-2 text-xs font-bold hover:bg-slate-200/60 dark:hover:bg-slate-700"
+                >
+                  A-
+                </button>
+                <input
+                  type="number"
+                  min={6}
+                  max={72}
+                  value={runDraft.fontSize}
+                  onChange={(e) => setRunDraft((d) => ({ ...d, fontSize: Number(e.target.value) || 12 }))}
+                  className="w-11 h-10 px-1 bg-transparent text-center text-xs font-mono-nums"
+                />
+                <button
+                  type="button"
+                  onClick={() => setRunDraft((d) => ({ ...d, fontSize: Math.min(72, d.fontSize + 1) }))}
+                  className="h-10 px-2 text-xs font-bold hover:bg-slate-200/60 dark:hover:bg-slate-700"
+                >
+                  A+
+                </button>
+              </div>
               <button
                 onClick={() => setRunDraft((d) => ({ ...d, bold: !d.bold }))}
                 className={`h-10 w-10 rounded-xl flex items-center justify-center border ${
@@ -3903,13 +5191,27 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               >
                 <Underline className="w-4 h-4" />
               </button>
-              <input
-                type="color"
-                title={language === 'bn' ? 'টেক্সট রঙ' : 'Text color'}
-                value={runDraft.color}
-                onChange={(e) => setRunDraft((d) => ({ ...d, color: e.target.value }))}
-                className="w-10 h-10 rounded-xl border border-slate-200 dark:border-slate-700 cursor-pointer"
-              />
+              <div className="flex items-center gap-1">
+                {(['#0F172A', '#142B4A', '#2563EB', '#DC2626', '#16A34A'] as const).map((tc) => (
+                  <button
+                    key={`run_clr_${tc}`}
+                    type="button"
+                    onClick={() => setRunDraft((d) => ({ ...d, color: tc }))}
+                    style={{ backgroundColor: tc }}
+                    className={`w-6 h-6 rounded-full border-2 shrink-0 ${
+                      runDraft.color.toUpperCase() === tc ? 'border-slate-900 dark:border-white scale-110' : 'border-transparent'
+                    }`}
+                    aria-label={`Text color ${tc}`}
+                  />
+                ))}
+                <input
+                  type="color"
+                  title={language === 'bn' ? 'টেক্সট রঙ' : 'Text color'}
+                  value={runDraft.color}
+                  onChange={(e) => setRunDraft((d) => ({ ...d, color: e.target.value }))}
+                  className="w-9 h-9 rounded-xl border border-slate-200 dark:border-slate-700 cursor-pointer"
+                />
+              </div>
             </div>
 
             <div className="flex items-center justify-between gap-2 text-xs px-2.5 py-2 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700">
@@ -3936,53 +5238,105 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 <button
                   type="button"
                   onClick={() => setRunDraft((d) => ({ ...d, backgroundColor: '#FFFFFF' }))}
-                  className="px-2.5 h-8 rounded-lg bg-white text-slate-800 border border-slate-200 font-semibold"
+                  className="px-2 h-8 rounded-lg bg-white text-slate-800 border border-slate-200 font-semibold"
                 >
                   #FFF
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRunDraft((d) => ({ ...d, backgroundColor: '#FEF9C3' }))}
+                  className="px-2 h-8 rounded-lg bg-[#FEF9C3] text-slate-800 border border-slate-200 font-semibold"
+                >
+                  #FEF
                 </button>
               </div>
             </div>
 
-            <div className="flex items-center justify-between gap-3 text-xs">
+            {/* Alignment, Spacing, and fine position nudge */}
+            <div className="flex items-center justify-between gap-2 text-xs">
               <div className="flex items-center gap-1">
                 {(['left', 'center', 'right'] as const).map((al) => (
                   <button
                     key={al}
                     type="button"
                     onClick={() => setRunDraft((d) => ({ ...d, align: al }))}
-                    className={`h-9 w-9 rounded-lg flex items-center justify-center border ${
+                    className={`h-8 w-8 rounded-lg flex items-center justify-center border ${
                       runDraft.align === al
                         ? 'bg-[#2563EB] text-white border-[#2563EB]'
                         : 'border-slate-200 dark:border-slate-700'
                     }`}
                   >
                     {al === 'left' ? (
-                      <AlignLeft className="w-4 h-4" />
+                      <AlignLeft className="w-3.5 h-3.5" />
                     ) : al === 'center' ? (
-                      <AlignCenter className="w-4 h-4" />
+                      <AlignCenter className="w-3.5 h-3.5" />
                     ) : (
-                      <AlignRight className="w-4 h-4" />
+                      <AlignRight className="w-3.5 h-3.5" />
                     )}
                   </button>
                 ))}
               </div>
-              <label className="flex items-center gap-2 flex-1">
-                <span className="text-slate-500 whitespace-nowrap">
-                  {language === 'bn' ? 'ফাঁক' : 'Spacing'}: {runDraft.letterSpacing}px
-                </span>
-                <input
-                  type="range"
-                  min={-1}
-                  max={6}
-                  step={0.5}
-                  value={runDraft.letterSpacing}
-                  onChange={(e) =>
-                    setRunDraft((d) => ({ ...d, letterSpacing: Number(e.target.value) }))
-                  }
-                  className="flex-1 accent-[#2563EB]"
-                />
-              </label>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => setRunDraft((d) => ({ ...d, dx: d.dx - 2 }))}
+                  className="h-8 w-7 rounded-lg border border-slate-200 dark:border-slate-700 font-bold"
+                  title="Nudge left"
+                >
+                  ←
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRunDraft((d) => ({ ...d, dy: d.dy - 2 }))}
+                  className="h-8 w-7 rounded-lg border border-slate-200 dark:border-slate-700 font-bold"
+                  title="Nudge up"
+                >
+                  ↑
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRunDraft((d) => ({ ...d, dy: d.dy + 2 }))}
+                  className="h-8 w-7 rounded-lg border border-slate-200 dark:border-slate-700 font-bold"
+                  title="Nudge down"
+                >
+                  ↓
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRunDraft((d) => ({ ...d, dx: d.dx + 2 }))}
+                  className="h-8 w-7 rounded-lg border border-slate-200 dark:border-slate-700 font-bold"
+                  title="Nudge right"
+                >
+                  →
+                </button>
+                {(runDraft.dx !== 0 || runDraft.dy !== 0) && (
+                  <button
+                    type="button"
+                    onClick={() => setRunDraft((d) => ({ ...d, dx: 0, dy: 0 }))}
+                    className="h-8 px-1.5 rounded-lg bg-slate-100 dark:bg-slate-800 text-[10px] font-mono-nums"
+                  >
+                    {runDraft.dx},{runDraft.dy}
+                  </button>
+                )}
+              </div>
             </div>
+
+            <label className="flex items-center gap-2 text-xs">
+              <span className="text-slate-500 whitespace-nowrap">
+                {language === 'bn' ? 'ফাঁক' : 'Spacing'}: {runDraft.letterSpacing}px
+              </span>
+              <input
+                type="range"
+                min={-1}
+                max={6}
+                step={0.5}
+                value={runDraft.letterSpacing}
+                onChange={(e) =>
+                  setRunDraft((d) => ({ ...d, letterSpacing: Number(e.target.value) }))
+                }
+                className="flex-1 accent-[#2563EB]"
+              />
+            </label>
 
             <div className="grid grid-cols-2 gap-2">
               <button
@@ -4005,22 +5359,47 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
       {/* Add / Edit Text Box Modal */}
       {addingBoxPos && (
         <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-4">
+          <div className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-3.5 max-h-[92vh] overflow-y-auto">
             <div className="flex items-center justify-between">
               <h3 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
                 {editingBoxId ? t.editor.editTextBoxTitle : t.editor.addTextBoxTitle}
               </h3>
               <button
                 onClick={() => {
+                  const wasAdding = !editingBoxId;
                   setAddingBoxPos(null);
                   setEditingBoxId(null);
+                  if (wasAdding && !keepToolActive) setActiveTool('select');
                 }}
                 className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-full"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  boxTextareaRef.current?.focus();
+                  boxTextareaRef.current?.select();
+                }}
+                className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 text-[11px] font-semibold text-slate-700 dark:text-slate-200"
+              >
+                {t.editor.selectAllText}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setNewBoxDraft((d) => ({ ...d, text: '' }));
+                  boxTextareaRef.current?.focus();
+                }}
+                className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 text-[11px] font-semibold text-slate-700 dark:text-slate-200"
+              >
+                {t.editor.clearText}
+              </button>
+            </div>
             <textarea
+              ref={boxTextareaRef}
               rows={3}
               value={newBoxDraft.text}
               onChange={(e) => setNewBoxDraft((d) => ({ ...d, text: e.target.value }))}
@@ -4044,14 +5423,30 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   </option>
                 ))}
               </select>
-              <input
-                type="number"
-                min={8}
-                max={64}
-                value={newBoxDraft.fontSize}
-                onChange={(e) => setNewBoxDraft((d) => ({ ...d, fontSize: Number(e.target.value) || 14 }))}
-                className="w-16 h-10 px-2 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-xs font-mono-nums"
-              />
+              <div className="flex items-center border border-slate-200 dark:border-slate-700 rounded-xl bg-slate-50 dark:bg-slate-800 overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setNewBoxDraft((d) => ({ ...d, fontSize: Math.max(8, d.fontSize - 1) }))}
+                  className="h-10 px-2 text-xs font-bold hover:bg-slate-200/60 dark:hover:bg-slate-700"
+                >
+                  A-
+                </button>
+                <input
+                  type="number"
+                  min={8}
+                  max={64}
+                  value={newBoxDraft.fontSize}
+                  onChange={(e) => setNewBoxDraft((d) => ({ ...d, fontSize: Number(e.target.value) || 14 }))}
+                  className="w-11 h-10 px-1 bg-transparent text-center text-xs font-mono-nums"
+                />
+                <button
+                  type="button"
+                  onClick={() => setNewBoxDraft((d) => ({ ...d, fontSize: Math.min(64, d.fontSize + 1) }))}
+                  className="h-10 px-2 text-xs font-bold hover:bg-slate-200/60 dark:hover:bg-slate-700"
+                >
+                  A+
+                </button>
+              </div>
               <button
                 type="button"
                 onClick={() => setNewBoxDraft((d) => ({ ...d, bold: !d.bold }))}
@@ -4079,14 +5474,28 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               >
                 <Underline className="w-4 h-4" />
               </button>
-              <input
-                type="color"
-                value={newBoxDraft.color}
-                onChange={(e) => setNewBoxDraft((d) => ({ ...d, color: e.target.value }))}
-                className="w-10 h-10 rounded-xl border border-slate-200 dark:border-slate-700 cursor-pointer"
-              />
+              <div className="flex items-center gap-1">
+                {(['#0F172A', '#142B4A', '#2563EB', '#DC2626', '#16A34A'] as const).map((tc) => (
+                  <button
+                    key={`box_clr_${tc}`}
+                    type="button"
+                    onClick={() => setNewBoxDraft((d) => ({ ...d, color: tc }))}
+                    style={{ backgroundColor: tc }}
+                    className={`w-6 h-6 rounded-full border-2 shrink-0 ${
+                      newBoxDraft.color.toUpperCase() === tc ? 'border-slate-900 dark:border-white scale-110' : 'border-transparent'
+                    }`}
+                    aria-label={`Box text color ${tc}`}
+                  />
+                ))}
+                <input
+                  type="color"
+                  value={newBoxDraft.color}
+                  onChange={(e) => setNewBoxDraft((d) => ({ ...d, color: e.target.value }))}
+                  className="w-9 h-9 rounded-xl border border-slate-200 dark:border-slate-700 cursor-pointer"
+                />
+              </div>
             </div>
-            <div className="flex items-center justify-between gap-2 text-xs">
+            <div className="flex items-center justify-between gap-2 text-xs flex-wrap">
               <div className="flex items-center gap-1.5">
                 <span className="text-slate-500 whitespace-nowrap">{t.editor.boxBg}:</span>
                 {TEXTBOX_BG_OPTIONS.map((opt) => (
@@ -4109,15 +5518,28 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   </button>
                 ))}
               </div>
-              <button
-                type="button"
-                onClick={() =>
-                  setNewBoxDraft((d) => ({ ...d, rotation: (d.rotation + 90) % 360 }))
-                }
-                className="h-7 px-2.5 rounded-lg border border-slate-200 dark:border-slate-700 flex items-center gap-1 font-semibold"
-              >
-                <RotateCw className="w-3.5 h-3.5" /> {newBoxDraft.rotation}°
-              </button>
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setNewBoxDraft((d) => ({ ...d, border: !d.border }))}
+                  className={`h-7 px-2 rounded-lg border font-semibold ${
+                    newBoxDraft.border
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {language === 'bn' ? 'বর্ডার' : 'Border'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setNewBoxDraft((d) => ({ ...d, rotation: (d.rotation + 90) % 360 }))
+                  }
+                  className="h-7 px-2 rounded-lg border border-slate-200 dark:border-slate-700 flex items-center gap-1 font-semibold"
+                >
+                  <RotateCw className="w-3.5 h-3.5" /> {newBoxDraft.rotation}°
+                </button>
+              </div>
             </div>
             <div className="flex items-center justify-between gap-3 text-xs">
               <div className="flex items-center gap-1">
@@ -4180,6 +5602,11 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 type="button"
                 onClick={() => {
                   if (!newBoxDraft.text.trim()) return;
+                  lastBoxPrefsRef.current = {
+                    fontSize: newBoxDraft.fontSize,
+                    fontFamily: newBoxDraft.fontFamily,
+                  };
+                  const wasAdding = !editingBoxId;
                   if (editingBoxId) {
                     commitState((prev) => ({
                       ...prev,
@@ -4192,6 +5619,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                               fontFamily: newBoxDraft.fontFamily,
                               color: newBoxDraft.color,
                               backgroundColor: newBoxDraft.backgroundColor,
+                              borderColor: newBoxDraft.border ? newBoxDraft.color : undefined,
                               rotation: newBoxDraft.rotation,
                               bold: newBoxDraft.bold,
                               italic: newBoxDraft.italic,
@@ -4203,12 +5631,13 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                       ),
                     }));
                   } else {
+                    const newId = `tb_${Date.now()}`;
                     commitState((prev) => ({
                       ...prev,
                       addedTexts: [
                         ...prev.addedTexts,
                         {
-                          id: `tb_${Date.now()}`,
+                          id: newId,
                           pageNumber,
                           text: newBoxDraft.text,
                           x: addingBoxPos.x,
@@ -4218,6 +5647,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                           fontFamily: newBoxDraft.fontFamily,
                           color: newBoxDraft.color,
                           backgroundColor: newBoxDraft.backgroundColor,
+                          borderColor: newBoxDraft.border ? newBoxDraft.color : undefined,
                           rotation: newBoxDraft.rotation,
                           bold: newBoxDraft.bold,
                           italic: newBoxDraft.italic,
@@ -4227,9 +5657,11 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                         },
                       ],
                     }));
+                    setSelectedElement({ kind: 'textBox', id: newId });
                   }
                   setAddingBoxPos(null);
                   setEditingBoxId(null);
+                  if (wasAdding && !keepToolActive) setActiveTool('select');
                 }}
                 className="w-full min-h-[46px] rounded-xl bg-[#2563EB] text-white text-sm font-semibold"
               >
@@ -4250,15 +5682,40 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
               </h3>
               <button
                 onClick={() => {
+                  const wasAdding = !editingStickyId;
                   setStickyPos(null);
                   setEditingStickyId(null);
+                  if (wasAdding && !keepToolActive) setActiveTool('select');
                 }}
                 className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-full"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => {
+                  stickyTextareaRef.current?.focus();
+                  stickyTextareaRef.current?.select();
+                }}
+                className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 text-[11px] font-semibold text-slate-700 dark:text-slate-200"
+              >
+                {t.editor.selectAllText}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setStickyText('');
+                  stickyTextareaRef.current?.focus();
+                }}
+                className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 text-[11px] font-semibold text-slate-700 dark:text-slate-200"
+              >
+                {t.editor.clearText}
+              </button>
+            </div>
             <textarea
+              ref={stickyTextareaRef}
               rows={3}
               value={stickyText}
               onChange={(e) => setStickyText(e.target.value)}
@@ -4451,8 +5908,10 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   }));
                   setSelectedElement({ kind: 'annotation', id: newId });
                 }
+                const wasAdding = !editingStickyId;
                 setStickyPos(null);
                 setEditingStickyId(null);
+                if (wasAdding && !keepToolActive) setActiveTool('select');
               }}
               className="w-full min-h-[46px] rounded-xl bg-[#2563EB] text-white text-sm font-semibold"
             >
@@ -4462,34 +5921,161 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         </div>
       )}
 
+      {/* Edit Stamp Modal */}
+      {editingStampId && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/50 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
+                {t.editor.stampEditTitle}
+              </h3>
+              <button
+                onClick={() => setEditingStampId(null)}
+                className="min-h-[40px] min-w-[40px] flex items-center justify-center rounded-full"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <input
+              type="text"
+              value={stampEditDraft.text}
+              onChange={(e) => setStampEditDraft((d) => ({ ...d, text: e.target.value }))}
+              className="w-full h-11 px-3 rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-50 dark:bg-slate-800 text-sm font-bold"
+              autoFocus
+            />
+            <div className="flex items-center justify-between gap-2 text-xs">
+              <div className="flex items-center gap-1.5">
+                {PALETTE_COLORS.slice(0, 6).map((c) => (
+                  <button
+                    key={c}
+                    type="button"
+                    onClick={() => setStampEditDraft((d) => ({ ...d, color: c }))}
+                    style={{ backgroundColor: c }}
+                    className={`w-6 h-6 rounded-full border-2 ${
+                      stampEditDraft.color === c ? 'border-slate-900 dark:border-white scale-110' : 'border-transparent'
+                    }`}
+                  />
+                ))}
+              </div>
+              <button
+                type="button"
+                onClick={() => setStampEditDraft((d) => ({ ...d, solidFill: !d.solidFill }))}
+                className={`px-2.5 py-1.5 rounded-lg font-semibold border ${
+                  stampEditDraft.solidFill
+                    ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                    : 'border-slate-200 dark:border-slate-700'
+                }`}
+              >
+                {stampEditDraft.solidFill ? t.editor.stampSolid : t.editor.stampOutline}
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => {
+                const txt = stampEditDraft.text.trim() || 'APPROVED';
+                const nextW = Math.max(84, txt.length * (stampEditDraft.fontSize * 0.72) + 24);
+                commitState((prev) => ({
+                  ...prev,
+                  annotations: prev.annotations.map((an) =>
+                    an.id === editingStampId
+                      ? {
+                          ...an,
+                          comment: txt,
+                          color: stampEditDraft.color,
+                          fillColor: stampEditDraft.solidFill ? stampEditDraft.color : undefined,
+                          width: Math.round(nextW),
+                        }
+                      : an
+                  ),
+                }));
+                setEditingStampId(null);
+              }}
+              className="w-full min-h-[44px] rounded-xl bg-[#2563EB] text-white text-sm font-semibold"
+            >
+              {t.editor.updateText}
+            </button>
+          </div>
+        </div>
+      )}
+
       <SignatureModal
         open={showSigModal}
+        language={language}
         onClose={() => setShowSigModal(false)}
         onSelectSignature={(sig) => {
           setPendingSig(sig);
           setShowSigModal(false);
-          setStatusMessage(t.editor.tapToPlaceSig);
-          setTimeout(() => setStatusMessage(null), 3000);
+          flashStatus(t.editor.tapToPlaceSig, 3000);
         }}
       />
 
       {/* Crop Inserted Image Modal */}
       {cropModalImg && (
         <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/55 backdrop-blur-sm">
-          <div className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-4">
+          <div className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-3.5 max-h-[92vh] overflow-y-auto">
             <div className="flex items-center justify-between">
               <h3 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
                 {t.editor.cropImageTitle}
               </h3>
-              <button onClick={() => setCropModalImg(null)} className="min-h-[40px] min-w-[40px]">
+              <button onClick={() => setCropModalImg(null)} className="min-h-[40px] min-w-[40px] flex items-center justify-center">
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            <div className="relative mx-auto w-fit max-h-52 overflow-hidden rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100">
+            {/* Aspect Ratio Presets */}
+            <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+              {[
+                { id: 'free', label: t.editor.cropFree, ratio: null },
+                { id: '1:1', label: '1:1', ratio: 1 },
+                { id: '3:4', label: '3:4 ID', ratio: 3 / 4 },
+                { id: '4:3', label: '4:3', ratio: 4 / 3 },
+                { id: '16:9', label: '16:9', ratio: 16 / 9 },
+              ].map((preset) => (
+                <button
+                  key={preset.id}
+                  type="button"
+                  onClick={() => {
+                    if (!preset.ratio) {
+                      setCropInsets({ top: 0, right: 0, bottom: 0, left: 0 });
+                      return;
+                    }
+                    const natW = cropNaturalSize?.w || cropModalImg.width;
+                    const natH = cropNaturalSize?.h || cropModalImg.height;
+                    const curRatio = natW / Math.max(1, natH);
+                    if (curRatio > preset.ratio) {
+                      const keepWFrac = preset.ratio / curRatio;
+                      const insetPct = Math.min(40, Math.max(0, Math.round(((1 - keepWFrac) / 2) * 100)));
+                      setCropInsets({ top: 0, bottom: 0, left: insetPct, right: insetPct });
+                    } else {
+                      const keepHFrac = curRatio / preset.ratio;
+                      const insetPct = Math.min(40, Math.max(0, Math.round(((1 - keepHFrac) / 2) * 100)));
+                      setCropInsets({ left: 0, right: 0, top: insetPct, bottom: insetPct });
+                    }
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 hover:bg-[#2563EB] hover:text-white font-semibold transition-colors"
+                >
+                  {preset.label}
+                </button>
+              ))}
+              <button
+                type="button"
+                onClick={() => setCropInsets({ top: 0, right: 0, bottom: 0, left: 0 })}
+                className="ml-auto px-2 py-1 rounded-lg text-rose-500 font-semibold flex items-center gap-1"
+              >
+                <RotateCcw className="w-3 h-3" /> {t.editor.cropReset}
+              </button>
+            </div>
+
+            <div className="relative mx-auto w-fit max-h-52 overflow-hidden rounded-xl border border-slate-200 dark:border-slate-700 bg-slate-100 dark:bg-slate-800">
               <img
                 src={cropModalImg.dataUrl}
                 alt="Crop preview"
+                onLoad={(e) => {
+                  const el = e.currentTarget;
+                  if (el.naturalWidth && el.naturalHeight) {
+                    setCropNaturalSize({ w: el.naturalWidth, h: el.naturalHeight });
+                  }
+                }}
                 style={{
                   clipPath: `inset(${cropInsets.top}% ${cropInsets.right}% ${cropInsets.bottom}% ${cropInsets.left}%)`,
                 }}
@@ -4507,7 +6093,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                   <input
                     type="range"
                     min={0}
-                    max={40}
+                    max={45}
                     value={cropInsets[side]}
                     onChange={(e) =>
                       setCropInsets((prev) => ({ ...prev, [side]: Number(e.target.value) }))
@@ -4558,6 +6144,557 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
         </div>
       )}
 
+      {/* Adjust Picture Pro Modal */}
+      {showImageAdjustModal && selectedImg && (
+        <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/55 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 p-5 shadow-2xl space-y-3.5 max-h-[92vh] overflow-y-auto text-xs">
+            <div className="flex items-center justify-between">
+              <h3 className="font-display text-base font-bold text-[#142B4A] dark:text-white">
+                {t.editor.adjustImageTitle}
+              </h3>
+              <button
+                type="button"
+                onClick={() => {
+                  const baseSnap = preGestureSnapshotRef.current;
+                  if (baseSnap) {
+                    setUndoStack((prev) => [...prev.slice(-24), baseSnap]);
+                    setRedoStack([]);
+                    preGestureSnapshotRef.current = null;
+                  }
+                  setShowImageAdjustModal(false);
+                }}
+                className="min-h-[38px] min-w-[38px] flex items-center justify-center rounded-full"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Live Compact Picture Preview */}
+            <div className="h-28 rounded-2xl bg-slate-100 dark:bg-slate-800/80 border border-slate-200 dark:border-slate-700 flex items-center justify-center overflow-hidden p-2">
+              <div
+                style={{
+                  opacity: selectedImg.opacity ?? 1,
+                  transform: `rotate(${selectedImg.rotation || 0}deg)`,
+                  borderRadius: `${Math.min(72, 72 * ((selectedImg.borderRadius || 0) / 100))}px`,
+                  border:
+                    selectedImg.borderWidth && selectedImg.borderWidth > 0
+                      ? `${selectedImg.borderWidth}px solid ${selectedImg.borderColor || '#142B4A'}`
+                      : undefined,
+                  overflow: 'hidden',
+                }}
+                className="max-h-24 flex items-center justify-center"
+              >
+                <img
+                  src={selectedImg.dataUrl}
+                  alt="Adjust preview"
+                  style={{
+                    transform: `scale(${selectedImg.flipX ? -1 : 1}, ${selectedImg.flipY ? -1 : 1})`,
+                    filter: [
+                      (selectedImg.brightness ?? 100) !== 100 ? `brightness(${selectedImg.brightness}%)` : '',
+                      (selectedImg.contrast ?? 100) !== 100 ? `contrast(${selectedImg.contrast}%)` : '',
+                      selectedImg.grayscale ? 'grayscale(100%)' : '',
+                    ]
+                      .filter(Boolean)
+                      .join(' ') || undefined,
+                  }}
+                  className="max-h-24 max-w-[200px] object-contain block"
+                />
+              </div>
+            </div>
+
+            {/* Dimensions + Aspect Ratio Lock + Align */}
+            <div className="p-3 rounded-2xl bg-slate-50 dark:bg-slate-800/60 border border-slate-200 dark:border-slate-700 space-y-2.5">
+              <div className="grid grid-cols-3 gap-2 items-end">
+                <label className="block">
+                  <span className="text-[11px] font-semibold text-slate-500">W (pt)</span>
+                  <input
+                    type="number"
+                    min={20}
+                    max={Math.round(pageSize.width)}
+                    value={Math.round(selectedImg.width)}
+                    onChange={(e) => {
+                      const nextW = Math.max(20, Math.min(pageSize.width, Number(e.target.value) || 20));
+                      const ratio = selectedImg.width / Math.max(1, selectedImg.height);
+                      const nextH =
+                        selectedImg.lockAspect !== false ? Math.max(20, Math.round(nextW / ratio)) : selectedImg.height;
+                      setState((prev) => ({
+                        ...prev,
+                        addedImages: prev.addedImages.map((im) =>
+                          im.id === selectedImg.id ? { ...im, width: nextW, height: nextH } : im
+                        ),
+                      }));
+                    }}
+                    className="w-full h-9 px-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-nums"
+                  />
+                </label>
+                <label className="block">
+                  <span className="text-[11px] font-semibold text-slate-500">H (pt)</span>
+                  <input
+                    type="number"
+                    min={20}
+                    max={Math.round(pageSize.height)}
+                    value={Math.round(selectedImg.height)}
+                    onChange={(e) => {
+                      const nextH = Math.max(20, Math.min(pageSize.height, Number(e.target.value) || 20));
+                      const ratio = selectedImg.width / Math.max(1, selectedImg.height);
+                      const nextW =
+                        selectedImg.lockAspect !== false ? Math.max(20, Math.round(nextH * ratio)) : selectedImg.width;
+                      setState((prev) => ({
+                        ...prev,
+                        addedImages: prev.addedImages.map((im) =>
+                          im.id === selectedImg.id ? { ...im, width: nextW, height: nextH } : im
+                        ),
+                      }));
+                    }}
+                    className="w-full h-9 px-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 font-mono-nums"
+                  />
+                </label>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, lockAspect: im.lockAspect === false } : im
+                      ),
+                    }))
+                  }
+                  className={`h-9 px-2 rounded-lg font-semibold border flex items-center justify-center gap-1 ${
+                    selectedImg.lockAspect !== false
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {selectedImg.lockAspect !== false ? <Lock className="w-3.5 h-3.5" /> : <Unlock className="w-3.5 h-3.5" />}
+                  <span className="truncate">{selectedImg.lockAspect !== false ? t.editor.lockAspect : t.editor.freeAspect}</span>
+                </button>
+              </div>
+
+              <div className="grid grid-cols-3 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id
+                          ? { ...im, x: Math.max(0, Math.round((pageSize.width - im.width) / 2)) }
+                          : im
+                      ),
+                    }))
+                  }
+                  className="h-8 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold"
+                >
+                  {t.editor.centerH}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id
+                          ? { ...im, y: Math.max(0, Math.round((pageSize.height - im.height) / 2)) }
+                          : im
+                      ),
+                    }))
+                  }
+                  className="h-8 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold"
+                >
+                  {t.editor.centerV}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const targetW = Math.max(80, Math.round(pageSize.width - 48));
+                    const targetH = Math.max(
+                      24,
+                      Math.round((targetW / Math.max(1, selectedImg.width)) * selectedImg.height)
+                    );
+                    setState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, x: 24, width: targetW, height: targetH } : im
+                      ),
+                    }));
+                  }}
+                  className="h-8 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 font-semibold"
+                >
+                  {t.editor.fitPageWidth}
+                </button>
+              </div>
+
+              {/* Fine Nudge D-Pad */}
+              <div className="flex items-center justify-between pt-1">
+                <span className="text-[11px] font-semibold text-slate-500">{t.editor.nudgePosition}</span>
+                <div className="flex items-center gap-1">
+                  {[
+                    { icon: ArrowLeft, dx: -2, dy: 0, label: 'Nudge left' },
+                    { icon: ArrowUp, dx: 0, dy: -2, label: 'Nudge up' },
+                    { icon: ArrowDown, dx: 0, dy: 2, label: 'Nudge down' },
+                    { icon: ArrowRight, dx: 2, dy: 0, label: 'Nudge right' },
+                  ].map((btn, i) => {
+                    const Icon = btn.icon;
+                    return (
+                      <button
+                        key={i}
+                        type="button"
+                        aria-label={btn.label}
+                        onClick={() =>
+                          setState((prev) => ({
+                            ...prev,
+                            addedImages: prev.addedImages.map((im) =>
+                              im.id === selectedImg.id
+                                ? {
+                                    ...im,
+                                    x: Math.max(0, Math.min(pageSize.width - 10, im.x + btn.dx)),
+                                    y: Math.max(0, Math.min(pageSize.height - 10, im.y + btn.dy)),
+                                  }
+                                : im
+                            ),
+                          }))
+                        }
+                        className="w-8 h-8 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 flex items-center justify-center"
+                      >
+                        <Icon className="w-3.5 h-3.5" />
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            </div>
+
+            {/* Smooth Rotation & Flip */}
+            <div className="space-y-2">
+              <label className="block">
+                <span className="flex justify-between text-slate-500 font-semibold mb-1">
+                  <span>{t.editor.fineRotate}</span>
+                  <span className="font-mono-nums">{selectedImg.rotation || 0}°</span>
+                </span>
+                <input
+                  type="range"
+                  min={-180}
+                  max={180}
+                  value={selectedImg.rotation > 180 ? selectedImg.rotation - 360 : selectedImg.rotation}
+                  onChange={(e) => {
+                    const val = Number(e.target.value);
+                    setState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, rotation: val } : im
+                      ),
+                    }));
+                  }}
+                  className="w-full accent-[#2563EB]"
+                />
+              </label>
+              <div className="flex flex-wrap gap-1.5">
+                {[-90, 0, 90].map((deg) => (
+                  <button
+                    key={deg}
+                    type="button"
+                    onClick={() =>
+                      setState((prev) => ({
+                        ...prev,
+                        addedImages: prev.addedImages.map((im) =>
+                          im.id === selectedImg.id ? { ...im, rotation: deg } : im
+                        ),
+                      }))
+                    }
+                    className={`px-2.5 py-1 rounded-lg font-mono-nums font-semibold border ${
+                      (selectedImg.rotation || 0) === deg
+                        ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                        : 'border-slate-200 dark:border-slate-700'
+                    }`}
+                  >
+                    {deg}°
+                  </button>
+                ))}
+                <button
+                  type="button"
+                  onClick={() =>
+                    setState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, flipX: !im.flipX } : im
+                      ),
+                    }))
+                  }
+                  className={`px-2.5 py-1 rounded-lg font-semibold border flex items-center gap-1 ${
+                    selectedImg.flipX
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  <FlipHorizontal2 className="w-3.5 h-3.5" /> {t.editor.flipH}
+                </button>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, flipY: !im.flipY } : im
+                      ),
+                    }))
+                  }
+                  className={`px-2.5 py-1 rounded-lg font-semibold border flex items-center gap-1 ${
+                    selectedImg.flipY
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  <FlipVertical2 className="w-3.5 h-3.5" /> {t.editor.flipV}
+                </button>
+              </div>
+            </div>
+
+            {/* Opacity, Brightness, Contrast */}
+            <div className="grid grid-cols-1 gap-2">
+              <label className="block">
+                <span className="flex justify-between text-slate-500 font-semibold">
+                  <span>{t.editor.opacity}</span>
+                  <span className="font-mono-nums">{Math.round((selectedImg.opacity ?? 1) * 100)}%</span>
+                </span>
+                <input
+                  type="range"
+                  min={10}
+                  max={100}
+                  value={Math.round((selectedImg.opacity ?? 1) * 100)}
+                  onChange={(e) => {
+                    const op = Number(e.target.value) / 100;
+                    setState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, opacity: op } : im
+                      ),
+                    }));
+                  }}
+                  className="w-full accent-[#2563EB]"
+                />
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="block">
+                  <span className="flex justify-between text-slate-500 font-semibold">
+                    <span>{t.editor.brightness}</span>
+                    <span className="font-mono-nums">{selectedImg.brightness ?? 100}%</span>
+                  </span>
+                  <input
+                    type="range"
+                    min={50}
+                    max={150}
+                    value={selectedImg.brightness ?? 100}
+                    onChange={(e) => {
+                      const val = Number(e.target.value);
+                      setState((prev) => ({
+                        ...prev,
+                        addedImages: prev.addedImages.map((im) =>
+                          im.id === selectedImg.id ? { ...im, brightness: val } : im
+                        ),
+                      }));
+                    }}
+                    className="w-full accent-[#2563EB]"
+                  />
+                </label>
+                <label className="block">
+                  <span className="flex justify-between text-slate-500 font-semibold">
+                    <span>{t.editor.contrast}</span>
+                    <span className="font-mono-nums">{selectedImg.contrast ?? 100}%</span>
+                  </span>
+                  <input
+                    type="range"
+                    min={50}
+                    max={150}
+                    value={selectedImg.contrast ?? 100}
+                    onChange={(e) => {
+                      const val = Number(e.target.value);
+                      setState((prev) => ({
+                        ...prev,
+                        addedImages: prev.addedImages.map((im) =>
+                          im.id === selectedImg.id ? { ...im, contrast: val } : im
+                        ),
+                      }));
+                    }}
+                    className="w-full accent-[#2563EB]"
+                  />
+                </label>
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, grayscale: !im.grayscale } : im
+                      ),
+                    }))
+                  }
+                  className={`px-3 py-1.5 rounded-xl font-semibold border ${
+                    selectedImg.grayscale
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {t.editor.grayscale}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const img = new Image();
+                    img.onload = () => {
+                      const c = document.createElement('canvas');
+                      c.width = img.naturalWidth || 200;
+                      c.height = img.naturalHeight || 200;
+                      const ctx = c.getContext('2d')!;
+                      ctx.drawImage(img, 0, 0);
+                      const imgData = ctx.getImageData(0, 0, c.width, c.height);
+                      const d = imgData.data;
+                      for (let i = 0; i < d.length; i += 4) {
+                        const r = d[i];
+                        const g = d[i + 1];
+                        const b = d[i + 2];
+                        if (r > 228 && g > 228 && b > 228) {
+                          d[i + 3] = 0;
+                        } else if (r > 205 && g > 205 && b > 205) {
+                          d[i + 3] = Math.round(d[i + 3] * 0.35);
+                        }
+                      }
+                      ctx.putImageData(imgData, 0, 0);
+                      const cleanUrl = c.toDataURL('image/png');
+                      commitState((prev) => ({
+                        ...prev,
+                        addedImages: prev.addedImages.map((im) =>
+                          im.id === selectedImg.id ? { ...im, dataUrl: cleanUrl } : im
+                        ),
+                      }));
+                    };
+                    img.src = selectedImg.dataUrl;
+                  }}
+                  className="px-3 py-1.5 rounded-xl font-semibold border border-slate-200 dark:border-slate-700 hover:border-[#2563EB] text-[#142B4A] dark:text-slate-200"
+                >
+                  {t.editor.removeWhiteBg}
+                </button>
+              </div>
+            </div>
+
+            {/* Rounded Corners & Frame Border */}
+            <div className="grid grid-cols-2 gap-3 pt-1 border-t border-slate-100 dark:border-slate-800">
+              <label className="block">
+                <span className="flex justify-between text-slate-500 font-semibold">
+                  <span>{t.editor.cornerRadius}</span>
+                  <span className="font-mono-nums">{selectedImg.borderRadius ?? 0}%</span>
+                </span>
+                <input
+                  type="range"
+                  min={0}
+                  max={50}
+                  value={selectedImg.borderRadius ?? 0}
+                  onChange={(e) => {
+                    const val = Number(e.target.value);
+                    setState((prev) => ({
+                      ...prev,
+                      addedImages: prev.addedImages.map((im) =>
+                        im.id === selectedImg.id ? { ...im, borderRadius: val } : im
+                      ),
+                    }));
+                  }}
+                  className="w-full accent-[#2563EB]"
+                />
+              </label>
+              <div>
+                <span className="flex justify-between text-slate-500 font-semibold mb-1">
+                  <span>{t.editor.frameBorder}</span>
+                  <span className="font-mono-nums">{selectedImg.borderWidth ?? 0}pt</span>
+                </span>
+                <div className="flex items-center gap-1">
+                  {[0, 1.5, 3, 5].map((bw) => (
+                    <button
+                      key={bw}
+                      type="button"
+                      onClick={() =>
+                        setState((prev) => ({
+                          ...prev,
+                          addedImages: prev.addedImages.map((im) =>
+                            im.id === selectedImg.id ? { ...im, borderWidth: bw } : im
+                          ),
+                        }))
+                      }
+                      className={`flex-1 h-7 rounded-lg font-mono-nums font-semibold border ${
+                        (selectedImg.borderWidth ?? 0) === bw
+                          ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                          : 'border-slate-200 dark:border-slate-700'
+                      }`}
+                    >
+                      {bw === 0 ? '0' : bw}
+                    </button>
+                  ))}
+                  <input
+                    type="color"
+                    value={selectedImg.borderColor || '#142B4A'}
+                    onChange={(e) =>
+                      setState((prev) => ({
+                        ...prev,
+                        addedImages: prev.addedImages.map((im) =>
+                          im.id === selectedImg.id ? { ...im, borderColor: e.target.value } : im
+                        ),
+                      }))
+                    }
+                    className="w-7 h-7 rounded-lg shrink-0"
+                  />
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 pt-1">
+              <button
+                type="button"
+                onClick={() =>
+                  setState((prev) => ({
+                    ...prev,
+                    addedImages: prev.addedImages.map((im) =>
+                      im.id === selectedImg.id
+                        ? {
+                            ...im,
+                            rotation: 0,
+                            opacity: 1,
+                            flipX: false,
+                            flipY: false,
+                            brightness: 100,
+                            contrast: 100,
+                            grayscale: false,
+                            borderRadius: 0,
+                            borderWidth: 0,
+                            lockAspect: true,
+                          }
+                        : im
+                    ),
+                  }))
+                }
+                className="min-h-[42px] rounded-xl bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-200 font-semibold"
+              >
+                {t.editor.resetImage}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const baseSnap = preGestureSnapshotRef.current;
+                  if (baseSnap) {
+                    setUndoStack((prev) => [...prev.slice(-24), baseSnap]);
+                    setRedoStack([]);
+                    preGestureSnapshotRef.current = null;
+                  }
+                  setShowImageAdjustModal(false);
+                }}
+                className="min-h-[42px] rounded-xl bg-[#2563EB] text-white font-semibold"
+              >
+                {t.editor.applyChanges}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Unsaved Changes Exit Guard Modal */}
       {showExitConfirm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4">
@@ -4574,7 +6711,7 @@ export const PdfEditorView: React.FC<PdfEditorViewProps> = ({
                 disabled={saving}
                 onClick={() => {
                   setShowExitConfirm(false);
-                  void handleSave('version');
+                  void handleSave('version', true);
                 }}
                 className="w-full min-h-[44px] rounded-xl bg-[#2563EB] text-white text-xs font-semibold"
               >

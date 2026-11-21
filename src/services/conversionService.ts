@@ -1,4 +1,19 @@
-import { Document, Packer, Paragraph, TextRun, HeadingLevel, PageBreak } from 'docx';
+import {
+  AlignmentType,
+  BorderStyle,
+  Document,
+  HeadingLevel,
+  ImageRun,
+  Packer,
+  PageBreak,
+  Paragraph,
+  ShadingType,
+  Table,
+  TableCell,
+  TableRow,
+  TextRun,
+  WidthType,
+} from 'docx';
 import * as XLSX from 'xlsx';
 import mammoth from 'mammoth';
 import JSZip from 'jszip';
@@ -11,12 +26,30 @@ import {
   getSharedPdfDocument,
   hasNonWinAnsiChars,
   hexToRgb,
+  renderPageToCanvas,
   renderPageToDataUrl,
   renderUnicodeTextPng,
   splitPdfByRanges,
 } from './pdfEngine';
+import { runOnDeviceOcr } from './ocrService';
 
 export type ImageToPdfFitMode = 'a4-fit' | 'a4-fill' | 'auto';
+
+export interface PdfToDocxOptions {
+  includeVisualOnScanned?: boolean;
+  useOcr?: boolean;
+  preservePageBreaks?: boolean;
+}
+
+export interface PdfToXlsxOptions {
+  mergeSheets?: boolean;
+  useOcr?: boolean;
+}
+
+export interface PdfToPptxOptions {
+  mode?: 'editable' | 'visual';
+  useOcr?: boolean;
+}
 
 export async function imagesToPdf(
   files: File[],
@@ -127,11 +160,68 @@ export async function splitPdfPagesAsZip(
 interface PositionedSpan {
   str: string;
   x: number;
+  right: number;
   baselineY: number;
+  topY: number;
   width: number;
   fontSize: number;
   isBold: boolean;
+  isItalic: boolean;
+  fontTone: 'sans' | 'serif' | 'mono';
 }
+
+interface RowCell {
+  x: number;
+  right: number;
+  fontSize: number;
+  text: string;
+  spans: PositionedSpan[];
+}
+
+interface ClusteredRow {
+  avgY: number;
+  topY: number;
+  avgFontSize: number;
+  spans: PositionedSpan[];
+  cells: RowCell[];
+  left: number;
+  right: number;
+  align: 'left' | 'center' | 'right';
+}
+
+interface ColInterval {
+  left: number;
+  right: number;
+  center: number;
+}
+
+type PageBlock =
+  | {
+      kind: 'table';
+      topY: number;
+      bottomY: number;
+      left: number;
+      right: number;
+      colWidths: number[];
+      rows: Array<Array<{ text: string; spans: PositionedSpan[]; isNumeric: boolean }>>;
+    }
+  | {
+      kind: 'paragraph';
+      topY: number;
+      bottomY: number;
+      left: number;
+      right: number;
+      fontSize: number;
+      align: 'left' | 'center' | 'right';
+      isList: boolean;
+      runs: Array<{
+        text: string;
+        bold: boolean;
+        italics: boolean;
+        fontTone: 'sans' | 'serif' | 'mono';
+        fontSize: number;
+      }>;
+    };
 
 async function extractVisualSpansPerPage(pdfBytes: ArrayBuffer): Promise<
   Array<{ pageNumber: number; width: number; height: number; spans: PositionedSpan[] }>
@@ -143,6 +233,7 @@ async function extractVisualSpansPerPage(pdfBytes: ArrayBuffer): Promise<
     const page = await pdf.getPage(p);
     const viewport = page.getViewport({ scale: 1 });
     const tc = await page.getTextContent();
+    const stylesMap = (tc as unknown as { styles?: Record<string, { fontFamily?: string }> }).styles || {};
     const spans: PositionedSpan[] = [];
 
     for (const item of tc.items) {
@@ -157,16 +248,43 @@ async function extractVisualSpansPerPage(pdfBytes: ArrayBuffer): Promise<
         item.width && item.width > 0
           ? item.width
           : Math.max(4, item.str.length * fontSize * 0.48);
-      const fname = (item.fontName || '').toLowerCase();
-      const isBold = fname.includes('bold') || fname.includes('black') || fname.includes('heavy');
+
+      const styleEntry = item.fontName ? stylesMap[item.fontName] : undefined;
+      const combinedFontDesc = `${item.fontName || ''} ${styleEntry?.fontFamily || ''}`.toLowerCase();
+      const isBold =
+        combinedFontDesc.includes('bold') ||
+        combinedFontDesc.includes('black') ||
+        combinedFontDesc.includes('heavy') ||
+        combinedFontDesc.includes('semibold') ||
+        combinedFontDesc.includes('demi');
+      const isItalic =
+        combinedFontDesc.includes('italic') ||
+        combinedFontDesc.includes('oblique') ||
+        combinedFontDesc.includes('slant');
+      const fontTone: 'sans' | 'serif' | 'mono' =
+        combinedFontDesc.includes('courier') ||
+        combinedFontDesc.includes('mono') ||
+        combinedFontDesc.includes('consolas')
+          ? 'mono'
+          : combinedFontDesc.includes('times') ||
+            combinedFontDesc.includes('serif') ||
+            combinedFontDesc.includes('georgia') ||
+            combinedFontDesc.includes('cambria') ||
+            combinedFontDesc.includes('garamond')
+          ? 'serif'
+          : 'sans';
 
       spans.push({
         str: item.str,
         x,
+        right: x + width,
         baselineY,
+        topY: baselineY - fontSize * 0.85,
         width,
         fontSize,
         isBold,
+        isItalic,
+        fontTone,
       });
     }
 
@@ -182,12 +300,60 @@ async function extractVisualSpansPerPage(pdfBytes: ArrayBuffer): Promise<
   return pages;
 }
 
-function clusterSpansIntoRows(spans: PositionedSpan[]) {
+function splitRowIntoCells(spans: PositionedSpan[]): RowCell[] {
+  const cells: RowCell[] = [];
+  for (const sp of spans) {
+    const clean = sp.str.replace(/\s+/g, ' ').trim();
+    if (!clean) continue;
+    const prev = cells[cells.length - 1];
+    const gap = prev ? sp.x - prev.right : Infinity;
+    const joinThreshold = prev ? Math.max(prev.fontSize, sp.fontSize) * 1.15 : 0;
+    if (prev && gap <= joinThreshold) {
+      const needsSpace =
+        gap > Math.min(sp.fontSize, prev.fontSize) * 0.16 &&
+        !prev.text.endsWith(' ') &&
+        !clean.startsWith(' ');
+      prev.text = `${prev.text}${needsSpace ? ' ' : ''}${clean}`;
+      prev.right = Math.max(prev.right, sp.right);
+      prev.fontSize = Math.max(prev.fontSize, sp.fontSize);
+      prev.spans.push(sp);
+    } else {
+      cells.push({
+        x: sp.x,
+        right: sp.right,
+        fontSize: sp.fontSize,
+        text: clean,
+        spans: [sp],
+      });
+    }
+  }
+  return cells;
+}
+
+function inferRowAlignment(
+  left: number,
+  right: number,
+  pageWidth: number
+): 'left' | 'center' | 'right' {
+  const contentW = right - left;
+  if (contentW >= pageWidth * 0.74) return 'left';
+  const leftMargin = Math.max(0, left);
+  const rightMargin = Math.max(0, pageWidth - right);
+  if (leftMargin > pageWidth * 0.14 && Math.abs(leftMargin - rightMargin) <= pageWidth * 0.1) {
+    return 'center';
+  }
+  if (leftMargin > pageWidth * 0.45 && rightMargin <= pageWidth * 0.16) {
+    return 'right';
+  }
+  return 'left';
+}
+
+function clusterSpansIntoRows(spans: PositionedSpan[], pageWidth = 595): ClusteredRow[] {
   const sorted = [...spans].sort((a, b) => a.baselineY - b.baselineY || a.x - b.x);
-  const rows: Array<{ avgY: number; avgFontSize: number; spans: PositionedSpan[] }> = [];
+  const rawRows: Array<{ avgY: number; avgFontSize: number; spans: PositionedSpan[] }> = [];
 
   for (const sp of sorted) {
-    const last = rows[rows.length - 1];
+    const last = rawRows[rawRows.length - 1];
     if (
       last &&
       Math.abs(sp.baselineY - last.avgY) <=
@@ -198,23 +364,365 @@ function clusterSpansIntoRows(spans: PositionedSpan[]) {
       last.avgFontSize = (last.avgFontSize * n + sp.fontSize) / (n + 1);
       last.spans.push(sp);
     } else {
-      rows.push({ avgY: sp.baselineY, avgFontSize: sp.fontSize, spans: [sp] });
+      rawRows.push({ avgY: sp.baselineY, avgFontSize: sp.fontSize, spans: [sp] });
     }
   }
 
-  rows.forEach((r) => r.spans.sort((a, b) => a.x - b.x));
-  return rows;
+  return rawRows
+    .map((r) => {
+      r.spans.sort((a, b) => a.x - b.x);
+      const cells = splitRowIntoCells(r.spans);
+      const left = r.spans.reduce((m, s) => Math.min(m, s.x), Infinity);
+      const right = r.spans.reduce((m, s) => Math.max(m, s.right), -Infinity);
+      const topY = r.spans.reduce((m, s) => Math.min(m, s.topY), r.avgY - r.avgFontSize * 0.85);
+      return {
+        avgY: r.avgY,
+        topY,
+        avgFontSize: r.avgFontSize,
+        spans: r.spans,
+        cells,
+        left: Number.isFinite(left) ? left : 0,
+        right: Number.isFinite(right) ? right : 0,
+        align: inferRowAlignment(left, right, pageWidth),
+      };
+    })
+    .filter((r) => r.cells.length > 0);
+}
+
+/**
+ * Clusters horizontal cell intervals from multi-cell rows into clean non-overlapping column tracks.
+ * Handles both left-aligned text columns and right-aligned numeric/currency columns accurately.
+ */
+function buildColumnIntervals(multiCellRows: RowCell[][]): ColInterval[] {
+  const flat = multiCellRows.flat().sort((a, b) => a.x - b.x || a.right - b.right);
+  const intervals: ColInterval[] = [];
+
+  for (const cell of flat) {
+    let bestIdx = -1;
+    let bestScore = Infinity;
+
+    for (let i = 0; i < intervals.length; i++) {
+      const col = intervals[i];
+      const overlap = Math.min(col.right, cell.right) - Math.max(col.left, cell.x);
+      const minW = Math.max(4, Math.min(col.right - col.left, cell.right - cell.x));
+      // Strong horizontal overlap OR tight left/right edge alignment (for right-aligned numbers)
+      if (
+        overlap > minW * 0.22 ||
+        Math.abs(cell.x - col.left) <= 12 ||
+        Math.abs(cell.right - col.right) <= 10
+      ) {
+        const score = Math.abs((cell.x + cell.right) / 2 - col.center);
+        if (score < bestScore) {
+          bestScore = score;
+          bestIdx = i;
+        }
+      }
+    }
+
+    if (bestIdx >= 0) {
+      const c = intervals[bestIdx];
+      c.left = Math.min(c.left, cell.x);
+      c.right = Math.max(c.right, cell.right);
+      c.center = (c.left + c.right) / 2;
+    } else {
+      intervals.push({
+        left: cell.x,
+        right: cell.right,
+        center: (cell.x + cell.right) / 2,
+      });
+    }
+  }
+
+  intervals.sort((a, b) => a.left - b.left);
+  // Merge intervals that ended up overlapping significantly after expansion
+  const merged: ColInterval[] = [];
+  for (const col of intervals) {
+    const prev = merged[merged.length - 1];
+    if (prev && col.left < prev.right - 4) {
+      prev.left = Math.min(prev.left, col.left);
+      prev.right = Math.max(prev.right, col.right);
+      prev.center = (prev.left + prev.right) / 2;
+    } else {
+      merged.push({ ...col });
+    }
+  }
+  return merged;
+}
+
+function matchCellToColumn(cell: RowCell, cols: ColInterval[]): number {
+  let bestCol = 0;
+  let bestScore = -Infinity;
+  const cellCenter = (cell.x + cell.right) / 2;
+
+  for (let i = 0; i < cols.length; i++) {
+    const col = cols[i];
+    const overlap = Math.min(col.right, cell.right) - Math.max(col.left, cell.x);
+    if (overlap > 0) {
+      const score = overlap * 10 - Math.abs(cellCenter - col.center);
+      if (score > bestScore) {
+        bestScore = score;
+        bestCol = i;
+      }
+    } else {
+      const dist = cell.right < col.left ? col.left - cell.right : cell.x - col.right;
+      const score = -1000 - dist;
+      if (score > bestScore) {
+        bestScore = score;
+        bestCol = i;
+      }
+    }
+  }
+  return bestCol;
+}
+
+function isBulletOrNumberedLine(text: string): boolean {
+  return /^([•●○▪▫■◆➤➢✓✔\-*]\s+|(\d{1,3}|[a-zA-Z])[.)]\s+)/.test(text.trim());
+}
+
+function mergeSpansIntoStyledRuns(
+  spans: PositionedSpan[]
+): Array<{
+  text: string;
+  bold: boolean;
+  italics: boolean;
+  fontTone: 'sans' | 'serif' | 'mono';
+  fontSize: number;
+}> {
+  const runs: Array<{
+    text: string;
+    bold: boolean;
+    italics: boolean;
+    fontTone: 'sans' | 'serif' | 'mono';
+    fontSize: number;
+  }> = [];
+  let lastRight = -Infinity;
+
+  for (const sp of spans) {
+    const gap = lastRight === -Infinity ? 0 : sp.x - lastRight;
+    let prefix = '';
+    if (runs.length > 0 && lastRight !== -Infinity) {
+      if (gap > sp.fontSize * 1.9) {
+        prefix = '    ';
+      } else if (
+        gap > sp.fontSize * 0.16 &&
+        !runs[runs.length - 1].text.endsWith(' ') &&
+        !sp.str.startsWith(' ')
+      ) {
+        prefix = ' ';
+      }
+    }
+    const piece = `${prefix}${sp.str}`;
+    lastRight = Math.max(lastRight, sp.right);
+
+    const roundedFs = Math.round(sp.fontSize * 2) / 2;
+    const prev = runs[runs.length - 1];
+    if (
+      prev &&
+      prev.bold === sp.isBold &&
+      prev.italics === sp.isItalic &&
+      prev.fontTone === sp.fontTone &&
+      Math.abs(prev.fontSize - roundedFs) <= 0.8
+    ) {
+      prev.text += piece;
+    } else {
+      runs.push({
+        text: piece,
+        bold: sp.isBold,
+        italics: sp.isItalic,
+        fontTone: sp.fontTone,
+        fontSize: roundedFs,
+      });
+    }
+  }
+  return runs.filter((r) => r.text.length > 0);
+}
+
+function analyzePageBlocks(rows: ClusteredRow[], pageWidth: number): PageBlock[] {
+  const blocks: PageBlock[] = [];
+  let idx = 0;
+
+  while (idx < rows.length) {
+    // Try to detect a multi-row table starting at idx
+    if (rows[idx].cells.length >= 2) {
+      let endIdx = idx + 1;
+      while (endIdx < rows.length) {
+        const yGap = rows[endIdx].avgY - rows[endIdx - 1].avgY;
+        const maxGap = Math.max(rows[endIdx].avgFontSize, rows[endIdx - 1].avgFontSize) * 3.1;
+        if (yGap > maxGap) break;
+        if (rows[endIdx].cells.length >= 2) {
+          endIdx++;
+          continue;
+        }
+        // Allow a wrapped 1-cell continuation inside a table ONLY if next row returns to >= 2 cells quickly
+        if (
+          endIdx + 1 < rows.length &&
+          rows[endIdx + 1].cells.length >= 2 &&
+          rows[endIdx + 1].avgY - rows[endIdx].avgY <= maxGap
+        ) {
+          endIdx++;
+          continue;
+        }
+        break;
+      }
+
+      const candidateRows = rows.slice(idx, endIdx);
+      const multiRows = candidateRows.filter((r) => r.cells.length >= 2);
+      if (multiRows.length >= 2) {
+        const cols = buildColumnIntervals(multiRows.map((r) => r.cells));
+        if (cols.length >= 2) {
+          const tableRows = candidateRows.map((r) => {
+            const rowCells: Array<{ text: string; spans: PositionedSpan[]; isNumeric: boolean }> =
+              Array.from({ length: cols.length }, () => ({
+                text: '',
+                spans: [],
+                isNumeric: false,
+              }));
+            for (const c of r.cells) {
+              const ci = matchCellToColumn(c, cols);
+              const existing = rowCells[ci];
+              existing.text = existing.text ? `${existing.text} ${c.text}` : c.text;
+              existing.spans.push(...c.spans);
+              existing.isNumeric = /^[$(£€₹৳+\-]?[\d,]+(\.\d+)?%?\)?$/.test(existing.text.trim());
+            }
+            return rowCells;
+          });
+
+          const totalSpanW = Math.max(120, cols[cols.length - 1].right - cols[0].left);
+          const colWidths = cols.map((c) =>
+            Math.max(0.08, (Math.max(24, c.right - c.left) / totalSpanW))
+          );
+
+          blocks.push({
+            kind: 'table',
+            topY: candidateRows[0].topY,
+            bottomY: candidateRows[candidateRows.length - 1].avgY + 4,
+            left: cols[0].left,
+            right: cols[cols.length - 1].right,
+            colWidths,
+            rows: tableRows,
+          });
+          idx = endIdx;
+          continue;
+        }
+      }
+    }
+
+    // Build reflowed paragraph from consecutive compatible text lines
+    const paraRows: ClusteredRow[] = [rows[idx]];
+    let j = idx + 1;
+    while (j < rows.length) {
+      const prev = paraRows[paraRows.length - 1];
+      const next = rows[j];
+      // Stop before starting a multi-row table
+      if (
+        next.cells.length >= 2 &&
+        j + 1 < rows.length &&
+        rows[j + 1].cells.length >= 2
+      ) {
+        break;
+      }
+      if (next.cells.length >= 3) break;
+
+      const yGap = next.avgY - prev.avgY;
+      const fs = Math.max(prev.avgFontSize, next.avgFontSize);
+      const prevText = prev.cells.map((c) => c.text).join('  ').trim();
+      const nextText = next.cells.map((c) => c.text).join('  ').trim();
+
+      const sameFontScale = Math.abs(prev.avgFontSize - next.avgFontSize) <= 1.6;
+      const closeLineGap = yGap <= fs * 1.65;
+      const similarIndentOrCentered =
+        (prev.align === 'center' && next.align === 'center') ||
+        Math.abs(prev.left - next.left) <= 22;
+      const endsWithTerminal = /[.!?:।]$/.test(prevText);
+      const nextIsBullet = isBulletOrNumberedLine(nextText);
+      const prevWasWideLine = prev.right >= pageWidth * 0.72;
+
+      if (
+        sameFontScale &&
+        closeLineGap &&
+        similarIndentOrCentered &&
+        !nextIsBullet &&
+        (!endsWithTerminal || prevWasWideLine) &&
+        prev.cells.length === 1 &&
+        next.cells.length === 1
+      ) {
+        paraRows.push(next);
+        j++;
+      } else {
+        break;
+      }
+    }
+
+    const combinedSpans: PositionedSpan[] = [];
+    paraRows.forEach((pr, rIdx) => {
+      if (rIdx > 0 && pr.spans.length > 0 && combinedSpans.length > 0) {
+        const last = combinedSpans[combinedSpans.length - 1];
+        const first = pr.spans[0];
+        if (!last.str.endsWith(' ') && !first.str.startsWith(' ')) {
+          combinedSpans.push({
+            ...first,
+            str: ' ',
+            x: last.right,
+            right: last.right + 2,
+            width: 2,
+          });
+        }
+      }
+      combinedSpans.push(...pr.spans);
+    });
+
+    const runs = mergeSpansIntoStyledRuns(combinedSpans);
+    const fullText = runs.map((r) => r.text).join('').trim();
+    const maxFs = paraRows.reduce((m, r) => Math.max(m, r.avgFontSize), 10);
+    const minLeft = paraRows.reduce((m, r) => Math.min(m, r.left), pageWidth);
+    const maxRight = paraRows.reduce((m, r) => Math.max(m, r.right), 0);
+
+    blocks.push({
+      kind: 'paragraph',
+      topY: paraRows[0].topY,
+      bottomY: paraRows[paraRows.length - 1].avgY + 4,
+      left: minLeft,
+      right: maxRight,
+      fontSize: maxFs,
+      align: paraRows[0].align,
+      isList: isBulletOrNumberedLine(fullText),
+      runs,
+    });
+    idx = j;
+  }
+
+  return blocks;
+}
+
+function mapToneToWordFont(tone: 'sans' | 'serif' | 'mono'): string {
+  if (tone === 'serif') return 'Times New Roman';
+  if (tone === 'mono') return 'Courier New';
+  return 'Calibri';
+}
+
+function uint8ArrayFromDataUrl(dataUrl: string): Uint8Array {
+  const b64 = dataUrl.split(',')[1] || '';
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
 }
 
 export async function pdfToDocxBytes(
   pdfBytes: ArrayBuffer,
-  title: string
-): Promise<{ buffer: ArrayBuffer; extractedChars: number }> {
+  title: string,
+  options?: PdfToDocxOptions
+): Promise<{ buffer: ArrayBuffer; extractedChars: number; ocrUsed: boolean }> {
+  const includeVisualOnScanned = options?.includeVisualOnScanned ?? true;
+  const useOcr = options?.useOcr ?? false;
+  const preservePageBreaks = options?.preservePageBreaks ?? true;
+
   const pages = await extractVisualSpansPerPage(pdfBytes);
 
-  // Estimate dominant body font size across document for accurate heading classification
+  // Estimate dominant body font size across document for heading classification
   const allFontSizes: number[] = [];
   let extractedChars = 0;
+  let ocrUsed = false;
   for (const pg of pages) {
     for (const sp of pg.spans) {
       extractedChars += sp.str.trim().length;
@@ -225,192 +733,478 @@ export async function pdfToDocxBytes(
   const bodySize =
     allFontSizes.length > 0 ? allFontSizes[Math.floor(allFontSizes.length * 0.5)] : 11;
 
-  const children: Paragraph[] = [
-    new Paragraph({
-      text: title.replace(/\.pdf$/i, ''),
-      heading: HeadingLevel.HEADING_1,
-    }),
-  ];
+  const children: Array<Paragraph | Table> = [];
+  const cleanDocTitle = title.replace(/\.pdf$/i, '');
 
-  pages.forEach((page, pageIdx) => {
-    if (pageIdx > 0) {
+  for (let pageIdx = 0; pageIdx < pages.length; pageIdx++) {
+    const page = pages[pageIdx];
+    if (pageIdx > 0 && preservePageBreaks) {
       children.push(new Paragraph({ children: [new PageBreak()] }));
     }
 
-    const rows = clusterSpansIntoRows(page.spans);
+    const rows = clusterSpansIntoRows(page.spans, page.width);
     if (rows.length === 0) {
-      children.push(
-        new Paragraph({
-          children: [
-            new TextRun({
-              text: `(Page ${page.pageNumber}: No extractable text — use OCR for scanned pages)`,
-              italics: true,
-              color: '64748B',
-            }),
-          ],
-        })
-      );
-      return;
-    }
-
-    for (const row of rows) {
-      let lineText = '';
-      let lastRight = -Infinity;
-      let boldCount = 0;
-      let maxFs = 0;
-
-      for (const sp of row.spans) {
-        const gap = lastRight === -Infinity ? 0 : sp.x - lastRight;
-        if (lineText) {
-          if (gap > sp.fontSize * 1.8) {
-            lineText += '    ';
-          } else if (gap > sp.fontSize * 0.16 && !lineText.endsWith(' ') && !sp.str.startsWith(' ')) {
-            lineText += ' ';
+      // Scanned or image-only PDF page: embed high-res visual image + optional OCR text
+      if (useOcr) {
+        try {
+          const canvas = document.createElement('canvas');
+          await renderPageToCanvas(pdfBytes, page.pageNumber, canvas, 2);
+          const ocrText = await runOnDeviceOcr(canvas, 'eng+ben');
+          if (ocrText.trim()) {
+            ocrUsed = true;
+            extractedChars += ocrText.trim().length;
+            ocrText
+              .split(/\r?\n/)
+              .map((l) => l.trim())
+              .filter(Boolean)
+              .forEach((line) => {
+                children.push(
+                  new Paragraph({
+                    spacing: { after: 120, line: 276 },
+                    children: [
+                      new TextRun({
+                        text: line,
+                        font: 'Calibri',
+                        size: 22,
+                      }),
+                    ],
+                  })
+                );
+              });
           }
+        } catch {
+          // ignore OCR error on page
         }
-        lineText += sp.str;
-        lastRight = Math.max(lastRight, sp.x + sp.width);
-        if (sp.isBold) boldCount++;
-        maxFs = Math.max(maxFs, sp.fontSize);
       }
 
-      const clean = lineText.trim();
-      if (!clean) continue;
-
-      const mostlyBold = boldCount >= Math.ceil(row.spans.length * 0.65);
-      if (maxFs >= bodySize * 1.38 && clean.length <= 120) {
-        children.push(new Paragraph({ text: clean, heading: HeadingLevel.HEADING_2 }));
-      } else if ((maxFs >= bodySize * 1.16 || (mostlyBold && clean.length <= 90)) && clean.length <= 120) {
-        children.push(new Paragraph({ text: clean, heading: HeadingLevel.HEADING_3 }));
-      } else {
+      if (includeVisualOnScanned) {
+        try {
+          const imgUrl = await renderPageToDataUrl(pdfBytes, page.pageNumber, 2, 'image/jpeg');
+          const { width, height } = await measureImageDataUrlSize(imgUrl);
+          const targetW = 580;
+          const targetH = Math.min(760, Math.round((height / Math.max(1, width)) * targetW));
+          children.push(
+            new Paragraph({
+              alignment: AlignmentType.CENTER,
+              children: [
+                new ImageRun({
+                  data: uint8ArrayFromDataUrl(imgUrl),
+                  transformation: { width: targetW, height: targetH },
+                  type: 'jpg',
+                }),
+              ],
+            })
+          );
+        } catch {
+          children.push(
+            new Paragraph({
+              children: [
+                new TextRun({
+                  text: `(Page ${page.pageNumber}: Scanned graphic page)`,
+                  italics: true,
+                  color: '64748B',
+                }),
+              ],
+            })
+          );
+        }
+      } else if (!useOcr) {
         children.push(
           new Paragraph({
             children: [
               new TextRun({
-                text: clean,
-                bold: mostlyBold,
+                text: `(Page ${page.pageNumber}: No extractable text — enable OCR or visual fallback for scanned pages)`,
+                italics: true,
+                color: '64748B',
               }),
             ],
           })
         );
       }
+      continue;
     }
-  });
+
+    const blocks = analyzePageBlocks(rows, page.width);
+    if (pageIdx === 0 && blocks.length > 0 && blocks[0].kind === 'paragraph' && blocks[0].fontSize < bodySize * 1.35) {
+      children.push(
+        new Paragraph({
+          text: cleanDocTitle,
+          heading: HeadingLevel.HEADING_1,
+          spacing: { after: 180 },
+        })
+      );
+    }
+
+    for (const blk of blocks) {
+      if (blk.kind === 'table') {
+        const totalDxa = 9360;
+        const colSum = blk.colWidths.reduce((s, w) => s + w, 0) || 1;
+        const dxaWidths = blk.colWidths.map((w) => Math.max(600, Math.round((w / colSum) * totalDxa)));
+
+        const tableRows = blk.rows.map((r, rIdx) => {
+          const isHeader = rIdx === 0;
+          const fillColor = isHeader ? 'EFF6FF' : rIdx % 2 === 1 ? 'FFFFFF' : 'F8FAFC';
+
+          return new TableRow({
+            tableHeader: isHeader,
+            children: r.map((cell, cIdx) => {
+              const cellRuns = cell.spans.length
+                ? mergeSpansIntoStyledRuns(cell.spans).map(
+                    (run) =>
+                      new TextRun({
+                        text: run.text,
+                        bold: isHeader || run.bold,
+                        italics: run.italics,
+                        font: mapToneToWordFont(run.fontTone),
+                        size: Math.max(16, Math.min(28, Math.round(run.fontSize * 2))),
+                        color: isHeader ? '142B4A' : '1E293B',
+                      })
+                  )
+                : [
+                    new TextRun({
+                      text: cell.text || ' ',
+                      bold: isHeader,
+                      font: 'Calibri',
+                      size: 20,
+                      color: isHeader ? '142B4A' : '1E293B',
+                    }),
+                  ];
+
+              return new TableCell({
+                width: { size: dxaWidths[cIdx] || 1500, type: WidthType.DXA },
+                shading: { fill: fillColor, type: ShadingType.CLEAR },
+                margins: { top: 80, bottom: 80, left: 110, right: 110 },
+                borders: {
+                  top: { style: BorderStyle.SINGLE, size: 4, color: 'CBD5E1' },
+                  bottom: { style: BorderStyle.SINGLE, size: 4, color: 'CBD5E1' },
+                  left: { style: BorderStyle.SINGLE, size: 4, color: 'CBD5E1' },
+                  right: { style: BorderStyle.SINGLE, size: 4, color: 'CBD5E1' },
+                },
+                children: [
+                  new Paragraph({
+                    alignment: cell.isNumeric && !isHeader ? AlignmentType.RIGHT : AlignmentType.LEFT,
+                    spacing: { after: 0, before: 0 },
+                    children: cellRuns,
+                  }),
+                ],
+              });
+            }),
+          });
+        });
+
+        children.push(
+          new Table({
+            width: { size: totalDxa, type: WidthType.DXA },
+            rows: tableRows,
+          })
+        );
+        children.push(new Paragraph({ spacing: { after: 100 }, text: '' }));
+        continue;
+      }
+
+      const plainText = blk.runs.map((r) => r.text).join('').trim();
+      if (!plainText) continue;
+
+      const alignEnum =
+        blk.align === 'center'
+          ? AlignmentType.CENTER
+          : blk.align === 'right'
+          ? AlignmentType.RIGHT
+          : AlignmentType.LEFT;
+
+      const allBold = blk.runs.every((r) => r.bold || !r.text.trim());
+      const isMajorHeading = blk.fontSize >= bodySize * 1.48 && plainText.length <= 130;
+      const isSubHeading =
+        (blk.fontSize >= bodySize * 1.18 || (allBold && plainText.length <= 85 && !blk.isList)) &&
+        plainText.length <= 130;
+
+      if (isMajorHeading) {
+        children.push(
+          new Paragraph({
+            heading: HeadingLevel.HEADING_2,
+            alignment: alignEnum,
+            spacing: { before: 160, after: 100 },
+            children: blk.runs.map(
+              (r) =>
+                new TextRun({
+                  text: r.text,
+                  bold: true,
+                  italics: r.italics,
+                  font: mapToneToWordFont(r.fontTone),
+                  size: Math.max(24, Math.min(48, Math.round(r.fontSize * 2))),
+                  color: '142B4A',
+                })
+            ),
+          })
+        );
+      } else if (isSubHeading) {
+        children.push(
+          new Paragraph({
+            heading: HeadingLevel.HEADING_3,
+            alignment: alignEnum,
+            spacing: { before: 120, after: 80 },
+            children: blk.runs.map(
+              (r) =>
+                new TextRun({
+                  text: r.text,
+                  bold: true,
+                  italics: r.italics,
+                  font: mapToneToWordFont(r.fontTone),
+                  size: Math.max(20, Math.min(36, Math.round(r.fontSize * 2))),
+                  color: '1E293B',
+                })
+            ),
+          })
+        );
+      } else {
+        children.push(
+          new Paragraph({
+            alignment: alignEnum,
+            indent: blk.isList ? { left: 360, hanging: 180 } : undefined,
+            spacing: { after: 110, line: 276 },
+            children: blk.runs.map(
+              (r) =>
+                new TextRun({
+                  text: r.text,
+                  bold: r.bold,
+                  italics: r.italics,
+                  font: mapToneToWordFont(r.fontTone),
+                  size: Math.max(16, Math.min(32, Math.round(r.fontSize * 2))),
+                  color: '1E293B',
+                })
+            ),
+          })
+        );
+      }
+    }
+  }
 
   const docx = new Document({
-    sections: [{ children }],
+    title: cleanDocTitle,
+    creator: 'PDF MASTER',
+    sections: [
+      {
+        properties: {
+          page: {
+            margin: { top: 1080, bottom: 1080, left: 1080, right: 1080 },
+          },
+        },
+        children,
+      },
+    ],
   });
   const blob = await Packer.toBlob(docx);
-  return { buffer: await blob.arrayBuffer(), extractedChars };
+  return { buffer: await blob.arrayBuffer(), extractedChars, ocrUsed };
 }
 
-function parseExcelCellValue(raw: string): string | number {
+interface ParsedExcelCell {
+  value: string | number;
+  numFmt?: string;
+}
+
+function parseExcelCellValue(raw: string): ParsedExcelCell {
   const trimmed = raw.trim();
-  if (!trimmed) return '';
+  if (!trimmed) return { value: '' };
+
   // Preserve phone numbers / IDs with leading zeros like "017123456" as text
-  if (/^0\d+$/.test(trimmed)) return trimmed;
+  if (/^0\d+$/.test(trimmed)) return { value: trimmed };
+
+  // Percentage: e.g. "12.5%" or "-4%"
+  const pctMatch = trimmed.match(/^(-?\d+(?:\.\d+)?)\s*%$/);
+  if (pctMatch) {
+    const n = Number(pctMatch[1]);
+    if (Number.isFinite(n)) return { value: n / 100, numFmt: '0.0%' };
+  }
+
+  // Parenthesized accounting negative e.g. "(1,234.50)" or "($1,234.50)"
+  const parenNeg = trimmed.match(/^\(\s*([$€£₹৳])?\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+(?:\.\d+)?)\s*\)$/);
+  if (parenNeg) {
+    const n = Number(parenNeg[2].replace(/,/g, ''));
+    if (Number.isFinite(n)) {
+      return {
+        value: -n,
+        numFmt: parenNeg[1] ? `${parenNeg[1]}#,##0.00` : '#,##0.00',
+      };
+    }
+  }
+
+  // Currency values e.g. "$1,200.50", "৳ 500", "-$45.00"
+  const curMatch = trimmed.match(/^(-?)\s*([$€£₹৳])\s*(-?\d{1,3}(?:,\d{3})*(?:\.\d+)?|-?\d+(?:\.\d+)?)$/);
+  if (curMatch) {
+    const sign = curMatch[1] === '-' || curMatch[3].startsWith('-') ? -1 : 1;
+    const rawNum = curMatch[3].replace(/^-/, '').replace(/,/g, '');
+    const n = Number(rawNum);
+    if (Number.isFinite(n)) {
+      return {
+        value: sign * n,
+        numFmt: `${curMatch[2]}#,##0.00`,
+      };
+    }
+  }
+
+  // Comma-grouped integers/decimals
   if (/^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(trimmed)) {
     const n = Number(trimmed.replace(/,/g, ''));
-    if (Number.isFinite(n)) return n;
+    if (Number.isFinite(n)) return { value: n, numFmt: trimmed.includes('.') ? '#,##0.00' : '#,##0' };
   }
+
+  // Plain integer/decimal
   if (/^-?\d+(\.\d+)?$/.test(trimmed)) {
     const n = Number(trimmed);
-    if (Number.isFinite(n)) return n;
+    if (Number.isFinite(n)) return { value: n };
   }
-  return trimmed;
+
+  return { value: trimmed };
+}
+
+function buildSheetFromRows(
+  parsedRows: Array<Array<ParsedExcelCell>>
+): XLSX.WorkSheet {
+  const aoa = parsedRows.length > 0
+    ? parsedRows.map((r) => r.map((c) => c.value))
+    : [['No tabular text detected']];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+
+  // Apply number/currency/percentage formatting cleanly to individual cells
+  parsedRows.forEach((row, rIdx) => {
+    row.forEach((cell, cIdx) => {
+      if (cell.numFmt && typeof cell.value === 'number') {
+        const ref = XLSX.utils.encode_cell({ r: rIdx, c: cIdx });
+        if (ws[ref]) {
+          ws[ref].z = cell.numFmt;
+        }
+      }
+    });
+  });
+
+  const maxCols = Math.max(...aoa.map((r) => r.length), 1);
+  ws['!cols'] = Array.from({ length: maxCols }, (_, cIdx) => {
+    const longest = aoa.reduce(
+      (max, r) => Math.max(max, String(r[cIdx] ?? '').length),
+      8
+    );
+    return { wch: Math.min(52, Math.max(11, longest + 3)) };
+  });
+
+  // Enable Excel AutoFilter when tabular rows have >= 2 columns & >= 2 rows
+  if (maxCols >= 2 && aoa.length >= 2) {
+    const headerIdx = aoa.findIndex((r) => r.filter((v) => v !== '').length >= 2);
+    if (headerIdx >= 0 && headerIdx < aoa.length - 1) {
+      ws['!autofilter'] = {
+        ref: XLSX.utils.encode_range({
+          s: { r: headerIdx, c: 0 },
+          e: { r: aoa.length - 1, c: maxCols - 1 },
+        }),
+      };
+    }
+  }
+  return ws;
 }
 
 export async function pdfToXlsxBytes(
-  pdfBytes: ArrayBuffer
-): Promise<{ buffer: ArrayBuffer; extractedChars: number }> {
+  pdfBytes: ArrayBuffer,
+  options?: PdfToXlsxOptions
+): Promise<{ buffer: ArrayBuffer; extractedChars: number; ocrUsed: boolean }> {
+  const mergeSheets = options?.mergeSheets ?? false;
+  const useOcr = options?.useOcr ?? false;
+
   const pages = await extractVisualSpansPerPage(pdfBytes);
   const wb = XLSX.utils.book_new();
   let extractedChars = 0;
+  let ocrUsed = false;
+
+  const combinedRows: Array<Array<ParsedExcelCell>> = [];
 
   for (const page of pages) {
-    const rows = clusterSpansIntoRows(page.spans);
-    const mergedRowCells: Array<Array<{ x: number; text: string }>> = [];
-    const allCellX: number[] = [];
+    const rows = clusterSpansIntoRows(page.spans, page.width);
+    let pageParsedRows: Array<Array<ParsedExcelCell>> = [];
 
-    for (const row of rows) {
-      const cells: Array<{ x: number; right: number; fontSize: number; text: string }> = [];
-      for (const sp of row.spans) {
-        const clean = sp.str.trim();
-        if (!clean) continue;
-        extractedChars += clean.length;
-
-        const prev = cells[cells.length - 1];
-        const gap = prev ? sp.x - prev.right : Infinity;
-        // Join tokens in the same phrase/column cell (only split columns on wide horizontal gaps)
-        if (prev && gap <= Math.max(prev.fontSize, sp.fontSize) * 1.1) {
-          prev.text = `${prev.text} ${clean}`.replace(/\s+/g, ' ').trim();
-          prev.right = Math.max(prev.right, sp.x + sp.width);
-          prev.fontSize = Math.max(prev.fontSize, sp.fontSize);
-        } else {
-          cells.push({
-            x: sp.x,
-            right: sp.x + sp.width,
-            fontSize: sp.fontSize,
-            text: clean,
-          });
-        }
-      }
-      if (cells.length > 0) {
-        mergedRowCells.push(cells.map((c) => ({ x: c.x, text: c.text })));
-        cells.forEach((c) => allCellX.push(c.x));
-      }
-    }
-
-    // Build column anchors by clustering X positions within 18pt
-    allCellX.sort((a, b) => a - b);
-    const colAnchors: number[] = [];
-    for (const x of allCellX) {
-      if (colAnchors.length === 0 || x - colAnchors[colAnchors.length - 1] > 18) {
-        colAnchors.push(x);
-      }
-    }
-
-    const sheetRows: Array<Array<string | number>> = mergedRowCells.map((rowCells) => {
-      if (colAnchors.length <= 1) {
-        return rowCells.map((c) => parseExcelCellValue(c.text));
-      }
-      const rowArr: Array<string | number> = new Array(colAnchors.length).fill('');
-      for (const cell of rowCells) {
-        let bestCol = 0;
-        let bestDist = Infinity;
-        for (let ci = 0; ci < colAnchors.length; ci++) {
-          const d = Math.abs(cell.x - colAnchors[ci]);
-          if (d < bestDist) {
-            bestDist = d;
-            bestCol = ci;
-          }
-        }
-        const existing = rowArr[bestCol];
-        const combined = existing ? `${existing} ${cell.text}` : cell.text;
-        rowArr[bestCol] = parseExcelCellValue(combined);
-      }
-      while (rowArr.length > 1 && rowArr[rowArr.length - 1] === '') {
-        rowArr.pop();
-      }
-      return rowArr;
-    });
-
-    const sheetData = sheetRows.length > 0 ? sheetRows : [['No tabular text detected']];
-    const ws = XLSX.utils.aoa_to_sheet(sheetData);
-    const maxCols = Math.max(...sheetData.map((r) => r.length), 1);
-    const colWidths = Array.from({ length: maxCols }, (_, cIdx) => {
-      const longest = sheetData.reduce(
-        (max, r) => Math.max(max, String(r[cIdx] ?? '').length),
-        8
+    if (rows.length > 0) {
+      rows.forEach((r) =>
+        r.cells.forEach((c) => {
+          extractedChars += c.text.length;
+        })
       );
-      return { wch: Math.min(48, Math.max(12, longest + 3)) };
-    });
-    ws['!cols'] = colWidths;
-    XLSX.utils.book_append_sheet(wb, ws, `Page_${page.pageNumber}`.slice(0, 31));
+
+      // Build stable column intervals ONLY from multi-cell rows so centered titles/headers never shift columns
+      const multiCellRows = rows.filter((r) => r.cells.length >= 2).map((r) => r.cells);
+      const colIntervals = buildColumnIntervals(multiCellRows);
+
+      pageParsedRows = rows.map((row) => {
+        if (colIntervals.length <= 1 || row.cells.length === 1) {
+          if (row.cells.length === 1 && colIntervals.length > 1) {
+            const ci = matchCellToColumn(row.cells[0], colIntervals);
+            const arr: ParsedExcelCell[] = Array.from({ length: ci + 1 }, () => ({ value: '' }));
+            // Place wide full-width headings at column 0; place aligned single values in their matched column
+            const targetIdx =
+              row.cells[0].right - row.cells[0].x > page.width * 0.45 ? 0 : ci;
+            arr[targetIdx] = parseExcelCellValue(row.cells[0].text);
+            return arr;
+          }
+          return row.cells.map((c) => parseExcelCellValue(c.text));
+        }
+
+        const rowArr: Array<{ raw: string }> = Array.from(
+          { length: colIntervals.length },
+          () => ({ raw: '' })
+        );
+        for (const cell of row.cells) {
+          const ci = matchCellToColumn(cell, colIntervals);
+          rowArr[ci].raw = rowArr[ci].raw ? `${rowArr[ci].raw} ${cell.text}` : cell.text;
+        }
+        const parsed = rowArr.map((c) => parseExcelCellValue(c.raw));
+        while (parsed.length > 1 && parsed[parsed.length - 1].value === '') {
+          parsed.pop();
+        }
+        return parsed;
+      });
+    } else if (useOcr) {
+      // Scanned page fallback via on-device OCR splitting multi-space gaps into columns
+      try {
+        const canvas = document.createElement('canvas');
+        await renderPageToCanvas(pdfBytes, page.pageNumber, canvas, 2);
+        const ocrText = await runOnDeviceOcr(canvas, 'eng+ben');
+        if (ocrText.trim()) {
+          ocrUsed = true;
+          extractedChars += ocrText.trim().length;
+          pageParsedRows = ocrText
+            .split(/\r?\n/)
+            .map((line) => line.trim())
+            .filter(Boolean)
+            .map((line) =>
+              line
+                .split(/\s{2,}|\t+/)
+                .map((col) => parseExcelCellValue(col))
+            );
+        }
+      } catch {
+        // leave empty fallback message
+      }
+    }
+
+    if (mergeSheets) {
+      if (pages.length > 1) {
+        combinedRows.push([{ value: `--- Page ${page.pageNumber} ---` }]);
+      }
+      if (pageParsedRows.length > 0) {
+        combinedRows.push(...pageParsedRows);
+      } else {
+        combinedRows.push([{ value: `(Page ${page.pageNumber}: No tabular text detected)` }]);
+      }
+      combinedRows.push([]);
+    } else {
+      const ws = buildSheetFromRows(pageParsedRows);
+      XLSX.utils.book_append_sheet(wb, ws, `Page_${page.pageNumber}`.slice(0, 31));
+    }
+  }
+
+  if (mergeSheets) {
+    const ws = buildSheetFromRows(combinedRows);
+    XLSX.utils.book_append_sheet(wb, ws, 'All_Pages');
   }
 
   const buffer = XLSX.write(wb, { bookType: 'xlsx', type: 'array' }) as ArrayBuffer;
-  return { buffer, extractedChars };
+  return { buffer, extractedChars, ocrUsed };
 }
 
 function measureImageDataUrlSize(dataUrl: string): Promise<{ width: number; height: number }> {
@@ -426,19 +1220,339 @@ function measureImageDataUrlSize(dataUrl: string): Promise<{ width: number; heig
   });
 }
 
-export async function pdfToPptxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer> {
-  const { previewImages } = await pdfToImagesZip(pdfBytes, 'image/jpeg', 2);
-  const dimsList = await Promise.all(previewImages.map((url) => measureImageDataUrlSize(url)));
-  const zip = new JSZip();
+function escapeXmlAttr(str: string): string {
+  return str
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
 
-  // Match PowerPoint slide size to first PDF page aspect ratio so slides fill crisply without letterbox bars
-  const firstDim = dimsList[0] || { width: 1200, height: 900 };
-  const isFirstLandscape = firstDim.width >= firstDim.height;
+function escapeXmlText(str: string): string {
+  return str
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+function mapToneToPptxFont(tone: 'sans' | 'serif' | 'mono'): string {
+  if (tone === 'serif') return 'Georgia';
+  if (tone === 'mono') return 'Courier New';
+  return 'Calibri';
+}
+
+export async function pdfToPptxBytes(
+  pdfBytes: ArrayBuffer,
+  options?: PdfToPptxOptions
+): Promise<{ buffer: ArrayBuffer; slideCount: number; editableBlocks: number }> {
+  const mode = options?.mode ?? 'editable';
+  const useOcr = options?.useOcr ?? false;
+
+  const pages = await extractVisualSpansPerPage(pdfBytes);
+  const firstPage = pages[0] || { pageNumber: 1, width: 792, height: 612, spans: [] };
+  const isFirstLandscape = firstPage.width >= firstPage.height;
   const slideW = isFirstLandscape ? 12192000 : 6858000;
   const slideH = Math.max(
     4572000,
-    Math.min(13716000, Math.round((firstDim.height / Math.max(1, firstDim.width)) * slideW))
+    Math.min(13716000, Math.round((firstPage.height / Math.max(1, firstPage.width)) * slideW))
   );
+
+  const zip = new JSZip();
+  const slideCount = Math.max(1, pages.length);
+  let editableBlocks = 0;
+
+  if (mode === 'visual') {
+    const { previewImages } = await pdfToImagesZip(pdfBytes, 'image/jpeg', 2.2);
+    const dimsList = await Promise.all(previewImages.map((url) => measureImageDataUrlSize(url)));
+
+    zip.file(
+      '[Content_Types].xml',
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="jpg" ContentType="image/jpeg"/>
+  <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
+  ${previewImages
+    .map(
+      (_, i) =>
+        `<Override PartName="/ppt/slides/slide${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`
+    )
+    .join('\n  ')}
+</Types>`
+    );
+
+    zip.file(
+      '_rels/.rels',
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="ppt/presentation.xml"/>
+</Relationships>`
+    );
+
+    zip.file(
+      'ppt/presentation.xml',
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:sldIdLst>
+    ${previewImages.map((_, i) => `<p:sldId id="${256 + i}" r:id="rId${i + 1}"/>`).join('\n    ')}
+  </p:sldIdLst>
+  <p:sldSz cx="${slideW}" cy="${slideH}" type="custom"/>
+  <p:notesSz cx="${slideH}" cy="${slideW}"/>
+</p:presentation>`
+    );
+
+    zip.file(
+      'ppt/_rels/presentation.xml.rels',
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  ${previewImages
+    .map(
+      (_, i) =>
+        `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${i + 1}.xml"/>`
+    )
+    .join('\n  ')}
+</Relationships>`
+    );
+
+    previewImages.forEach((imgDataUrl, i) => {
+      const idx = i + 1;
+      const b64 = imgDataUrl.split(',')[1];
+      const { width, height } = dimsList[i] || { width: 1200, height: 900 };
+      const ratio = Math.min(slideW / Math.max(1, width), slideH / Math.max(1, height));
+      const drawCx = Math.max(1, Math.round(width * ratio));
+      const drawCy = Math.max(1, Math.round(height * ratio));
+      const offX = Math.max(0, Math.round((slideW - drawCx) / 2));
+      const offY = Math.max(0, Math.round((slideH - drawCy) / 2));
+
+      zip.file(`ppt/media/image${idx}.jpg`, b64, { base64: true });
+      zip.file(
+        `ppt/slides/slide${idx}.xml`,
+        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr/>
+      <p:pic>
+        <p:nvPicPr><p:cNvPr id="2" name="SlideImage${idx}"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
+        <p:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>
+        <p:spPr>
+          <a:xfrm><a:off x="${offX}" y="${offY}"/><a:ext cx="${drawCx}" cy="${drawCy}"/></a:xfrm>
+          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+        </p:spPr>
+      </p:pic>
+    </p:spTree>
+  </p:cSld>
+</p:sld>`
+      );
+      zip.file(
+        `ppt/slides/_rels/slide${idx}.xml.rels`,
+        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image${idx}.jpg"/>
+</Relationships>`
+      );
+    });
+
+    const buffer = await zip.generateAsync({ type: 'arraybuffer' });
+    return { buffer, slideCount: previewImages.length, editableBlocks: 0 };
+  }
+
+  // Editable Slides Mode: real positioned DrawingML text shapes + native PowerPoint tables + scanned visual fallback
+  let hasAnyImage = false;
+
+  for (let pIdx = 0; pIdx < pages.length; pIdx++) {
+    const page = pages[pIdx];
+    const slideIdx = pIdx + 1;
+    const rows = clusterSpansIntoRows(page.spans, page.width);
+    const scaleToSlide = Math.min(slideW / Math.max(1, page.width), slideH / Math.max(1, page.height));
+    const offsetX = Math.round((slideW - page.width * scaleToSlide) / 2);
+    const offsetY = Math.round((slideH - page.height * scaleToSlide) / 2);
+
+    const shapesXml: string[] = [];
+    let relXml = '';
+    let nextShapeId = 2;
+
+    if (rows.length === 0) {
+      // Scanned page: embed crisp slide picture + optional OCR editable box
+      hasAnyImage = true;
+      const imgUrl = await renderPageToDataUrl(pdfBytes, page.pageNumber, 2, 'image/jpeg');
+      const { width, height } = await measureImageDataUrlSize(imgUrl);
+      const b64 = imgUrl.split(',')[1];
+      zip.file(`ppt/media/image${slideIdx}.jpg`, b64, { base64: true });
+      relXml = `<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image${slideIdx}.jpg"/>`;
+
+      const ratio = Math.min(slideW / Math.max(1, width), slideH / Math.max(1, height));
+      const drawCx = Math.max(1, Math.round(width * ratio));
+      const drawCy = Math.max(1, Math.round(height * ratio));
+      const picX = Math.max(0, Math.round((slideW - drawCx) / 2));
+      const picY = Math.max(0, Math.round((slideH - drawCy) / 2));
+
+      shapesXml.push(`
+      <p:pic>
+        <p:nvPicPr><p:cNvPr id="${nextShapeId++}" name="ScannedSlide${slideIdx}"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
+        <p:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>
+        <p:spPr>
+          <a:xfrm><a:off x="${picX}" y="${picY}"/><a:ext cx="${drawCx}" cy="${drawCy}"/></a:xfrm>
+          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+        </p:spPr>
+      </p:pic>`);
+
+      if (useOcr) {
+        try {
+          const canvas = document.createElement('canvas');
+          await renderPageToCanvas(pdfBytes, page.pageNumber, canvas, 2);
+          const ocrText = await runOnDeviceOcr(canvas, 'eng+ben');
+          if (ocrText.trim()) {
+            editableBlocks++;
+            const paras = ocrText
+              .split(/\r?\n/)
+              .map((l) => l.trim())
+              .filter(Boolean)
+              .map(
+                (l) =>
+                  `<a:p><a:r><a:rPr lang="en-US" sz="1200"><a:solidFill><a:srgbClr val="1E293B"/></a:solidFill></a:rPr><a:t>${escapeXmlText(l)}</a:t></a:r></a:p>`
+              )
+              .join('');
+            shapesXml.push(`
+      <p:sp>
+        <p:nvSpPr><p:cNvPr id="${nextShapeId++}" name="OcrTextBox${slideIdx}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>
+        <p:spPr>
+          <a:xfrm><a:off x="457200" y="457200"/><a:ext cx="${Math.max(914400, slideW - 914400)}" cy="${Math.max(914400, slideH - 914400)}"/></a:xfrm>
+          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+          <a:solidFill><a:srgbClr val="FFFFFF"><a:alpha val="88000"/></a:srgbClr></a:solidFill>
+        </p:spPr>
+        <p:txBody><a:bodyPr wrap="square"/><a:lstStyle/>${paras}</p:txBody>
+      </p:sp>`);
+          }
+        } catch {
+          // ignore OCR error
+        }
+      }
+    } else {
+      const blocks = analyzePageBlocks(rows, page.width);
+      for (const blk of blocks) {
+        editableBlocks++;
+        if (blk.kind === 'table') {
+          const tblX = Math.max(180000, Math.round(offsetX + blk.left * scaleToSlide));
+          const tblY = Math.max(180000, Math.round(offsetY + blk.topY * scaleToSlide));
+          const tblW = Math.max(914400, Math.min(slideW - tblX - 180000, Math.round((blk.right - blk.left) * scaleToSlide + 260000)));
+          const rowH = Math.max(290000, Math.round(((blk.bottomY - blk.topY) * scaleToSlide) / Math.max(1, blk.rows.length)));
+          const tblH = Math.min(slideH - tblY - 120000, rowH * blk.rows.length);
+
+          const colSum = blk.colWidths.reduce((s, w) => s + w, 0) || 1;
+          const gridColsXml = blk.colWidths
+            .map((w) => `<a:gridCol w="${Math.max(360000, Math.round((w / colSum) * tblW))}"/>`)
+            .join('');
+
+          const trXml = blk.rows
+            .map((r, rIdx) => {
+              const isHeader = rIdx === 0;
+              const fillHex = isHeader ? '142B4A' : rIdx % 2 === 1 ? 'FFFFFF' : 'F8FAFC';
+              const textHex = isHeader ? 'FFFFFF' : '1E293B';
+              const cellsXml = r
+                .map(
+                  (c) => `<a:tc>
+                    <a:txBody>
+                      <a:bodyPr wrap="square"/>
+                      <a:lstStyle/>
+                      <a:p>
+                        <a:pPr algn="${c.isNumeric && !isHeader ? 'r' : 'l'}"/>
+                        <a:r>
+                          <a:rPr lang="en-US" sz="1100"${isHeader ? ' b="1"' : ''}><a:solidFill><a:srgbClr val="${textHex}"/></a:solidFill><a:latin typeface="Calibri"/></a:rPr>
+                          <a:t>${escapeXmlText(c.text || ' ')}</a:t>
+                        </a:r>
+                      </a:p>
+                    </a:txBody>
+                    <a:tcPr marL="72000" marR="72000" marT="45720" marB="45720">
+                      <a:lnL w="12700"><a:solidFill><a:srgbClr val="CBD5E1"/></a:solidFill></a:lnL>
+                      <a:lnR w="12700"><a:solidFill><a:srgbClr val="CBD5E1"/></a:solidFill></a:lnR>
+                      <a:lnT w="12700"><a:solidFill><a:srgbClr val="CBD5E1"/></a:solidFill></a:lnT>
+                      <a:lnB w="12700"><a:solidFill><a:srgbClr val="CBD5E1"/></a:solidFill></a:lnB>
+                      <a:solidFill><a:srgbClr val="${fillHex}"/></a:solidFill>
+                    </a:tcPr>
+                  </a:tc>`
+                )
+                .join('');
+              return `<a:tr h="${Math.round(tblH / Math.max(1, blk.rows.length))}">${cellsXml}</a:tr>`;
+            })
+            .join('');
+
+          shapesXml.push(`
+      <p:graphicFrame>
+        <p:nvGraphicFramePr><p:cNvPr id="${nextShapeId++}" name="${escapeXmlAttr(`Table${slideIdx}_${nextShapeId}`)}"/><p:cNvGraphicFramePr><a:graphicFrameLocks noGrp="1"/></p:cNvGraphicFramePr><p:nvPr/></p:nvGraphicFramePr>
+        <p:xfrm><a:off x="${tblX}" y="${tblY}"/><a:ext cx="${tblW}" cy="${Math.max(360000, tblH)}"/></p:xfrm>
+        <a:graphic>
+          <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/table">
+            <a:tbl><a:tblPr firstRow="1" bandRow="1"/><a:tblGrid>${gridColsXml}</a:tblGrid>${trXml}</a:tbl>
+          </a:graphicData>
+        </a:graphic>
+      </p:graphicFrame>`);
+          continue;
+        }
+
+        const algn = blk.align === 'center' ? 'ctr' : blk.align === 'right' ? 'r' : 'l';
+        const boxLeftPt = blk.align === 'center' ? Math.max(20, blk.left - 30) : blk.left;
+        const boxRightPt = blk.align === 'center' ? Math.min(page.width - 20, blk.right + 30) : Math.max(blk.right + 32, Math.min(page.width - 16, blk.left + 260));
+        const spX = Math.max(91440, Math.round(offsetX + boxLeftPt * scaleToSlide));
+        const spY = Math.max(91440, Math.round(offsetY + blk.topY * scaleToSlide));
+        const spW = Math.max(914400, Math.min(slideW - spX - 91440, Math.round((boxRightPt - boxLeftPt) * scaleToSlide)));
+        const spH = Math.max(260000, Math.round((blk.bottomY - blk.topY) * scaleToSlide + blk.fontSize * 12700 * 0.9));
+
+        const runsXml = blk.runs
+          .map((r) => {
+            const ptScaled = Math.max(8, Math.min(48, Math.round(r.fontSize * (scaleToSlide / 12700))));
+            const sz = ptScaled * 100;
+            const colHex = blk.fontSize >= 14 ? '142B4A' : '1E293B';
+            return `<a:r><a:rPr lang="en-US" sz="${sz}"${r.bold ? ' b="1"' : ''}${r.italics ? ' i="1"' : ''}><a:solidFill><a:srgbClr val="${colHex}"/></a:solidFill><a:latin typeface="${mapToneToPptxFont(r.fontTone)}"/></a:rPr><a:t>${escapeXmlText(r.text)}</a:t></a:r>`;
+          })
+          .join('');
+
+        shapesXml.push(`
+      <p:sp>
+        <p:nvSpPr><p:cNvPr id="${nextShapeId++}" name="TextBox${slideIdx}_${nextShapeId}"/><p:cNvSpPr txBox="1"/><p:nvPr/></p:nvSpPr>
+        <p:spPr>
+          <a:xfrm><a:off x="${spX}" y="${spY}"/><a:ext cx="${spW}" cy="${spH}"/></a:xfrm>
+          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+          <a:noFill/>
+        </p:spPr>
+        <p:txBody>
+          <a:bodyPr wrap="square" lIns="36000" rIns="36000" tIns="18000" bIns="18000"/>
+          <a:lstStyle/>
+          <a:p><a:pPr algn="${algn}"/>${runsXml}</a:p>
+        </p:txBody>
+      </p:sp>`);
+      }
+    }
+
+    zip.file(
+      `ppt/slides/slide${slideIdx}.xml`,
+      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
+  <p:cSld>
+    <p:bg><p:bgPr><a:solidFill><a:srgbClr val="FFFFFF"/></a:solidFill><a:effectLst/></p:bgPr></p:bg>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr/>${shapesXml.join('')}
+    </p:spTree>
+  </p:cSld>
+</p:sld>`
+    );
+
+    if (relXml) {
+      zip.file(
+        `ppt/slides/_rels/slide${slideIdx}.xml.rels`,
+        `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  ${relXml}
+</Relationships>`
+      );
+    }
+  }
 
   zip.file(
     '[Content_Types].xml',
@@ -446,9 +1560,9 @@ export async function pdfToPptxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
   <Default Extension="xml" ContentType="application/xml"/>
-  <Default Extension="jpg" ContentType="image/jpeg"/>
+  ${hasAnyImage ? '<Default Extension="jpg" ContentType="image/jpeg"/>' : ''}
   <Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>
-  ${previewImages
+  ${pages
     .map(
       (_, i) =>
         `<Override PartName="/ppt/slides/slide${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>`
@@ -470,7 +1584,7 @@ export async function pdfToPptxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <p:presentation xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
   <p:sldIdLst>
-    ${previewImages.map((_, i) => `<p:sldId id="${256 + i}" r:id="rId${i + 1}"/>`).join('\n    ')}
+    ${pages.map((_, i) => `<p:sldId id="${256 + i}" r:id="rId${i + 1}"/>`).join('\n    ')}
   </p:sldIdLst>
   <p:sldSz cx="${slideW}" cy="${slideH}" type="custom"/>
   <p:notesSz cx="${slideH}" cy="${slideW}"/>
@@ -481,7 +1595,7 @@ export async function pdfToPptxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer
     'ppt/_rels/presentation.xml.rels',
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  ${previewImages
+  ${pages
     .map(
       (_, i) =>
         `<Relationship Id="rId${i + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/slide" Target="slides/slide${i + 1}.xml"/>`
@@ -490,47 +1604,8 @@ export async function pdfToPptxBytes(pdfBytes: ArrayBuffer): Promise<ArrayBuffer
 </Relationships>`
   );
 
-  previewImages.forEach((imgDataUrl, i) => {
-    const idx = i + 1;
-    const b64 = imgDataUrl.split(',')[1];
-    const { width, height } = dimsList[i] || { width: 1200, height: 900 };
-    const ratio = Math.min(slideW / Math.max(1, width), slideH / Math.max(1, height));
-    const drawCx = Math.max(1, Math.round(width * ratio));
-    const drawCy = Math.max(1, Math.round(height * ratio));
-    const offX = Math.max(0, Math.round((slideW - drawCx) / 2));
-    const offY = Math.max(0, Math.round((slideH - drawCy) / 2));
-
-    zip.file(`ppt/media/image${idx}.jpg`, b64, { base64: true });
-    zip.file(
-      `ppt/slides/slide${idx}.xml`,
-      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<p:sld xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main">
-  <p:cSld>
-    <p:spTree>
-      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
-      <p:grpSpPr/>
-      <p:pic>
-        <p:nvPicPr><p:cNvPr id="2" name="SlideImage${idx}"/><p:cNvPicPr/><p:nvPr/></p:nvPicPr>
-        <p:blipFill><a:blip r:embed="rId1"/><a:stretch><a:fillRect/></a:stretch></p:blipFill>
-        <p:spPr>
-          <a:xfrm><a:off x="${offX}" y="${offY}"/><a:ext cx="${drawCx}" cy="${drawCy}"/></a:xfrm>
-          <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
-        </p:spPr>
-      </p:pic>
-    </p:spTree>
-  </p:cSld>
-</p:sld>`
-    );
-    zip.file(
-      `ppt/slides/_rels/slide${idx}.xml.rels`,
-      `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
-  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="../media/image${idx}.jpg"/>
-</Relationships>`
-    );
-  });
-
-  return zip.generateAsync({ type: 'arraybuffer' });
+  const buffer = await zip.generateAsync({ type: 'arraybuffer' });
+  return { buffer, slideCount, editableBlocks };
 }
 
 export async function docxFileToPdf(file: File): Promise<{ pdfBytes: ArrayBuffer; html: string }> {

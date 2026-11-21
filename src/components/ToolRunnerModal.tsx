@@ -200,6 +200,11 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
   const [mergeSearch, setMergeSearch] = useState('');
   const [resultDoc, setResultDoc] = useState<DocumentRecord | null>(null);
   const [resultZip, setResultZip] = useState<{ bytes: ArrayBuffer; name: string } | null>(null);
+  const [resultOfficeFile, setResultOfficeFile] = useState<{
+    bytes: ArrayBuffer;
+    name: string;
+    mime: string;
+  } | null>(null);
   const [uploadedFiles, setUploadedFiles] = useState<File[]>([]);
   const [running, setRunning] = useState(false);
   const [resultMsg, setResultMsg] = useState<string | null>(null);
@@ -235,6 +240,13 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
   const [headerFooterFontSize, setHeaderFooterFontSize] = useState(9.5);
   const [headerFooterColor, setHeaderFooterColor] = useState('#475569');
   const [imageFitMode, setImageFitMode] = useState<ImageToPdfFitMode>('a4-fit');
+  const [docxUseOcr, setDocxUseOcr] = useState(false);
+  const [docxIncludeVisual, setDocxIncludeVisual] = useState(true);
+  const [docxPageBreaks, setDocxPageBreaks] = useState(true);
+  const [xlsxMergeSheets, setXlsxMergeSheets] = useState(false);
+  const [xlsxUseOcr, setXlsxUseOcr] = useState(false);
+  const [pptxMode, setPptxMode] = useState<'editable' | 'visual'>('editable');
+  const [pptxUseOcr, setPptxUseOcr] = useState(false);
   const [passwordInput, setPasswordInput] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [metaTitle, setMetaTitle] = useState('');
@@ -379,6 +391,7 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
     setResultMsg(null);
     setResultDoc(null);
     setResultZip(null);
+    setResultOfficeFile(null);
     setPreviewUrls([]);
 
     try {
@@ -694,43 +707,75 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
           throw new Error('Select image(s) from Device Storage or choose a Recent file.');
         }
       } else if (toolId === 'pdfToDocx') {
-        if (!primaryDoc) throw new Error('Select a PDF.');
-        const { buffer: docxBuf, extractedChars } = await pdfToDocxBytes(
+        if (!primaryDoc) throw new Error(language === 'bn' ? 'একটি পিডিএফ বাছুন।' : 'Select a PDF.');
+        const { buffer: docxBuf, extractedChars, ocrUsed } = await pdfToDocxBytes(
           primaryDoc.pdfBytes,
-          primaryDoc.name
+          primaryDoc.name,
+          {
+            includeVisualOnScanned: docxIncludeVisual,
+            useOcr: docxUseOcr,
+            preservePageBreaks: docxPageBreaks,
+          }
         );
-        await saveBufferToDeviceStorage(
-          docxBuf,
-          primaryDoc.name.replace(/\.pdf$/i, '.docx'),
-          'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-        );
+        const outName = primaryDoc.name.replace(/\.pdf$/i, '.docx');
+        const mime = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
+        setResultOfficeFile({ bytes: docxBuf, name: outName, mime });
+        await saveBufferToDeviceStorage(docxBuf, outName, mime);
         setResultMsg(
           extractedChars === 0
-            ? 'Converted Word (.DOCX) file saved, but no embedded text was found (use OCR Text for scanned PDFs).'
-            : 'Converted and saved Word (.DOCX) file.'
+            ? language === 'bn'
+              ? docxIncludeVisual
+                ? 'Word (.DOCX) তৈরি হয়েছে (স্ক্যান পৃষ্ঠাগুলো ছবি হিসেবে যুক্ত হয়েছে — এডিটেবল টেক্সটের জন্য OCR চালু করুন)।'
+                : 'Word (.DOCX) তৈরি হয়েছে, তবে টেক্সট পাওয়া যায়নি (OCR চালু করুন)।'
+              : docxIncludeVisual
+              ? 'Converted Word (.DOCX) with scanned page visuals embedded (enable OCR for editable text).'
+              : 'Converted Word (.DOCX), but no embedded text was found (enable OCR for scanned PDFs).'
+            : language === 'bn'
+            ? `Word (.DOCX) ফাইল সফলভাবে তৈরি ও ডাউনলোড হয়েছে${ocrUsed ? ' (OCR সহ)' : ''} (${formatBytes(docxBuf.byteLength)})।`
+            : `Converted & saved Word (.DOCX) with formatted text & tables${ocrUsed ? ' (+ OCR)' : ''} (${formatBytes(docxBuf.byteLength)}).`
         );
       } else if (toolId === 'pdfToXlsx') {
-        if (!primaryDoc) throw new Error('Select a PDF.');
-        const { buffer: xlsxBuf, extractedChars } = await pdfToXlsxBytes(primaryDoc.pdfBytes);
-        await saveBufferToDeviceStorage(
-          xlsxBuf,
-          primaryDoc.name.replace(/\.pdf$/i, '.xlsx'),
-          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        );
+        if (!primaryDoc) throw new Error(language === 'bn' ? 'একটি পিডিএফ বাছুন।' : 'Select a PDF.');
+        const { buffer: xlsxBuf, extractedChars, ocrUsed } = await pdfToXlsxBytes(primaryDoc.pdfBytes, {
+          mergeSheets: xlsxMergeSheets,
+          useOcr: xlsxUseOcr,
+        });
+        const outName = primaryDoc.name.replace(/\.pdf$/i, '.xlsx');
+        const mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+        setResultOfficeFile({ bytes: xlsxBuf, name: outName, mime });
+        await saveBufferToDeviceStorage(xlsxBuf, outName, mime);
         setResultMsg(
           extractedChars === 0
-            ? 'Excel (.XLSX) workbook saved, but no embedded text was found (use OCR Text for scanned PDFs).'
-            : 'Extracted tabular data to Excel (.XLSX) workbook.'
+            ? language === 'bn'
+              ? 'Excel (.XLSX) তৈরি হয়েছে, তবে স্ক্যান পেজের জন্য "স্ক্যান OCR" অপশন চালু করুন।'
+              : 'Excel (.XLSX) saved, but no embedded text was found (enable OCR for scanned PDFs).'
+            : language === 'bn'
+            ? `Excel (.XLSX) সফলভাবে তৈরি ও ডাউনলোড হয়েছে${ocrUsed ? ' (OCR সহ)' : ''} (${formatBytes(xlsxBuf.byteLength)})।`
+            : `Extracted structured tables & numbers into Excel (.XLSX)${ocrUsed ? ' (+ OCR)' : ''} (${formatBytes(xlsxBuf.byteLength)}).`
         );
       } else if (toolId === 'pdfToPptx') {
-        if (!primaryDoc) throw new Error('Select a PDF.');
-        const pptxBuf = await pdfToPptxBytes(primaryDoc.pdfBytes);
-        await saveBufferToDeviceStorage(
-          pptxBuf,
-          primaryDoc.name.replace(/\.pdf$/i, '.pptx'),
-          'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+        if (!primaryDoc) throw new Error(language === 'bn' ? 'একটি পিডিএফ বাছুন।' : 'Select a PDF.');
+        const { buffer: pptxBuf, slideCount, editableBlocks } = await pdfToPptxBytes(primaryDoc.pdfBytes, {
+          mode: pptxMode,
+          useOcr: pptxUseOcr,
+        });
+        const outName = primaryDoc.name.replace(/\.pdf$/i, '.pptx');
+        const mime = 'application/vnd.openxmlformats-officedocument.presentationml.presentation';
+        setResultOfficeFile({ bytes: pptxBuf, name: outName, mime });
+        await saveBufferToDeviceStorage(pptxBuf, outName, mime);
+        setResultMsg(
+          language === 'bn'
+            ? `${slideCount}টি স্লাইডের PowerPoint (.PPTX) তৈরি হয়েছে (${
+                pptxMode === 'editable'
+                  ? `${editableBlocks}টি এডিটেবল টেক্সট/টেবিল বক্স`
+                  : 'হাই-রেজ ভিজ্যুয়াল স্লাইড'
+              })।`
+            : `Converted ${slideCount} slide(s) to PowerPoint (.PPTX) (${
+                pptxMode === 'editable'
+                  ? `${editableBlocks} editable shapes/tables`
+                  : 'exact visual layout'
+              }).`
         );
-        setResultMsg('Converted PDF pages into PowerPoint (.PPTX) presentation.');
       } else if (toolId === 'wordToPdf') {
         const file = uploadedFiles[0];
         if (!file && recentExternalDocId) {
@@ -1937,6 +1982,145 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
             </div>
           )}
 
+          {toolId === 'pdfToDocx' && (
+            <div className="space-y-2.5 text-xs p-3 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700">
+              <p className="font-bold text-[#142B4A] dark:text-slate-200">
+                {language === 'bn' ? 'ওয়ার্ড কনভার্সন অপশন' : 'Word Conversion Options'}
+              </p>
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={docxPageBreaks}
+                  onChange={(e) => setDocxPageBreaks(e.target.checked)}
+                  className="w-4 h-4 accent-[#2563EB] rounded"
+                />
+                <span className="font-medium">
+                  {language === 'bn'
+                    ? 'মূল পিডিএফ অনুযায়ী পেজ ব্রেক রাখুন'
+                    : 'Preserve page breaks between PDF pages'}
+                </span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={docxIncludeVisual}
+                  onChange={(e) => setDocxIncludeVisual(e.target.checked)}
+                  className="w-4 h-4 accent-[#2563EB] rounded"
+                />
+                <span className="font-medium">
+                  {language === 'bn'
+                    ? 'স্ক্যান পেজে ছবি যুক্ত করুন (ফাঁকা দেখাবে না)'
+                    : 'Embed visual image on scanned/image-only pages'}
+                </span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={docxUseOcr}
+                  onChange={(e) => setDocxUseOcr(e.target.checked)}
+                  className="w-4 h-4 accent-[#2563EB] rounded"
+                />
+                <span className="font-medium">
+                  {language === 'bn'
+                    ? 'স্ক্যান করা পেজে OCR (ইংরেজি + বাংলা) চালিয়ে এডিটেবল টেক্সট নিন'
+                    : 'Run OCR on scanned pages to extract editable text (EN + বাংলা)'}
+                </span>
+              </label>
+            </div>
+          )}
+
+          {toolId === 'pdfToXlsx' && (
+            <div className="space-y-2.5 text-xs p-3 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700">
+              <p className="font-bold text-[#142B4A] dark:text-slate-200">
+                {language === 'bn' ? 'এক্সেল শিট ও টেবিল অপশন' : 'Excel Sheet & Table Options'}
+              </p>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setXlsxMergeSheets(false)}
+                  className={`min-h-[38px] px-2 rounded-xl font-semibold border ${
+                    !xlsxMergeSheets
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {language === 'bn' ? 'প্রতি পেজে আলাদা শিট' : 'Sheet per Page'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setXlsxMergeSheets(true)}
+                  className={`min-h-[38px] px-2 rounded-xl font-semibold border ${
+                    xlsxMergeSheets
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {language === 'bn' ? 'সব পেজ এক শিটে' : 'Merge Into 1 Sheet'}
+                </button>
+              </div>
+              <label className="flex items-center gap-2 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={xlsxUseOcr}
+                  onChange={(e) => setXlsxUseOcr(e.target.checked)}
+                  className="w-4 h-4 accent-[#2563EB] rounded"
+                />
+                <span className="font-medium">
+                  {language === 'bn'
+                    ? 'স্ক্যান পেজের টেবিলে OCR ব্যবহার করুন'
+                    : 'Use OCR for scanned PDF tables'}
+                </span>
+              </label>
+            </div>
+          )}
+
+          {toolId === 'pdfToPptx' && (
+            <div className="space-y-2.5 text-xs p-3 rounded-xl bg-slate-50 dark:bg-slate-800/70 border border-slate-200 dark:border-slate-700">
+              <p className="font-bold text-[#142B4A] dark:text-slate-200">
+                {language === 'bn' ? 'পাওয়ারপয়েন্ট কনভার্সন মোড' : 'PowerPoint Slide Mode'}
+              </p>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => setPptxMode('editable')}
+                  className={`min-h-[40px] px-2 rounded-xl font-semibold border ${
+                    pptxMode === 'editable'
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {language === 'bn' ? 'এডিটেবল টেক্সট ও টেবিল' : 'Editable Text & Tables'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPptxMode('visual')}
+                  className={`min-h-[40px] px-2 rounded-xl font-semibold border ${
+                    pptxMode === 'visual'
+                      ? 'bg-[#2563EB] text-white border-[#2563EB]'
+                      : 'bg-white dark:bg-slate-900 border-slate-200 dark:border-slate-700'
+                  }`}
+                >
+                  {language === 'bn' ? 'হুবহু ভিজ্যুয়াল স্লাইড' : 'Exact Visual Slides'}
+                </button>
+              </div>
+              {pptxMode === 'editable' && (
+                <label className="flex items-center gap-2 cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={pptxUseOcr}
+                    onChange={(e) => setPptxUseOcr(e.target.checked)}
+                    className="w-4 h-4 accent-[#2563EB] rounded"
+                  />
+                  <span className="font-medium">
+                    {language === 'bn'
+                      ? 'স্ক্যান পেজে OCR এডিটেবল টেক্সট বক্স যোগ করুন'
+                      : 'Add OCR editable text box on scanned slides'}
+                  </span>
+                </label>
+              )}
+            </div>
+          )}
+
           {(toolId === 'protectVault' || toolId === 'unlockPdf') && (
             <div className="space-y-2">
               <div className="relative">
@@ -2133,6 +2317,38 @@ export const ToolRunnerModal: React.FC<ToolRunnerModalProps> = ({
                   >
                     <Share2 className="w-3.5 h-3.5 text-[#06B6D4]" />
                     <span>{language === 'bn' ? 'শেয়ার ZIP' : 'Share ZIP'}</span>
+                  </button>
+                </div>
+              )}
+              {resultOfficeFile && (
+                <div className="grid grid-cols-2 gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void saveBufferToDeviceStorage(
+                        resultOfficeFile.bytes,
+                        resultOfficeFile.name,
+                        resultOfficeFile.mime
+                      )
+                    }
+                    className="min-h-[38px] px-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold flex items-center justify-center gap-1"
+                  >
+                    <Download className="w-3.5 h-3.5" />
+                    <span>{language === 'bn' ? 'পুনরায় ডাউনলোড' : 'Download File'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void shareBufferNativeOrWeb(
+                        resultOfficeFile.bytes,
+                        resultOfficeFile.name,
+                        resultOfficeFile.mime
+                      )
+                    }
+                    className="min-h-[38px] px-2 rounded-xl bg-white dark:bg-slate-900 border border-emerald-300 dark:border-emerald-700 text-[#142B4A] dark:text-white font-semibold flex items-center justify-center gap-1"
+                  >
+                    <Share2 className="w-3.5 h-3.5 text-[#06B6D4]" />
+                    <span>{language === 'bn' ? 'শেয়ার করুন' : 'Share File'}</span>
                   </button>
                 </div>
               )}

@@ -206,6 +206,16 @@ export interface AddedImageOverlay {
   width: number;
   height: number;
   rotation: number;
+  opacity?: number;
+  flipX?: boolean;
+  flipY?: boolean;
+  brightness?: number;
+  contrast?: number;
+  grayscale?: boolean;
+  borderRadius?: number;
+  borderColor?: string;
+  borderWidth?: number;
+  lockAspect?: boolean;
 }
 
 export interface AnnotationOverlay {

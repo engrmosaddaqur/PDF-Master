@@ -1008,22 +1008,106 @@ export async function applyPdfEditsToBytes(
     return fontHelv;
   };
 
+  const embedDataUrlImage = async (dataUrl: string) => {
+    const normalizePngBytes = async (srcUrl: string): Promise<Uint8Array> => {
+      const img = new Image();
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error('Failed to decode image overlay'));
+        img.src = srcUrl;
+      });
+      const c = document.createElement('canvas');
+      c.width = Math.max(1, img.naturalWidth || 200);
+      c.height = Math.max(1, img.naturalHeight || 200);
+      const ctx = c.getContext('2d')!;
+      ctx.drawImage(img, 0, 0, c.width, c.height);
+      const pngUrl = c.toDataURL('image/png');
+      const b64 = pngUrl.split(',')[1] || '';
+      const bin = atob(b64);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    };
+
+    const base64 = dataUrl.split(',')[1];
+    if (!base64) return null;
+    if (dataUrl.startsWith('data:image/png')) {
+      const bin = atob(base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return doc.embedPng(bytes);
+    }
+    if (dataUrl.startsWith('data:image/jpeg') || dataUrl.startsWith('data:image/jpg')) {
+      const bin = atob(base64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return doc.embedJpg(bytes);
+    }
+    const pngBytes = await normalizePngBytes(dataUrl);
+    return doc.embedPng(pngBytes);
+  };
+
+  const makeVisualMapper = (page: ReturnType<PDFDocument['getPages']>[number]) => {
+    const { visW, visH, toPdfPoint } = getVisualPageGeometry(page);
+    const pageRot = ((page.getRotation().angle % 360) + 360) % 360;
+    const swapped = pageRot === 90 || pageRot === 270;
+
+    const mapPoint = (vx: number, vyTop: number) => toPdfPoint(vx, visH - vyTop, 0);
+
+    const mapRect = (vx: number, vyTop: number, w: number, h: number, visCwDeg = 0) => {
+      const vcx = vx + w / 2;
+      const vcy = visH - vyTop - h / 2;
+      const vRotDeg = -visCwDeg;
+      const rad = (vRotDeg * Math.PI) / 180;
+      const ox = (w / 2) * Math.cos(rad) - (h / 2) * Math.sin(rad);
+      const oy = (w / 2) * Math.sin(rad) + (h / 2) * Math.cos(rad);
+      return toPdfPoint(vcx - ox, vcy - oy, vRotDeg);
+    };
+
+    const mapBaselineText = (
+      vx: number,
+      vyTopBaseline: number,
+      visCwDeg = 0,
+      centerX?: number,
+      centerYTop?: number
+    ) => {
+      const vcy = centerYTop !== undefined ? visH - centerYTop : visH - vyTopBaseline;
+      const vyPdf = visH - vyTopBaseline;
+      if (visCwDeg !== 0 && centerX !== undefined) {
+        const rad = (-visCwDeg * Math.PI) / 180;
+        const rx = centerX + (vx - centerX) * Math.cos(rad) - (vyPdf - vcy) * Math.sin(rad);
+        const ry = vcy + (vx - centerX) * Math.sin(rad) + (vyPdf - vcy) * Math.cos(rad);
+        return toPdfPoint(rx, ry, -visCwDeg);
+      }
+      return toPdfPoint(vx, vyPdf, -visCwDeg);
+    };
+
+    return { visW, visH, swapped, mapPoint, mapRect, mapBaselineText, toPdfPoint };
+  };
+
   const pages = doc.getPages();
 
   // 1. Existing text replacements/deletions
   for (const rep of edits.replacements) {
     const page = pages[rep.pageNumber - 1];
     if (!page) continue;
-    const { height: pageH } = page.getSize();
-    const pdfY = pageH - rep.y - rep.height;
+    const vm = makeVisualMapper(page);
 
     // Clear original text bounding area cleanly using matched background color
+    const maskPt = vm.mapRect(
+      Math.max(0, rep.x - 1.5),
+      Math.max(0, rep.y - 1.5),
+      rep.width + 4,
+      rep.height + 4,
+      0
+    );
     page.drawRectangle({
-      x: Math.max(0, rep.x - 1.5),
-      y: Math.max(0, pdfY - 2),
+      x: maskPt.x,
+      y: maskPt.y,
       width: rep.width + 4,
       height: rep.height + 4,
       color: rep.backgroundColor ? hexToRgb(rep.backgroundColor) : rgb(1, 1, 1),
+      ...(maskPt.angleDeg !== 0 ? { rotate: degrees(maskPt.angleDeg) } : {}),
     });
 
     if (!rep.deleted && rep.newText.trim()) {
@@ -1033,6 +1117,9 @@ export async function applyPdfEditsToBytes(
         rep.newText.includes('\n') ||
         isCustomDesktopFont(rep.fontFamily)
       ) {
+        const availableW = rep.newText.includes('\n')
+          ? Math.max(rep.width + 24, 320)
+          : Math.max(rep.width + 40, vm.visW - rep.x - 12);
         const rendered = await renderUnicodeTextPng({
           text: rep.newText,
           fontSize: rep.fontSize,
@@ -1043,14 +1130,16 @@ export async function applyPdfEditsToBytes(
           underline: rep.underline,
           align: rep.align,
           letterSpacing: rep.letterSpacing,
-          maxWidth: Math.max(rep.width, 180),
+          maxWidth: availableW,
         });
         const img = await doc.embedPng(rendered.pngBytes);
+        const imgPt = vm.mapRect(rep.x, rep.y, rendered.widthPt, rendered.heightPt, 0);
         page.drawImage(img, {
-          x: rep.x,
-          y: pageH - rep.y - rendered.heightPt,
+          x: imgPt.x,
+          y: imgPt.y,
           width: rendered.widthPt,
           height: rendered.heightPt,
+          ...(imgPt.angleDeg !== 0 ? { rotate: degrees(imgPt.angleDeg) } : {}),
         });
       } else {
         const font = pickStandardFont(rep.fontFamily, rep.bold, rep.italic);
@@ -1060,18 +1149,22 @@ export async function applyPdfEditsToBytes(
         let drawX = rep.x;
         if (rep.align === 'center') drawX = rep.x + (boxW - tw) / 2;
         if (rep.align === 'right') drawX = rep.x + boxW - tw;
-        const baselineY = pageH - rep.y - rep.fontSize * 0.9;
+        const baselineTop = rep.y + rep.fontSize * 0.9;
+        const txtPt = vm.mapBaselineText(drawX, baselineTop, 0);
         page.drawText(rep.newText, {
-          x: drawX,
-          y: baselineY,
+          x: txtPt.x,
+          y: txtPt.y,
           size: rep.fontSize,
           font,
           color: col,
+          ...(txtPt.angleDeg !== 0 ? { rotate: degrees(txtPt.angleDeg) } : {}),
         });
         if (rep.underline && tw > 0) {
+          const u1 = vm.mapPoint(drawX, baselineTop + 2);
+          const u2 = vm.mapPoint(drawX + tw, baselineTop + 2);
           page.drawLine({
-            start: { x: drawX, y: baselineY - 2 },
-            end: { x: drawX + tw, y: baselineY - 2 },
+            start: { x: u1.x, y: u1.y },
+            end: { x: u2.x, y: u2.y },
             thickness: Math.max(0.8, rep.fontSize * 0.07),
             color: col,
           });
@@ -1084,14 +1177,9 @@ export async function applyPdfEditsToBytes(
   for (const tb of edits.addedTexts) {
     const page = pages[tb.pageNumber - 1];
     if (!page || !tb.text.trim()) continue;
-    const { height: pageH } = page.getSize();
+    const vm = makeVisualMapper(page);
     const boxW = Math.max(80, tb.width || 260);
-    const rotDeg = -(tb.rotation || 0);
-    const rad = (rotDeg * Math.PI) / 180;
-    const rotateAround = (px: number, py: number, cx: number, cy: number) => ({
-      x: cx + (px - cx) * Math.cos(rad) - (py - cy) * Math.sin(rad),
-      y: cy + (px - cx) * Math.sin(rad) + (py - cy) * Math.cos(rad),
-    });
+    const rotCw = tb.rotation || 0;
 
     if (
       hasNonWinAnsiChars(tb.text) ||
@@ -1112,15 +1200,12 @@ export async function applyPdfEditsToBytes(
       });
       const drawW = Math.max(boxW, rendered.widthPt);
       const drawH = rendered.heightPt + 6;
-      const cx = tb.x + drawW / 2;
-      const cy = pageH - tb.y - drawH / 2;
-      const ox = (drawW / 2) * Math.cos(rad) - (drawH / 2) * Math.sin(rad);
-      const oy = (drawW / 2) * Math.sin(rad) + (drawH / 2) * Math.cos(rad);
 
       if ((tb.backgroundColor && tb.backgroundColor !== 'transparent') || tb.borderColor) {
+        const bgPt = vm.mapRect(tb.x, tb.y, drawW, drawH, rotCw);
         page.drawRectangle({
-          x: cx - ox,
-          y: cy - oy,
+          x: bgPt.x,
+          y: bgPt.y,
           width: drawW,
           height: drawH,
           ...(tb.backgroundColor && tb.backgroundColor !== 'transparent'
@@ -1129,19 +1214,26 @@ export async function applyPdfEditsToBytes(
           ...(tb.borderColor
             ? { borderColor: hexToRgb(tb.borderColor), borderWidth: 1 }
             : {}),
-          ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
+          ...(bgPt.angleDeg !== 0 ? { rotate: degrees(bgPt.angleDeg) } : {}),
         });
       }
 
       const img = await doc.embedPng(rendered.pngBytes);
-      const imgOx = (rendered.widthPt / 2) * Math.cos(rad) - (rendered.heightPt / 2) * Math.sin(rad);
-      const imgOy = (rendered.widthPt / 2) * Math.sin(rad) + (rendered.heightPt / 2) * Math.cos(rad);
+      const centerX = tb.x + drawW / 2;
+      const centerYTop = tb.y + drawH / 2;
+      const imgPt = vm.mapRect(
+        centerX - rendered.widthPt / 2,
+        centerYTop - rendered.heightPt / 2,
+        rendered.widthPt,
+        rendered.heightPt,
+        rotCw
+      );
       page.drawImage(img, {
-        x: cx - imgOx,
-        y: cy - imgOy,
+        x: imgPt.x,
+        y: imgPt.y,
         width: rendered.widthPt,
         height: rendered.heightPt,
-        ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
+        ...(imgPt.angleDeg !== 0 ? { rotate: degrees(imgPt.angleDeg) } : {}),
       });
     } else {
       // Emit genuine editable vector PDF text for WinAnsi added text boxes (even multiline/aligned/underlined/rotated)
@@ -1170,15 +1262,14 @@ export async function applyPdfEditsToBytes(
       }
 
       const boxH = Math.max(tb.fontSize * 1.5 + 6, outLines.length * lineStep + 8);
-      const cx = tb.x + boxW / 2;
-      const cy = pageH - tb.y - boxH / 2;
-      const ox = (boxW / 2) * Math.cos(rad) - (boxH / 2) * Math.sin(rad);
-      const oy = (boxW / 2) * Math.sin(rad) + (boxH / 2) * Math.cos(rad);
+      const centerX = tb.x + boxW / 2;
+      const centerYTop = tb.y + boxH / 2;
 
       if ((tb.backgroundColor && tb.backgroundColor !== 'transparent') || tb.borderColor) {
+        const bgPt = vm.mapRect(tb.x, tb.y, boxW, boxH, rotCw);
         page.drawRectangle({
-          x: cx - ox,
-          y: cy - oy,
+          x: bgPt.x,
+          y: bgPt.y,
           width: boxW,
           height: boxH,
           ...(tb.backgroundColor && tb.backgroundColor !== 'transparent'
@@ -1187,9 +1278,18 @@ export async function applyPdfEditsToBytes(
           ...(tb.borderColor
             ? { borderColor: hexToRgb(tb.borderColor), borderWidth: 1 }
             : {}),
-          ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
+          ...(bgPt.angleDeg !== 0 ? { rotate: degrees(bgPt.angleDeg) } : {}),
         });
       }
+
+      const vRad = (rotCw * Math.PI) / 180;
+      const rotScreenPt = (px: number, py: number) =>
+        rotCw === 0
+          ? { x: px, y: py }
+          : {
+              x: centerX + (px - centerX) * Math.cos(vRad) - (py - centerYTop) * Math.sin(vRad),
+              y: centerYTop + (px - centerX) * Math.sin(vRad) + (py - centerYTop) * Math.cos(vRad),
+            };
 
       outLines.forEach((line, idx) => {
         if (!line) return;
@@ -1197,22 +1297,24 @@ export async function applyPdfEditsToBytes(
         let drawX = tb.x + 4;
         if (tb.align === 'center') drawX = tb.x + Math.max(4, (boxW - tw) / 2);
         if (tb.align === 'right') drawX = tb.x + Math.max(4, boxW - tw - 4);
-        const baselineY = pageH - tb.y - tb.fontSize - 3 - idx * lineStep;
-        const textPt = rotDeg !== 0 ? rotateAround(drawX, baselineY, cx, cy) : { x: drawX, y: baselineY };
+        const baselineTop = tb.y + tb.fontSize + 3 + idx * lineStep;
+        const txtPt = vm.mapBaselineText(drawX, baselineTop, rotCw, centerX, centerYTop);
         page.drawText(line, {
-          x: textPt.x,
-          y: textPt.y,
+          x: txtPt.x,
+          y: txtPt.y,
           size: tb.fontSize,
           font,
           color: col,
-          ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
+          ...(txtPt.angleDeg !== 0 ? { rotate: degrees(txtPt.angleDeg) } : {}),
         });
         if (tb.underline && tw > 0) {
-          const u1 = rotDeg !== 0 ? rotateAround(drawX, baselineY - 2, cx, cy) : { x: drawX, y: baselineY - 2 };
-          const u2 = rotDeg !== 0 ? rotateAround(drawX + tw, baselineY - 2, cx, cy) : { x: drawX + tw, y: baselineY - 2 };
+          const s1 = rotScreenPt(drawX, baselineTop + 2);
+          const s2 = rotScreenPt(drawX + tw, baselineTop + 2);
+          const u1 = vm.mapPoint(s1.x, s1.y);
+          const u2 = vm.mapPoint(s2.x, s2.y);
           page.drawLine({
-            start: u1,
-            end: u2,
+            start: { x: u1.x, y: u1.y },
+            end: { x: u2.x, y: u2.y },
             thickness: Math.max(0.8, tb.fontSize * 0.07),
             color: col,
           });
@@ -1221,32 +1323,109 @@ export async function applyPdfEditsToBytes(
     }
   }
 
-  // 3. Added images (rotate around center to match editor canvas preview)
+  const bakeAdjustedImageDataUrl = async (imgOv: AddedImageOverlay): Promise<string> => {
+    const flipX = Boolean(imgOv.flipX);
+    const flipY = Boolean(imgOv.flipY);
+    const brightness = imgOv.brightness ?? 100;
+    const contrast = imgOv.contrast ?? 100;
+    const grayscale = Boolean(imgOv.grayscale);
+    const radiusPct = Math.max(0, Math.min(50, imgOv.borderRadius ?? 0));
+    const borderW = Math.max(0, imgOv.borderWidth ?? 0);
+
+    if (
+      !flipX &&
+      !flipY &&
+      brightness === 100 &&
+      contrast === 100 &&
+      !grayscale &&
+      radiusPct === 0 &&
+      borderW === 0
+    ) {
+      return imgOv.dataUrl;
+    }
+
+    const imgEl = new Image();
+    await new Promise<void>((resolve, reject) => {
+      imgEl.onload = () => resolve();
+      imgEl.onerror = () => reject(new Error('Failed to decode adjusted image'));
+      imgEl.src = imgOv.dataUrl;
+    });
+
+    const pxScale = 3;
+    const cw = Math.max(60, Math.round(imgOv.width * pxScale));
+    const ch = Math.max(60, Math.round(imgOv.height * pxScale));
+    const c = document.createElement('canvas');
+    c.width = cw;
+    c.height = ch;
+    const ctx = c.getContext('2d')!;
+
+    const radiusPx = Math.min(cw, ch) * (radiusPct / 100);
+    const traceRoundedPath = (inset = 0) => {
+      const rw = Math.max(4, cw - inset * 2);
+      const rh = Math.max(4, ch - inset * 2);
+      const r = Math.max(0, Math.min(Math.min(rw, rh) / 2, radiusPx - inset));
+      ctx.beginPath();
+      if (typeof ctx.roundRect === 'function') {
+        ctx.roundRect(inset, inset, rw, rh, r);
+      } else {
+        ctx.moveTo(inset + r, inset);
+        ctx.lineTo(inset + rw - r, inset);
+        ctx.quadraticCurveTo(inset + rw, inset, inset + rw, inset + r);
+        ctx.lineTo(inset + rw, inset + rh - r);
+        ctx.quadraticCurveTo(inset + rw, inset + rh, inset + rw - r, inset + rh);
+        ctx.lineTo(inset + r, inset + rh);
+        ctx.quadraticCurveTo(inset, inset + rh, inset, inset + rh - r);
+        ctx.lineTo(inset, inset + r);
+        ctx.quadraticCurveTo(inset, inset, inset + r, inset);
+      }
+      ctx.closePath();
+    };
+
+    ctx.save();
+    if (radiusPx > 0) {
+      traceRoundedPath(0);
+      ctx.clip();
+    }
+    const filters: string[] = [];
+    if (brightness !== 100) filters.push(`brightness(${brightness}%)`);
+    if (contrast !== 100) filters.push(`contrast(${contrast}%)`);
+    if (grayscale) filters.push('grayscale(100%)');
+    if (filters.length > 0) ctx.filter = filters.join(' ');
+
+    ctx.translate(cw / 2, ch / 2);
+    ctx.scale(flipX ? -1 : 1, flipY ? -1 : 1);
+    ctx.drawImage(imgEl, -cw / 2, -ch / 2, cw, ch);
+    ctx.restore();
+
+    if (borderW > 0) {
+      const strokePx = borderW * pxScale;
+      ctx.save();
+      traceRoundedPath(strokePx / 2);
+      ctx.strokeStyle = imgOv.borderColor || '#142B4A';
+      ctx.lineWidth = strokePx;
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    return c.toDataURL('image/png');
+  };
+
+  // 3. Added images (rotate around center to match editor canvas preview + baked filters/flips/frames)
   for (const imgOv of edits.addedImages) {
     const page = pages[imgOv.pageNumber - 1];
     if (!page) continue;
-    const { height: pageH } = page.getSize();
-    const base64 = imgOv.dataUrl.split(',')[1];
-    if (!base64) continue;
-    const bin = atob(base64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-
-    const embedded = imgOv.dataUrl.includes('image/png')
-      ? await doc.embedPng(bytes)
-      : await doc.embedJpg(bytes);
-    const rotDeg = -(imgOv.rotation || 0);
-    const rad = (rotDeg * Math.PI) / 180;
-    const cx = imgOv.x + imgOv.width / 2;
-    const cy = pageH - imgOv.y - imgOv.height / 2;
-    const ox = (imgOv.width / 2) * Math.cos(rad) - (imgOv.height / 2) * Math.sin(rad);
-    const oy = (imgOv.width / 2) * Math.sin(rad) + (imgOv.height / 2) * Math.cos(rad);
+    const processedUrl = await bakeAdjustedImageDataUrl(imgOv);
+    const embedded = await embedDataUrlImage(processedUrl);
+    if (!embedded) continue;
+    const vm = makeVisualMapper(page);
+    const imgPt = vm.mapRect(imgOv.x, imgOv.y, imgOv.width, imgOv.height, imgOv.rotation || 0);
     page.drawImage(embedded, {
-      x: cx - ox,
-      y: cy - oy,
+      x: imgPt.x,
+      y: imgPt.y,
       width: imgOv.width,
       height: imgOv.height,
-      rotate: degrees(rotDeg),
+      opacity: imgOv.opacity ?? 1,
+      ...(imgPt.angleDeg !== 0 ? { rotate: degrees(imgPt.angleDeg) } : {}),
     });
   }
 
@@ -1254,49 +1433,58 @@ export async function applyPdfEditsToBytes(
   for (const ann of edits.annotations) {
     const page = pages[ann.pageNumber - 1];
     if (!page) continue;
-    const { height: pageH } = page.getSize();
+    const vm = makeVisualMapper(page);
     const color = hexToRgb(ann.color || '#2563EB');
 
     if (ann.kind === 'highlight') {
+      const pt = vm.mapRect(ann.x, ann.y, ann.width, ann.height, 0);
       page.drawRectangle({
-        x: ann.x,
-        y: pageH - ann.y - ann.height,
+        x: pt.x,
+        y: pt.y,
         width: ann.width,
         height: ann.height,
         color,
         opacity: ann.opacity ?? 0.34,
+        ...(pt.angleDeg !== 0 ? { rotate: degrees(pt.angleDeg) } : {}),
       });
     } else if (ann.kind === 'whiteout') {
+      const pt = vm.mapRect(ann.x, ann.y, ann.width, ann.height, 0);
       page.drawRectangle({
-        x: ann.x,
-        y: pageH - ann.y - ann.height,
+        x: pt.x,
+        y: pt.y,
         width: ann.width,
         height: ann.height,
         color: hexToRgb(ann.fillColor || ann.color || '#FFFFFF'),
         opacity: ann.opacity ?? 1,
+        ...(pt.angleDeg !== 0 ? { rotate: degrees(pt.angleDeg) } : {}),
       });
     } else if (ann.kind === 'underline') {
+      const p1 = vm.mapPoint(ann.x, ann.y + ann.height);
+      const p2 = vm.mapPoint(ann.x + ann.width, ann.y + ann.height);
       page.drawLine({
-        start: { x: ann.x, y: pageH - (ann.y + ann.height) },
-        end: { x: ann.x + ann.width, y: pageH - (ann.y + ann.height) },
+        start: { x: p1.x, y: p1.y },
+        end: { x: p2.x, y: p2.y },
         thickness: ann.strokeWidth || 2,
         color,
         lineCap: LineCapStyle.Round,
         opacity: ann.opacity ?? 1,
       });
     } else if (ann.kind === 'strikethrough') {
+      const p1 = vm.mapPoint(ann.x, ann.y + ann.height / 2);
+      const p2 = vm.mapPoint(ann.x + ann.width, ann.y + ann.height / 2);
       page.drawLine({
-        start: { x: ann.x, y: pageH - (ann.y + ann.height / 2) },
-        end: { x: ann.x + ann.width, y: pageH - (ann.y + ann.height / 2) },
+        start: { x: p1.x, y: p1.y },
+        end: { x: p2.x, y: p2.y },
         thickness: ann.strokeWidth || 2,
         color,
         lineCap: LineCapStyle.Round,
         opacity: ann.opacity ?? 1,
       });
     } else if (ann.kind === 'rect') {
+      const pt = vm.mapRect(ann.x, ann.y, ann.width, ann.height, 0);
       page.drawRectangle({
-        x: ann.x,
-        y: pageH - ann.y - ann.height,
+        x: pt.x,
+        y: pt.y,
         width: ann.width,
         height: ann.height,
         borderColor: color,
@@ -1305,13 +1493,17 @@ export async function applyPdfEditsToBytes(
         ...(ann.fillColor
           ? { color: hexToRgb(ann.fillColor), opacity: 0.18, borderOpacity: ann.opacity ?? 1 }
           : { borderOpacity: ann.opacity ?? 1 }),
+        ...(pt.angleDeg !== 0 ? { rotate: degrees(pt.angleDeg) } : {}),
       });
     } else if (ann.kind === 'circle') {
+      const center = vm.mapPoint(ann.x + ann.width / 2, ann.y + ann.height / 2);
+      const rx = Math.max(1, ann.width / 2);
+      const ry = Math.max(1, ann.height / 2);
       page.drawEllipse({
-        x: ann.x + ann.width / 2,
-        y: pageH - ann.y - ann.height / 2,
-        xScale: Math.max(1, ann.width / 2),
-        yScale: Math.max(1, ann.height / 2),
+        x: center.x,
+        y: center.y,
+        xScale: vm.swapped ? ry : rx,
+        yScale: vm.swapped ? rx : ry,
         borderColor: color,
         borderWidth: ann.strokeWidth || 2,
         ...(ann.lineStyle === 'dashed' ? { borderDashArray: [6, 4] } : {}),
@@ -1320,36 +1512,38 @@ export async function applyPdfEditsToBytes(
           : { borderOpacity: ann.opacity ?? 1 }),
       });
     } else if (ann.kind === 'arrow') {
-      const startX = ann.x;
-      const startY = pageH - ann.y;
-      const endX = ann.x + ann.width;
-      const endY = pageH - (ann.y + ann.height);
+      const sx = ann.x;
+      const sy = ann.y;
+      const ex = ann.x + ann.width;
+      const ey = ann.y + ann.height;
+      const startPt = vm.mapPoint(sx, sy);
+      const endPt = vm.mapPoint(ex, ey);
       const thick = ann.strokeWidth || 2.5;
       const op = ann.opacity ?? 1;
       const arrowStyle = ann.arrowStyle || 'single';
       page.drawLine({
-        start: { x: startX, y: startY },
-        end: { x: endX, y: endY },
+        start: { x: startPt.x, y: startPt.y },
+        end: { x: endPt.x, y: endPt.y },
         thickness: thick,
         color,
         lineCap: LineCapStyle.Round,
         opacity: op,
         ...(ann.lineStyle === 'dashed' ? { dashArray: [6, 4] } : {}),
       });
-      const angle = Math.atan2(endY - startY, endX - startX);
+      const angle = Math.atan2(endPt.y - startPt.y, endPt.x - startPt.x);
       const headLen = Math.max(9, thick * 3.4);
       if (arrowStyle !== 'line') {
         page.drawLine({
-          start: { x: endX, y: endY },
-          end: { x: endX - headLen * Math.cos(angle - Math.PI / 6), y: endY - headLen * Math.sin(angle - Math.PI / 6) },
+          start: { x: endPt.x, y: endPt.y },
+          end: { x: endPt.x - headLen * Math.cos(angle - Math.PI / 6), y: endPt.y - headLen * Math.sin(angle - Math.PI / 6) },
           thickness: thick,
           color,
           lineCap: LineCapStyle.Round,
           opacity: op,
         });
         page.drawLine({
-          start: { x: endX, y: endY },
-          end: { x: endX - headLen * Math.cos(angle + Math.PI / 6), y: endY - headLen * Math.sin(angle + Math.PI / 6) },
+          start: { x: endPt.x, y: endPt.y },
+          end: { x: endPt.x - headLen * Math.cos(angle + Math.PI / 6), y: endPt.y - headLen * Math.sin(angle + Math.PI / 6) },
           thickness: thick,
           color,
           lineCap: LineCapStyle.Round,
@@ -1359,16 +1553,16 @@ export async function applyPdfEditsToBytes(
       if (arrowStyle === 'double') {
         const revAngle = angle + Math.PI;
         page.drawLine({
-          start: { x: startX, y: startY },
-          end: { x: startX - headLen * Math.cos(revAngle - Math.PI / 6), y: startY - headLen * Math.sin(revAngle - Math.PI / 6) },
+          start: { x: startPt.x, y: startPt.y },
+          end: { x: startPt.x - headLen * Math.cos(revAngle - Math.PI / 6), y: startPt.y - headLen * Math.sin(revAngle - Math.PI / 6) },
           thickness: thick,
           color,
           lineCap: LineCapStyle.Round,
           opacity: op,
         });
         page.drawLine({
-          start: { x: startX, y: startY },
-          end: { x: startX - headLen * Math.cos(revAngle + Math.PI / 6), y: startY - headLen * Math.sin(revAngle + Math.PI / 6) },
+          start: { x: startPt.x, y: startPt.y },
+          end: { x: startPt.x - headLen * Math.cos(revAngle + Math.PI / 6), y: startPt.y - headLen * Math.sin(revAngle + Math.PI / 6) },
           thickness: thick,
           color,
           lineCap: LineCapStyle.Round,
@@ -1379,7 +1573,6 @@ export async function applyPdfEditsToBytes(
       const pts = ann.points;
       const thick = ann.strokeWidth || 2.5;
       const op = ann.opacity ?? 1;
-      // Subdivide quadratic midpoint Bezier curves into smooth dense segments with round caps
       const smoothPts: Array<{ x: number; y: number }> = [pts[0]];
       if (pts.length === 2) {
         smoothPts.push(pts[1]);
@@ -1403,11 +1596,11 @@ export async function applyPdfEditsToBytes(
         smoothPts.push(pts[pts.length - 1]);
       }
       for (let i = 1; i < smoothPts.length; i++) {
-        const p1 = smoothPts[i - 1];
-        const p2 = smoothPts[i];
+        const p1 = vm.mapPoint(smoothPts[i - 1].x, smoothPts[i - 1].y);
+        const p2 = vm.mapPoint(smoothPts[i].x, smoothPts[i].y);
         page.drawLine({
-          start: { x: p1.x, y: pageH - p1.y },
-          end: { x: p2.x, y: pageH - p2.y },
+          start: { x: p1.x, y: p1.y },
+          end: { x: p2.x, y: p2.y },
           thickness: thick,
           color,
           lineCap: LineCapStyle.Round,
@@ -1417,30 +1610,30 @@ export async function applyPdfEditsToBytes(
     } else if (ann.kind === 'sticky') {
       const boxW = Math.max(84, ann.width || 165);
       const boxH = Math.max(44, ann.height || 76);
-      const boxY = pageH - ann.y - boxH;
       const noteBg = hexToRgb(ann.fillColor || '#FEF3C7');
       const noteAccent = hexToRgb(ann.color && ann.color !== '#FACC15' ? ann.color : '#D97706');
       const fontSize = Math.max(7, Math.min(24, ann.fontSize || 9.5));
 
+      const boxPt = vm.mapRect(ann.x, ann.y, boxW, boxH, 0);
       page.drawRectangle({
-        x: ann.x,
-        y: boxY,
+        x: boxPt.x,
+        y: boxPt.y,
         width: boxW,
         height: boxH,
         color: noteBg,
         borderColor: noteAccent,
         borderWidth: 1.4,
+        ...(boxPt.angleDeg !== 0 ? { rotate: degrees(boxPt.angleDeg) } : {}),
       });
 
-      // Draw free-angle / corner / directional callout arrow indicator
       const arrowGeo = computeStickyArrowGeometry(ann);
       if (arrowGeo.hasArrow) {
-        const stemStart = { x: arrowGeo.startX, y: pageH - arrowGeo.startY };
-        const stemEnd = { x: arrowGeo.tipX, y: pageH - arrowGeo.tipY };
+        const stemStart = vm.mapPoint(arrowGeo.startX, arrowGeo.startY);
+        const stemEnd = vm.mapPoint(arrowGeo.tipX, arrowGeo.tipY);
         const thick = Math.max(1.8, ann.strokeWidth || 2.1);
         page.drawLine({
-          start: stemStart,
-          end: stemEnd,
+          start: { x: stemStart.x, y: stemStart.y },
+          end: { x: stemEnd.x, y: stemEnd.y },
           thickness: thick,
           color: noteAccent,
           lineCap: LineCapStyle.Round,
@@ -1448,14 +1641,14 @@ export async function applyPdfEditsToBytes(
         const ang = Math.atan2(stemEnd.y - stemStart.y, stemEnd.x - stemStart.x);
         const headLen = Math.max(7, Math.min(13, thick * 3.6));
         page.drawLine({
-          start: stemEnd,
+          start: { x: stemEnd.x, y: stemEnd.y },
           end: { x: stemEnd.x - headLen * Math.cos(ang - Math.PI / 6), y: stemEnd.y - headLen * Math.sin(ang - Math.PI / 6) },
           thickness: thick,
           color: noteAccent,
           lineCap: LineCapStyle.Round,
         });
         page.drawLine({
-          start: stemEnd,
+          start: { x: stemEnd.x, y: stemEnd.y },
           end: { x: stemEnd.x - headLen * Math.cos(ang + Math.PI / 6), y: stemEnd.y - headLen * Math.sin(ang + Math.PI / 6) },
           thickness: thick,
           color: noteAccent,
@@ -1480,11 +1673,13 @@ export async function applyPdfEditsToBytes(
         const img = await doc.embedPng(rendered.pngBytes);
         const drawH = Math.min(boxH - 8, rendered.heightPt);
         const drawW = rendered.heightPt > boxH - 8 ? rendered.widthPt * (drawH / rendered.heightPt) : rendered.widthPt;
+        const imgPt = vm.mapRect(ann.x + 6, ann.y + 5, Math.min(innerW, drawW), drawH, 0);
         page.drawImage(img, {
-          x: ann.x + 6,
-          y: pageH - ann.y - 5 - drawH,
+          x: imgPt.x,
+          y: imgPt.y,
           width: Math.min(innerW, drawW),
           height: drawH,
+          ...(imgPt.angleDeg !== 0 ? { rotate: degrees(imgPt.angleDeg) } : {}),
         });
       } else {
         const lineHeight = fontSize * 1.28;
@@ -1506,12 +1701,14 @@ export async function applyPdfEditsToBytes(
         }
         wrapped.slice(0, maxLines).forEach((ln, idx) => {
           if (!ln) return;
+          const txtPt = vm.mapBaselineText(ann.x + 6, ann.y + fontSize + 5 + idx * lineHeight, 0);
           page.drawText(ln, {
-            x: ann.x + 6,
-            y: pageH - ann.y - fontSize - 5 - idx * lineHeight,
+            x: txtPt.x,
+            y: txtPt.y,
             size: fontSize,
             font: fontHelv,
             color: rgb(0.12, 0.16, 0.23),
+            ...(txtPt.angleDeg !== 0 ? { rotate: degrees(txtPt.angleDeg) } : {}),
           });
         });
       }
@@ -1520,29 +1717,32 @@ export async function applyPdfEditsToBytes(
       const stampFont = Math.max(8, Math.min(26, ann.fontSize || 10));
       const stampW = Math.max(96, ann.width || label.length * stampFont * 0.72 + 20);
       const stampH = Math.max(24, ann.height || stampFont * 2.4);
-      const rotDeg = -(ann.rotation || 0);
-      const rad = (rotDeg * Math.PI) / 180;
-      const cx = ann.x + stampW / 2;
-      const cy = pageH - ann.y - stampH / 2;
-      const ox = (stampW / 2) * Math.cos(rad) - (stampH / 2) * Math.sin(rad);
-      const oy = (stampW / 2) * Math.sin(rad) + (stampH / 2) * Math.cos(rad);
+      const rotCw = ann.rotation || 0;
+      const isSolidFill = Boolean(ann.fillColor);
+
+      const rectPt = vm.mapRect(ann.x, ann.y, stampW, stampH, rotCw);
       page.drawRectangle({
-        x: cx - ox,
-        y: cy - oy,
+        x: rectPt.x,
+        y: rectPt.y,
         width: stampW,
         height: stampH,
         borderColor: color,
         borderWidth: 1.8,
-        color: rgb(0.98, 0.99, 1),
-        opacity: 0.92,
-        ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
+        color: isSolidFill ? color : rgb(0.98, 0.99, 1),
+        opacity: isSolidFill ? 0.92 : 0.94,
+        ...(rectPt.angleDeg !== 0 ? { rotate: degrees(rectPt.angleDeg) } : {}),
       });
+      const textColorHex = isSolidFill ? '#FFFFFF' : ann.color || '#2563EB';
+      const textCol = isSolidFill ? rgb(1, 1, 1) : color;
+      const centerX = ann.x + stampW / 2;
+      const centerYTop = ann.y + stampH / 2;
+
       if (hasNonWinAnsiChars(label)) {
         const rendered = await renderUnicodeTextPng({
           text: label,
           fontSize: stampFont,
           fontFamily: 'sans',
-          color: ann.color || '#2563EB',
+          color: textColorHex,
           bold: true,
           italic: false,
           underline: false,
@@ -1550,55 +1750,81 @@ export async function applyPdfEditsToBytes(
           maxWidth: stampW - 8,
         });
         const img = await doc.embedPng(rendered.pngBytes);
-        const iox = (rendered.widthPt / 2) * Math.cos(rad) - (rendered.heightPt / 2) * Math.sin(rad);
-        const ioy = (rendered.widthPt / 2) * Math.sin(rad) + (rendered.heightPt / 2) * Math.cos(rad);
+        const imgPt = vm.mapRect(
+          centerX - rendered.widthPt / 2,
+          centerYTop - rendered.heightPt / 2,
+          rendered.widthPt,
+          rendered.heightPt,
+          rotCw
+        );
         page.drawImage(img, {
-          x: cx - iox,
-          y: cy - ioy,
+          x: imgPt.x,
+          y: imgPt.y,
           width: rendered.widthPt,
           height: rendered.heightPt,
-          ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
+          ...(imgPt.angleDeg !== 0 ? { rotate: degrees(imgPt.angleDeg) } : {}),
         });
       } else {
         const tw = fontHelvBold.widthOfTextAtSize(label, stampFont);
         const rawTx = ann.x + Math.max(8, (stampW - tw) / 2);
-        const rawTy = pageH - ann.y - stampH / 2 - stampFont * 0.35;
-        const tx = rotDeg !== 0 ? cx + (rawTx - cx) * Math.cos(rad) - (rawTy - cy) * Math.sin(rad) : rawTx;
-        const ty = rotDeg !== 0 ? cy + (rawTx - cx) * Math.sin(rad) + (rawTy - cy) * Math.cos(rad) : rawTy;
+        const baselineTop = ann.y + stampH / 2 + stampFont * 0.35;
+        const txtPt = vm.mapBaselineText(rawTx, baselineTop, rotCw, centerX, centerYTop);
         page.drawText(label, {
-          x: tx,
-          y: ty,
+          x: txtPt.x,
+          y: txtPt.y,
           size: stampFont,
           font: fontHelvBold,
-          color,
-          ...(rotDeg !== 0 ? { rotate: degrees(rotDeg) } : {}),
+          color: textCol,
+          ...(txtPt.angleDeg !== 0 ? { rotate: degrees(txtPt.angleDeg) } : {}),
         });
       }
     } else if (ann.kind === 'signature' && ann.signatureDataUrl) {
-      const base64 = ann.signatureDataUrl.split(',')[1];
-      if (base64) {
-        const bin = atob(base64);
-        const bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        const sigImg = ann.signatureDataUrl.includes('image/png')
-          ? await doc.embedPng(bytes)
-          : await doc.embedJpg(bytes);
+      const sigImg = await embedDataUrlImage(ann.signatureDataUrl);
+      if (sigImg) {
+        const rotCw = ann.rotation || 0;
+        const sigPt = vm.mapRect(ann.x, ann.y, ann.width, ann.height, rotCw);
         page.drawImage(sigImg, {
-          x: ann.x,
-          y: pageH - ann.y - ann.height,
+          x: sigPt.x,
+          y: sigPt.y,
           width: ann.width,
           height: ann.height,
+          ...(sigPt.angleDeg !== 0 ? { rotate: degrees(sigPt.angleDeg) } : {}),
         });
         if (ann.signerName || ann.dateStr) {
           const caption = `${ann.signerName || ''} ${ann.dateStr ? `· ${ann.dateStr}` : ''}`.trim();
           if (caption) {
-            page.drawText(caption.replace(/[^\x20-\x7E]/g, ''), {
-              x: ann.x,
-              y: Math.max(4, pageH - ann.y - ann.height - 11),
-              size: 8,
-              font: fontHelv,
-              color: rgb(0.3, 0.35, 0.45),
-            });
+            if (hasNonWinAnsiChars(caption)) {
+              const rendered = await renderUnicodeTextPng({
+                text: caption,
+                fontSize: 8,
+                fontFamily: 'sans',
+                color: '#475569',
+                bold: false,
+                italic: false,
+                underline: false,
+                align: 'left',
+                maxWidth: Math.max(120, ann.width + 40),
+              });
+              const capImg = await doc.embedPng(rendered.pngBytes);
+              const capPt = vm.mapRect(ann.x, ann.y + ann.height + 2, rendered.widthPt, rendered.heightPt, 0);
+              page.drawImage(capImg, {
+                x: capPt.x,
+                y: capPt.y,
+                width: rendered.widthPt,
+                height: rendered.heightPt,
+                ...(capPt.angleDeg !== 0 ? { rotate: degrees(capPt.angleDeg) } : {}),
+              });
+            } else {
+              const txtPt = vm.mapBaselineText(ann.x, ann.y + ann.height + 10, 0);
+              page.drawText(caption, {
+                x: txtPt.x,
+                y: txtPt.y,
+                size: 8,
+                font: fontHelv,
+                color: rgb(0.3, 0.35, 0.45),
+                ...(txtPt.angleDeg !== 0 ? { rotate: degrees(txtPt.angleDeg) } : {}),
+              });
+            }
           }
         }
       }
